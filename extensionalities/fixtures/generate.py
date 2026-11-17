@@ -15,16 +15,21 @@ def archive(name, entries):
             out.writestr(info, body)
 
 
-def png(w, h):
+def png(w, h, document=False):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    raw = (b"\0" + b"\xff\xff\xff" * w) * h
+    if document:
+        raw = b"".join(b"\0" + b"".join(b"\0\0\0" if 50 < x < w - 50 and y % 24 < 3 else b"\xff\xff\xff" for x in range(w)) for y in range(h))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress((b"\0" + b"\xff\xff\xff" * w) * h))
+            + (chunk(b"pHYs", struct.pack(">IIB", 11811, 11811, 1)) if document else b"")
+            + chunk(b"IDAT", zlib.compress(raw))
             + chunk(b"IEND", b""))
 
 
 archive("listing.zip", {"note.txt": "Hello archive\n", "../escape.txt": "Never extract me\n"})
 (ROOT / "image.png").write_bytes(png(640, 400))
+(ROOT / "document-image.png").write_bytes(png(600, 800, document=True))
 (ROOT / "disguised.pdf").write_bytes(png(10, 10))
 (ROOT / "truncated.zip").write_bytes(b"PK\x03\x04broken")
 archive("entry-cap.zip", {f"entry-{i}": "" for i in range(4097)})
@@ -305,3 +310,50 @@ repack("native.epub", "doctype.epub", {
 repack("native.epub", "xxe.epub", {
     "Book/first.xhtml": '<!DOCTYPE html [<!ENTITY secret SYSTEM "file:///etc/passwd">]><html xmlns="http://www.w3.org/1999/xhtml"><body><p>&secret;</p></body></html>',
 })
+
+def pdf(multipage=False):
+    def stream(data, attributes=b""):
+        return b"<< /Length " + str(len(data)).encode() + b" " + attributes + b" >>\nstream\n" + data + b"\nendstream"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /XObject << /Scan 8 0 R >> >> /Contents 7 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream(b"BT /F1 20 Tf 50 700 Td (Native PDF evidence for bounded preview.) Tj ET"),
+        stream(b"q 600 0 0 800 0 0 cm /Scan Do Q"),
+        stream(b"\xff\xff\xff", b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8"),
+        b"<< /Title (Native PDF) /Author (Example Author) >>",
+    ]
+    if multipage:
+        kids = [3, 4]
+        dense = b"BT /F1 14 Tf 40 740 Td " + b" ".join(
+            (b"0 -28 Td " if n else b"") + b"(Native text paragraphs provide substantial document evidence.) Tj"
+            for n in range(20)) + b" ET"
+        for body, width, height in [
+            (dense, 600, 800),
+            (b"", 600, 800),
+            (b"q 200 0 0 200 200 350 cm /Scan Do Q BT /F1 20 Tf 50 700 Td (Caption with an embedded figure.) Tj ET", 600, 800),
+            (b"BT /F1 20 Tf 50 500 Td (Final page confirms full-document extraction.) Tj ET", 800, 600),
+        ]:
+            objects.append(stream(body))
+            content = len(objects)
+            objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Resources << /Font << /F1 5 0 R >> /XObject << /Scan 8 0 R >> >> /Contents {content} 0 R >>".encode())
+            kids.append(len(objects))
+        objects[1] = b"<< /Type /Pages /Kids [" + b" ".join(f"{n} 0 R".encode() for n in kids) + b"] /Count 6 >>"
+    data = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for n, obj in enumerate(objects, 1):
+        offsets.append(len(data))
+        data.extend(f"{n} 0 obj\n".encode() + obj + b"\nendobj\n")
+    xref = len(data)
+    data.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        data.extend(f"{offset:010} 00000 n \n".encode())
+    data.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R /Info 9 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return data
+
+
+(ROOT / "native.pdf").write_bytes(pdf())
+(ROOT / "multipage.pdf").write_bytes(pdf(multipage=True))
+(ROOT / "broken.pdf").write_bytes(b"%PDF-1.7\nbroken")

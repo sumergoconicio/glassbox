@@ -7,15 +7,19 @@ mod comics;
 mod detect;
 mod djvu;
 mod epub;
+mod images;
 mod mobi;
 mod odf;
 mod office;
+mod pdf;
 mod profile;
 mod rar;
 mod spreadsheet;
 mod tables;
 mod thumbnail;
 mod xml;
+pub use images::{ImageAnalysis, OcrProbe};
+pub use pdf::{PdfAnalysis, PdfGeometry};
 pub use tables::{DocumentTable, TableCell};
 
 /// Explicitly linked libav bindings, never part of the default binary.
@@ -165,6 +169,10 @@ pub struct Sheet {
 
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<PdfAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageAnalysis>,
     pub pages: Vec<Page>,
     pub format: Format,
     pub claims: Vec<Claim>,
@@ -226,11 +234,26 @@ impl InspectReport {
             self.counts.bytes,
             self.counts.chars
         );
+        if let Some(pages) = self.counts.pages {
+            out.push_str(&format!("{pages} pages\n"));
+        }
         for claim in &self.claims {
             out.push_str(&format!(
                 "{}: {} [{}]\n",
                 claim.key, claim.value, claim.source
             ));
+        }
+        if let Some(image) = &self.image {
+            out.push_str(&format!(
+                "image: {}x{}, {} [{}]\n",
+                image.width, image.height, image.classification, image.basis
+            ));
+            if let Some(probe) = &image.probe {
+                out.push_str(&format!(
+                    "OCR: {} words, mean confidence {:.2} [{}]\n",
+                    probe.word_count, probe.mean_confidence, probe.basis
+                ));
+            }
         }
         out.push_str(&self.text.content);
         for error in &self.errors {
@@ -243,6 +266,8 @@ impl InspectReport {
 pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
     let extension = detect::extension(path);
     let mut report = InspectReport {
+        pdf: None,
+        image: None,
         pages: vec![],
         format: Format {
             extension: extension.clone(),
@@ -342,20 +367,19 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
             || (report.format.basis == "extension" && matches!(extension.as_str(), "cbr" | "rar"))
         {
             rar::inspect(path, &mut report);
-        } else if report.format.bucket == "Images" && options.thumbnail.is_some() {
-            match std::fs::File::open(path) {
-                Ok(file) => thumbnail::write(
-                    std::io::BufReader::new(file),
-                    "downscaled",
-                    options,
-                    &mut report,
-                ),
-                Err(error) => report.error("thumbnail", error),
-            }
+        } else if report.format.detected_mime.as_deref() == Some("application/pdf")
+            || (report.format.basis == "extension" && extension == "pdf")
+        {
+            pdf::inspect(path, &mut report, options);
+        } else if report.format.bucket == "Images" {
+            images::inspect(path, &mut report, options);
         }
     }
-    if options.probe_ocr {
-        report.error("probe_ocr", "image OCR probing is deferred to Phase 4");
+    if options.probe_ocr && report.format.bucket != "Images" {
+        report.error(
+            "probe_ocr",
+            "OCR probing is supported for raster images only",
+        );
     }
     if options.packet {
         report.packet = Some(serde_json::json!({

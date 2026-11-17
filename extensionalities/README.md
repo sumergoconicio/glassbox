@@ -86,7 +86,7 @@ integration, and other platforms were not tested by this scaffold.
 The initial scaffold added no EXIF, ID3, or Office extractors, consumer integration,
 delivery naming, recipe changes, or release assets. Those are separate work.
 
-## Native Quick Look, through Phase 2
+## Native Quick Look, through Phase 4
 
 `litx inspect PATH --pretty` now detects file bytes, lists guarded ZIP entries,
 and inspects native DOCX/PPTX/XLSX and ODT/ODP/ODS XML. It extracts metadata,
@@ -114,3 +114,11 @@ resource limits, and verification results. Following review and approval,
 Phase 3 adds native EPUB spine/metadata/cover extraction, MOBI-family PalmDOC
 text and EXTH metadata, CBZ image pages, CBR header-only listing, and DjVu page
 geometry. See [Phase 3 notes](PHASE3-NOTES.md) for supported subsets and limits.
+
+Phase 4 delegates PDF native text, metadata and preflight to upstream LiteParse.
+PDF thumbnails render the first page only when requested. Raster images report
+sampled white fraction, luminance histogram, aspect ratio and available PNG/JFIF
+physical density. Image classification is explicitly heuristic, not OCR proof.
+`--probe-ocr` adds local English Tesseract word counts and mean confidence;
+missing trained data produces a partial report, never an automatic download.
+See [Phase 4 notes](PHASE4-NOTES.md) for bounds and six-page verification.

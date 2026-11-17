@@ -1674,7 +1674,9 @@ dependencies = [
  "quick-xml",
  "serde",
  "serde_json",
+ "tesseract-rs",
  "thiserror 2.0.21",
+ "tokio",
  "unicode-general-category",
  "zip 9.6.1",
 ]

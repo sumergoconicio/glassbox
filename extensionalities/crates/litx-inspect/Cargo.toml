@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Offline, bounded file identification and native Office inspection"
+description = "Offline, bounded file identification and native Quick Look inspection"
 
 [features]
 default = []
@@ -26,6 +26,8 @@ thiserror = "2"
 encoding_rs = "0.8"
 crc32fast = "1"
 percent-encoding = "2"
+tesseract-rs = "0.2"
+tokio = { version = "1", features = ["rt"] }
 # Match the inspected Go scorer's Unicode 15 letter and uppercase categories.
 unicode-general-category = "=0.6.0"
 liteparse = { path = "../../../crates/liteparse", features = ["tesseract"] }
