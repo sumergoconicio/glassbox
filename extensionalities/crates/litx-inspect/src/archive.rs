@@ -1,0 +1,112 @@
+use crate::{ArchiveEntry, InspectReport};
+use std::{collections::HashSet, fs::File, io::Read, path::Path};
+use thiserror::Error;
+use zip::ZipArchive;
+
+pub(crate) const MAX_ENTRIES: usize = 4096;
+pub(crate) const MAX_ENTRY_BYTES: u64 = 16 << 20;
+const MAX_TOTAL_BYTES: u64 = 256 << 20;
+
+#[derive(Debug, Error)]
+pub(crate) enum ArchiveError {
+    #[error("{0}")]
+    Limit(&'static str),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub(crate) struct Archive {
+    inner: ZipArchive<File>,
+    pub names: Vec<String>,
+    read_bytes: u64,
+}
+
+impl Archive {
+    pub fn open(path: &Path, report: &mut InspectReport) -> Result<Self, ArchiveError> {
+        let file = File::open(path)?;
+        if file.metadata()?.len() > MAX_TOTAL_BYTES {
+            return Err(ArchiveError::Limit("ZIP physical byte cap exceeded"));
+        }
+        let mut inner = ZipArchive::new(file)?;
+        if inner.len() > MAX_ENTRIES {
+            return Err(ArchiveError::Limit("ZIP entry-count cap exceeded"));
+        }
+        let mut total = 0u64;
+        let mut name_bytes = 0usize;
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for i in 0..inner.len() {
+            let entry = inner.by_index_raw(i)?;
+            let name = entry.name()?.into_owned();
+            total = total
+                .checked_add(entry.size())
+                .ok_or(ArchiveError::Limit("ZIP size overflow"))?;
+            if total > MAX_TOTAL_BYTES {
+                return Err(ArchiveError::Limit(
+                    "ZIP total-uncompressed-bytes cap exceeded",
+                ));
+            }
+            name_bytes += name.len();
+            if name.len() > 4096 || name_bytes > 1 << 20 {
+                return Err(ArchiveError::Limit("ZIP entry-name byte cap exceeded"));
+            }
+            if !seen.insert(name.clone()) {
+                return Err(ArchiveError::Limit(
+                    "duplicate ZIP entry names are ambiguous",
+                ));
+            }
+            if entry.enclosed_name().is_none() || name.contains('\\') {
+                report.error(
+                    "archive",
+                    format!("unsafe entry name retained as data: {name:?}"),
+                );
+            }
+            names.push(name.clone());
+            let timestamp = entry.last_modified().map(|d| {
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                    d.year(),
+                    d.month(),
+                    d.day(),
+                    d.hour(),
+                    d.minute(),
+                    d.second()
+                )
+            });
+            report.entries.push(ArchiveEntry {
+                name,
+                size: entry.size(),
+                compressed_size: entry.compressed_size(),
+                timestamp,
+            });
+        }
+        report.counts.entries = Some(names.len());
+        Ok(Self {
+            inner,
+            names,
+            read_bytes: 0,
+        })
+    }
+
+    pub fn read(&mut self, name: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
+        if !self.names.iter().any(|n| n == name) {
+            return Ok(None);
+        }
+        let entry = self.inner.by_name(name)?;
+        if entry.size() > MAX_ENTRY_BYTES {
+            return Err(ArchiveError::Limit("ZIP per-entry read cap exceeded"));
+        }
+        let mut bytes = Vec::new();
+        entry.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_ENTRY_BYTES {
+            return Err(ArchiveError::Limit("ZIP expanded entry exceeds read cap"));
+        }
+        self.read_bytes += bytes.len() as u64;
+        if self.read_bytes > MAX_TOTAL_BYTES {
+            return Err(ArchiveError::Limit("ZIP cumulative read cap exceeded"));
+        }
+        Ok(Some(bytes))
+    }
+}

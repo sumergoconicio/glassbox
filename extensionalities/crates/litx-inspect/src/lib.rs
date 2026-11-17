@@ -1,6 +1,9 @@
 //! Bounded, offline Quick Look. Claims retain their source; they are not verified identities.
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+mod archive;
+mod detect;
+mod thumbnail;
 
 #[derive(Debug, Clone)]
 pub struct InspectOptions {
@@ -177,11 +180,7 @@ impl InspectReport {
 }
 
 pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
-    let extension = path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
+    let extension = detect::extension(path);
     let mut report = InspectReport {
         format: Format {
             extension: extension.clone(),
@@ -209,6 +208,54 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
         Ok(meta) if meta.is_file() => report.counts.bytes = meta.len(),
         Ok(_) => report.error("input", "input is not a regular file"),
         Err(error) => report.error("input", error),
+    }
+    if report.errors.is_empty() {
+        if let Err(error) = detect::detect(path, &mut report) {
+            report.error("detection", error);
+        } else if report.format.detected_mime.as_deref() == Some("application/zip")
+            || matches!(
+                report.format.extension.as_str(),
+                "zip" | "cbz" | "docx" | "xlsx" | "xlsm" | "pptx" | "odt" | "ods" | "odp"
+            )
+        {
+            match archive::Archive::open(path, &mut report) {
+                Ok(mut archive) => {
+                    // Only allowlisted embedded preview entries may be read.
+                    if options.thumbnail.is_some() {
+                        for name in [
+                            "docProps/thumbnail.jpeg",
+                            "docProps/thumbnail.png",
+                            "Thumbnails/thumbnail.png",
+                        ] {
+                            match archive.read(name) {
+                                Ok(Some(bytes)) => {
+                                    thumbnail::write(
+                                        std::io::Cursor::new(bytes),
+                                        "embedded",
+                                        options,
+                                        &mut report,
+                                    );
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(error) => report.error("thumbnail", error),
+                            }
+                        }
+                    }
+                }
+                Err(error) => report.error("archive", error),
+            }
+        } else if report.format.bucket == "Images" && options.thumbnail.is_some() {
+            match std::fs::File::open(path) {
+                Ok(file) => thumbnail::write(
+                    std::io::BufReader::new(file),
+                    "downscaled",
+                    options,
+                    &mut report,
+                ),
+                Err(error) => report.error("thumbnail", error),
+            }
+        }
     }
     if options.probe_ocr {
         report.error("probe_ocr", "image OCR probing is deferred to Phase 4");
