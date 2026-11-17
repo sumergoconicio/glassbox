@@ -1,5 +1,10 @@
 use crate::{ArchiveEntry, InspectReport};
-use std::{collections::HashSet, fs::File, io::Read, path::Path};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 use thiserror::Error;
 use zip::ZipArchive;
 
@@ -25,10 +30,11 @@ pub(crate) struct Archive {
 
 impl Archive {
     pub fn open(path: &Path, report: &mut InspectReport) -> Result<Self, ArchiveError> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         if file.metadata()?.len() > MAX_TOTAL_BYTES {
             return Err(ArchiveError::Limit("ZIP physical byte cap exceeded"));
         }
+        check_directory(&mut file)?;
         let mut inner = ZipArchive::new(file)?;
         if inner.len() > MAX_ENTRIES {
             return Err(ArchiveError::Limit("ZIP entry-count cap exceeded"));
@@ -109,4 +115,45 @@ impl Archive {
         }
         Ok(Some(bytes))
     }
+}
+
+fn check_directory(file: &mut File) -> Result<(), ArchiveError> {
+    let tail_len = file.metadata()?.len().min(65_557) as usize;
+    file.seek(SeekFrom::End(-(tail_len as i64)))?;
+    let mut tail = Vec::with_capacity(tail_len);
+    file.read_to_end(&mut tail)?;
+    let u16_at = |i: usize| u16::from_le_bytes([tail[i], tail[i + 1]]);
+    let mut found = None;
+    if tail.len() >= 22 {
+        for i in (0..=tail.len() - 22).rev() {
+            if &tail[i..i + 4] == b"PK\x05\x06" && i + 22 + u16_at(i + 20) as usize == tail.len() {
+                found = Some(i);
+                break;
+            }
+        }
+    }
+    let i = found.ok_or(ArchiveError::Limit(
+        "ZIP missing or truncated end-of-directory",
+    ))?;
+    // ZIP64 has a separate count/size record; do not trust the classic fields.
+    if i >= 20 && &tail[i - 20..i - 16] == b"PK\x06\x07" {
+        return Err(ArchiveError::Limit(
+            "ZIP64 directories require a bounded ZIP64 adapter",
+        ));
+    }
+    if u16_at(i + 10) as usize > MAX_ENTRIES {
+        return Err(ArchiveError::Limit(
+            "ZIP entry-count cap exceeded before directory allocation",
+        ));
+    }
+    let directory_bytes =
+        u32::from_le_bytes(tail[i + 12..i + 16].try_into().expect("fixed EOCD slice"));
+    if directory_bytes > 2 << 20 {
+        return Err(ArchiveError::Limit("ZIP directory byte cap exceeded"));
+    }
+    if u16_at(i + 4) != 0 || u16_at(i + 6) != 0 || u16_at(i + 8) != u16_at(i + 10) {
+        return Err(ArchiveError::Limit("multi-disk ZIP is unsupported"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(())
 }

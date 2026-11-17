@@ -3,7 +3,18 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 mod archive;
 mod detect;
+mod odf;
+mod office;
+mod profile;
+mod spreadsheet;
+mod tables;
 mod thumbnail;
+mod xml;
+pub use tables::{DocumentTable, TableCell};
+
+/// Explicitly linked libav bindings, never part of the default binary.
+#[cfg(feature = "ffmpeg-link")]
+pub use ffmpeg_next as linked_ffmpeg;
 
 #[derive(Debug, Clone)]
 pub struct InspectOptions {
@@ -48,6 +59,8 @@ pub struct Claim {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Counts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +112,7 @@ pub struct Preflight {
     pub needs_ocr: bool,
     pub reasons: Vec<String>,
     pub confidence: &'static str,
+    pub coverage_available: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +152,7 @@ pub struct InspectReport {
     pub counts: Counts,
     pub entries: Vec<ArchiveEntry>,
     pub sheets: Vec<Sheet>,
+    pub tables: Vec<DocumentTable>,
     pub preflight: Vec<Preflight>,
     pub text: Text,
     pub thumbnail: Option<Thumbnail>,
@@ -147,6 +162,33 @@ pub struct InspectReport {
 }
 
 impl InspectReport {
+    pub(crate) fn append_text(&mut self, value: &str, cap: usize) {
+        let chars = value.chars().count();
+        self.append_counted(value, chars, 1, cap);
+    }
+
+    pub(crate) fn append_counted(
+        &mut self,
+        prefix: &str,
+        chars: usize,
+        repeats: usize,
+        cap: usize,
+    ) {
+        self.counts.chars = self
+            .counts
+            .chars
+            .saturating_add(chars.saturating_mul(repeats));
+        if let Some(copies) = cap.saturating_sub(self.text.chars).checked_div(chars) {
+            let copies = repeats.min(copies.saturating_add(1));
+            for _ in 0..copies {
+                let remaining = cap.saturating_sub(self.text.chars);
+                let taken = chars.min(remaining);
+                self.text.content.extend(prefix.chars().take(taken));
+                self.text.chars += taken;
+            }
+        }
+        self.text.truncated = self.counts.chars > self.text.chars;
+    }
     pub(crate) fn error(&mut self, stage: &'static str, message: impl ToString) {
         self.errors.push(StageError {
             stage,
@@ -195,6 +237,7 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
         counts: Counts::default(),
         entries: vec![],
         sheets: vec![],
+        tables: vec![],
         preflight: vec![],
         text: Text {
             origin: "native".into(),
@@ -212,14 +255,20 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
     if report.errors.is_empty() {
         if let Err(error) = detect::detect(path, &mut report) {
             report.error("detection", error);
-        } else if report.format.detected_mime.as_deref() == Some("application/zip")
-            || matches!(
+        } else if report.format.detected_mime.as_deref().is_some_and(|mime| {
+            mime == "application/zip"
+                || mime.starts_with("application/vnd.openxmlformats-officedocument.")
+                || mime.starts_with("application/vnd.oasis.opendocument.")
+                || mime == "application/vnd.ms-excel.sheet.macroEnabled.12"
+        }) || (report.format.basis == "extension"
+            && matches!(
                 report.format.extension.as_str(),
                 "zip" | "cbz" | "docx" | "xlsx" | "xlsm" | "pptx" | "odt" | "ods" | "odp"
-            )
+            ))
         {
             match archive::Archive::open(path, &mut report) {
                 Ok(mut archive) => {
+                    office::inspect(&mut archive, &mut report, options);
                     // Only allowlisted embedded preview entries may be read.
                     if options.thumbnail.is_some() {
                         for name in [
@@ -262,7 +311,7 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
     }
     if options.packet {
         report.packet = Some(serde_json::json!({
-            "Format": report.format.bucket, "Language": "N/A",
+            "Format": report.format.bucket, "Language": office::language(&report),
             "counts": report.counts, "excerpt": report.text.content,
         }));
     }

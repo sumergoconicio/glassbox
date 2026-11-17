@@ -81,7 +81,34 @@ uses the full host triple for future cache separation.
 Upstream warnings remain. Document parsing, actual OCR execution, consumer
 integration, and other platforms were not tested by this scaffold.
 
-## Scope
+## Original scaffold scope
 
-This scaffold adds no EXIF, ID3, or Office extractors, consumer integration,
+The initial scaffold added no EXIF, ID3, or Office extractors, consumer integration,
 delivery naming, recipe changes, or release assets. Those are separate work.
+
+## Native Quick Look, through Phase 2
+
+`litx inspect PATH --pretty` now detects file bytes, lists guarded ZIP entries,
+and inspects native DOCX/PPTX/XLSX and ODT/ODP/ODS XML. It extracts metadata,
+bounded text previews, spreadsheet profiles, logical document tables, embedded
+thumbnails, and deterministic OCR-preflight signals. No LibreOffice conversion,
+rasterization, network access, or OCR runs during native Office inspection.
+
+Use `--max-chars` (default 16000) for preview text and the separate shared table
+text budget. `--max-units` (default 5) limits preflight only, not full structure
+or character counts. `--thumbnail PATH` refuses to overwrite; its default edge
+limit is 320 pixels. `--packet` adds the lightweight taxonomy projection.
+
+Document tables preserve explicit row/column spans, declared header rows,
+source parts, logical units, and nested table links. They do not claim visual
+geometry or inferred header semantics. Spreadsheet grids remain in `sheets`,
+not document `tables`. Partial failures appear in `errors`.
+
+Optional `magika` and `ffmpeg-link` Cargo features are off by default. Magika
+requires an existing `ORT_DYLIB_PATH`; nothing downloads a runtime automatically.
+Linked FFmpeg requires native development libraries and may impose GPL
+obligations depending on the selected build. Tesseract remains enabled.
+
+See [the Phase 2 review report](PHASE2-REVIEW.md) for exact table semantics,
+resource limits, verification results, and remaining coverage. Work stops at
+this review gate before Phase 3.

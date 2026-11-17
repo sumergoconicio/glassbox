@@ -92,5 +92,39 @@ pub(crate) fn detect(path: &Path, report: &mut InspectReport) -> std::io::Result
             && !ext.starts_with(&format!("tar.{detected_ext}")),
         detector: "file-format".into(),
     };
+    #[cfg(feature = "magika")]
+    if ambiguous {
+        if let Err(error) = magika_fallback(&prefix, report) {
+            report.error("magika", error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "magika")]
+fn magika_fallback(prefix: &[u8], report: &mut InspectReport) -> crate::xml::Result<()> {
+    let path = std::env::var_os("ORT_DYLIB_PATH")
+        .ok_or("optional Magika requires ORT_DYLIB_PATH; no runtime is downloaded")?;
+    if !Path::new(&path).is_file() {
+        return Err("ORT_DYLIB_PATH is not a regular file".into());
+    }
+    ort::init_from(path)?.commit();
+    let mut session = magika::Builder::default()
+        .with_intra_threads(2)
+        .with_inter_threads(1)
+        .build()?;
+    let found = session.identify_content_sync(prefix)?;
+    let info = found.info();
+    report.claims.push(crate::Claim {
+        key: "magika_detection".into(),
+        value: format!(
+            "{}; score={}; sampled_bytes={}",
+            info.label,
+            found.score(),
+            prefix.len()
+        ),
+        source: "bytes",
+    });
+    // A statistical alternative remains a claim, not a byte-verified identity.
     Ok(())
 }

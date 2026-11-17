@@ -1,11 +1,14 @@
 # Study references
 
-Implementation plan references, for study only. No source code is copied and no
-dependency is taken from these projects:
+Implementation plan references. Except for the optional Magika crate noted
+below, these are study-only references: no source code is copied and no
+dependency is taken from them.
 
 - Shiva (`TOOLS/shiva`): native document metadata and legacy spreadsheet reference.
 - Microsoft MarkItDown (`MEDIA/markitdown`): format coverage reference.
-- Magika (`TOOLS/magika`): optional future detection reference.
+- Magika (`TOOLS/magika`): detection reference; the off-by-default `magika`
+  feature now depends on the published Magika Rust crate and dynamic ONNX
+  bindings. No source is vendored or copied into this workspace.
 - subextractor, VideOCR, Video Subtitle Extractor (VSE), Subtitler,
   iSubRip, quick-subtitles: subtitle workflow references.
 - Subloader: candidate ranking reference.

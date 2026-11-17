@@ -10,6 +10,11 @@ description = "Isolated LiteParse Extended CLI scaffold"
 name = "litx"
 path = "src/main.rs"
 
+[features]
+default = []
+magika = ["litx-inspect/magika"]
+ffmpeg-link = ["litx-inspect/ffmpeg-link"]
+
 [dependencies]
 litx-inspect = { path = "../litx-inspect" }
 liteparse = { path = "../../../crates/liteparse", features = ["tesseract"] }
