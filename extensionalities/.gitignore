@@ -1,0 +1,15 @@
+# Keep source fixtures visible despite upstream's broad file-type rules.
+!*.txt
+!*.pdf
+!*.png
+!*.log
+!*cache*
+!*claude*
+!bin/
+!tmp/
+!temp/
+
+# Build products and secrets remain local.
+target/
+.env
+.env.*
