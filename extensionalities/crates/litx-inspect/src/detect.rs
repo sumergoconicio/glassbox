@@ -13,7 +13,7 @@ pub(crate) fn bucket(ext: &str) -> &'static str {
         ("Structured Data", "json jsonl xml yaml yml toml"),
         ("Images", "jpg jpeg png gif webp heic avif tif tiff bmp"),
         ("Vector Graphics", "svg eps"),
-        ("Ebooks", "epub mobi azw azw3"),
+        ("Ebooks", "epub mobi azw azw3 prc djvu djv"),
         ("Comics", "cbz cbr"),
         ("Audio", "mp3 m4a aac flac wav ogg opus aiff"),
         ("Video", "mp4 mkv mov avi webm m4v mpeg"),

@@ -11,7 +11,7 @@ def archive(name, entries):
     with zipfile.ZipFile(ROOT / name, "w", zipfile.ZIP_DEFLATED) as out:
         for path, body in entries.items():
             info = zipfile.ZipInfo(path, (2026, 1, 2, 3, 4, 6))
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED if name.endswith(".epub") and path == "mimetype" else zipfile.ZIP_DEFLATED
             out.writestr(info, body)
 
 
@@ -188,3 +188,120 @@ struct.pack_into("<HH", directory, 8, 4097, 4097)
 archive("zip64-directory.zip", {})
 end = (ROOT / "zip64-directory.zip").read_bytes()
 (ROOT / "zip64-directory.zip").write_bytes(struct.pack("<4sIQI", b"PK\x06\x07", 0, 0, 1) + end)
+
+OPF = "http://www.idpf.org/2007/opf"
+CONTAINER = "urn:oasis:names:tc:opendocument:xmlns:container"
+archive("native.epub", {
+    "mimetype": "application/epub+zip",
+    "META-INF/container.xml": f'<container xmlns="{CONTAINER}"><rootfiles><rootfile full-path="Book/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>',
+    "Book/package.opf": f'''<package xmlns="{OPF}" version="2.0"><metadata xmlns:dc="{DC}"><dc:title>Bounded Book</dc:title><dc:creator>Example Writer</dc:creator><dc:language>es</dc:language><meta name="cover" content="cover"/></metadata>
+<manifest><item id="last" href="last.xhtml" media-type="application/xhtml+xml"/><item id="first" href="first.xhtml" media-type="application/xhtml+xml"/><item id="cover" href="images/cover.png" media-type="image/png"/></manifest>
+<spine><itemref idref="first"/><itemref idref="last"/></spine></package>''',
+    "Book/last.xhtml": '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Not body</title></head><body><p>Second chapter.</p></body></html>',
+    "Book/first.xhtml": '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>First <em>chapter</em> &amp; evidence.</p><script>never execute or include</script></body></html>',
+    "Book/images/cover.png": png(64, 40),
+})
+repack("native.epub", "escaping.epub", {
+    "META-INF/container.xml": f'<container xmlns="{CONTAINER}"><rootfiles><rootfile full-path="../outside.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'
+})
+
+def mobi(name, version=6, compression=2, encrypted=0, payload=None):
+    text = b"<html><body><p>Native MOBI abcabc &amp; evidence.</p></body></html>"
+    encoded = text.replace(b" M", b"\xcd").replace(b"abcabc", b"abc\x80\x18") if compression == 2 else text
+    if payload is not None:
+        encoded = payload
+    records = []
+    for kind, value in [(100, b"Example Author"), (101, b"Example Press"), (504, b"TEST-ASIN"), (524, b"de"), (201, struct.pack(">I", 0))]:
+        records.append(struct.pack(">II", kind, 8 + len(value)) + value)
+    exth = b"EXTH" + struct.pack(">II", 12 + sum(map(len, records)), len(records)) + b"".join(records)
+    title = b"Native Pocket Book"
+    head = bytearray(248)
+    struct.pack_into(">HHIHHHH", head, 0, compression, 0, len(text), 1, 4096, encrypted, 0)
+    head[16:20] = b"MOBI"
+    for offset, value in [(20, 232), (24, 2), (28, 65001), (36, version), (84, len(head) + len(exth)), (88, len(title)), (92, 1031), (108, 2), (128, 0x40)]:
+        struct.pack_into(">I", head, offset, value)
+    parts = [bytes(head) + exth + title, encoded, png(64, 40)]
+    pdb = bytearray(78)
+    pdb[60:68] = b"BOOKMOBI"
+    struct.pack_into(">H", pdb, 76, len(parts))
+    offset = 78 + 8 * len(parts) + 2
+    for part in parts:
+        pdb.extend(struct.pack(">II", offset, 0))
+        offset += len(part)
+    (ROOT / name).write_bytes(pdb + b"\0\0" + b"".join(parts))
+
+
+mobi("native.mobi")
+mobi("native.azw3", version=8, compression=1)
+mobi("encrypted.azw", encrypted=2)
+mobi("huff.mobi", compression=17480)
+mobi("broken-lz77.mobi", payload=b"\x80\x00")
+archive("pages.cbz", {"ComicInfo.xml": "<ComicInfo/>", "02.png": png(64, 40), "01.png": png(128, 80)})
+
+def iff(kind, data):
+    return kind + struct.pack(">I", len(data)) + data + (b"\0" if len(data) & 1 else b"")
+
+
+def djvu_page(width, height):
+    info = struct.pack(">HHBB", width, height, 26, 0) + struct.pack("<H", 300) + b"\x16\x01"
+    return iff(b"FORM", b"DJVU" + iff(b"INFO", info))
+
+
+components = [iff(b"FORM", b"DJVI"), djvu_page(600, 800), djvu_page(900, 1200)]
+directory_size = 3 + 4 * len(components) + 1
+offset = 16 + 8 + directory_size + (directory_size & 1)
+offsets = []
+for component in components:
+    offsets.append(offset)
+    offset += len(component)
+directory = b"\x81" + struct.pack(">H", len(components)) + b"".join(struct.pack(">I", o) for o in offsets) + b"\0"
+(ROOT / "bundled.djvu").write_bytes(b"AT&T" + iff(b"FORM", b"DJVM" + iff(b"DIRM", directory) + b"".join(components)))
+(ROOT / "single.djvu").write_bytes(b"AT&T" + djvu_page(600, 800))
+(ROOT / "indirect.djvu").write_bytes(b"AT&T" + iff(b"FORM", b"DJVM" + iff(b"DIRM", b"\x01\0\x03\0")))
+(ROOT / "truncated.djvu").write_bytes((ROOT / "bundled.djvu").read_bytes()[:-3])
+
+def rar4_block(kind, flags, body=b"", data=b""):
+    header = struct.pack("<BHH", kind, flags, 7 + len(body)) + body
+    return struct.pack("<H", zlib.crc32(header) & 0xffff) + header + data
+
+
+rar4 = bytearray(b"Rar!\x1a\x07\x00" + rar4_block(0x73, 0, b"\0" * 6))
+for name in [b"02.png", b"01.png"]:
+    data = png(64, 40)
+    body = struct.pack("<IIBIIBBHI", len(data), len(data), 3, zlib.crc32(data), 0, 20, 0x30, len(name), 0) + name
+    rar4.extend(rar4_block(0x74, 0x8000, body, data))
+rar4.extend(rar4_block(0x7b, 0x4000))
+(ROOT / "pages4.cbr").write_bytes(rar4)
+
+def vint(n):
+    result = bytearray()
+    while n >= 128:
+        result.append((n & 127) | 128)
+        n >>= 7
+    return result + bytes([n])
+
+
+def rar5_block(kind, flags, body=b"", data=b""):
+    header = vint(kind) + vint(flags) + (vint(len(data)) if flags & 2 else b"") + body
+    checked = vint(len(header)) + header
+    return struct.pack("<I", zlib.crc32(checked)) + checked + data
+
+
+rar5 = bytearray(b"Rar!\x1a\x07\x01\x00" + rar5_block(1, 0, vint(0)))
+for name in [b"02.png", b"01.png"]:
+    data = png(64, 40)
+    body = vint(0) + vint(len(data)) + vint(0) + vint(0) + vint(1) + vint(len(name)) + name
+    rar5.extend(rar5_block(2, 2, body, data))
+rar5.extend(rar5_block(5, 0, vint(0)))
+(ROOT / "pages5.cbr").write_bytes(rar5)
+(ROOT / "truncated.cbr").write_bytes(rar5[:-3])
+(ROOT / "encrypted.cbr").write_bytes(b"Rar!\x1a\x07\x00" + rar4_block(0x73, 0x80, b"\0" * 6))
+with zipfile.ZipFile(ROOT / "native.epub") as book:
+    package = book.read("Book/package.opf").decode().replace('href="first.xhtml"', 'href="chapter%20one.xhtml"')
+repack("native.epub", "doctype.epub", {
+    "Book/package.opf": package,
+    "Book/chapter one.xhtml": '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "https://example.invalid/no-fetch.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><body><p>First&nbsp;chapter.</p></body></html>',
+})
+repack("native.epub", "xxe.epub", {
+    "Book/first.xhtml": '<!DOCTYPE html [<!ENTITY secret SYSTEM "file:///etc/passwd">]><html xmlns="http://www.w3.org/1999/xhtml"><body><p>&secret;</p></body></html>',
+})

@@ -110,5 +110,7 @@ Linked FFmpeg requires native development libraries and may impose GPL
 obligations depending on the selected build. Tesseract remains enabled.
 
 See [the Phase 2 review report](PHASE2-REVIEW.md) for exact table semantics,
-resource limits, verification results, and remaining coverage. Work stops at
-this review gate before Phase 3.
+resource limits, and verification results. Following review and approval,
+Phase 3 adds native EPUB spine/metadata/cover extraction, MOBI-family PalmDOC
+text and EXTH metadata, CBZ image pages, CBR header-only listing, and DjVu page
+geometry. See [Phase 3 notes](PHASE3-NOTES.md) for supported subsets and limits.

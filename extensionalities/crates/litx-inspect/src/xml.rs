@@ -1,4 +1,4 @@
-//! Small bounded XML tree. No DTDs, entities, external resources, or namespace guessing.
+//! Small bounded XML tree. No DTD expansion, external resources, or namespace guessing.
 use quick_xml::{NsReader, events::Event, name::ResolveResult};
 use std::collections::BTreeMap;
 
@@ -88,6 +88,15 @@ fn text(stack: &mut [Node], value: String) -> Result<()> {
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Node> {
+    parse_inner(bytes, false)
+}
+
+/// XHTML commonly declares an external DTD. Ignore that declaration, never load it.
+pub(crate) fn parse_xhtml(bytes: &[u8]) -> Result<Node> {
+    parse_inner(bytes, true)
+}
+
+fn parse_inner(bytes: &[u8], xhtml: bool) -> Result<Node> {
     let mut reader = NsReader::from_reader(bytes);
     reader.config_mut().expand_empty_elements = true;
     let mut stack: Vec<Node> = vec![];
@@ -142,13 +151,14 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Node> {
                         "gt" => ">",
                         "quot" => "\"",
                         "apos" => "'",
+                        "nbsp" if xhtml => " ",
                         _ => return Err("unsupported XML entity reference".into()),
                     }
                     .to_string()
                 };
                 text(&mut stack, value)?;
             }
-            Event::DocType(_) => return Err("XML DTDs are prohibited".into()),
+            Event::DocType(_) if !xhtml => return Err("XML DTDs are prohibited".into()),
             Event::Decl(e) => version = e.xml_version()?,
             Event::Eof => break,
             _ => {}

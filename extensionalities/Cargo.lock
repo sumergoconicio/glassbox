@@ -1662,12 +1662,15 @@ dependencies = [
 name = "litx-inspect"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "encoding_rs",
  "ffmpeg-next",
  "file-format",
  "image",
  "liteparse",
  "magika",
  "ort",
+ "percent-encoding",
  "quick-xml",
  "serde",
  "serde_json",

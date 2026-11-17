@@ -2,10 +2,16 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 mod archive;
+mod binary;
+mod comics;
 mod detect;
+mod djvu;
+mod epub;
+mod mobi;
 mod odf;
 mod office;
 mod profile;
+mod rar;
 mod spreadsheet;
 mod tables;
 mod thumbnail;
@@ -60,6 +66,8 @@ pub struct Claim {
 #[derive(Debug, Default, Serialize)]
 pub struct Counts {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub spine_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tables: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages: Option<usize>,
@@ -106,6 +114,16 @@ pub struct ArchiveEntry {
 }
 
 #[derive(Debug, Serialize)]
+pub struct Page {
+    pub index: usize,
+    pub source_part: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub dpi: Option<u16>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Preflight {
     pub page_number: usize,
     pub unit_kind: &'static str,
@@ -147,6 +165,7 @@ pub struct Sheet {
 
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
+    pub pages: Vec<Page>,
     pub format: Format,
     pub claims: Vec<Claim>,
     pub counts: Counts,
@@ -224,6 +243,7 @@ impl InspectReport {
 pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
     let extension = detect::extension(path);
     let mut report = InspectReport {
+        pages: vec![],
         format: Format {
             extension: extension.clone(),
             detected_mime: None,
@@ -257,18 +277,21 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
             report.error("detection", error);
         } else if report.format.detected_mime.as_deref().is_some_and(|mime| {
             mime == "application/zip"
+                || mime == "application/epub+zip"
                 || mime.starts_with("application/vnd.openxmlformats-officedocument.")
                 || mime.starts_with("application/vnd.oasis.opendocument.")
                 || mime == "application/vnd.ms-excel.sheet.macroEnabled.12"
         }) || (report.format.basis == "extension"
             && matches!(
                 report.format.extension.as_str(),
-                "zip" | "cbz" | "docx" | "xlsx" | "xlsm" | "pptx" | "odt" | "ods" | "odp"
+                "zip" | "cbz" | "epub" | "docx" | "xlsx" | "xlsm" | "pptx" | "odt" | "ods" | "odp"
             ))
         {
             match archive::Archive::open(path, &mut report) {
                 Ok(mut archive) => {
                     office::inspect(&mut archive, &mut report, options);
+                    epub::inspect(&mut archive, &mut report, options);
+                    comics::cbz(&mut archive, &mut report, options);
                     // Only allowlisted embedded preview entries may be read.
                     if options.thumbnail.is_some() {
                         for name in [
@@ -294,6 +317,31 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
                 }
                 Err(error) => report.error("archive", error),
             }
+        } else if report
+            .format
+            .detected_mime
+            .as_deref()
+            .is_some_and(|m| m.contains("mobipocket") || m == "application/vnd.amazon.ebook")
+            || (report.format.basis == "extension"
+                && matches!(extension.as_str(), "mobi" | "azw" | "azw3" | "prc"))
+        {
+            mobi::inspect(path, &mut report, options);
+        } else if report
+            .format
+            .detected_mime
+            .as_deref()
+            .is_some_and(|m| m.contains("djvu"))
+            || (report.format.basis == "extension" && matches!(extension.as_str(), "djvu" | "djv"))
+        {
+            djvu::inspect(path, &mut report);
+        } else if report
+            .format
+            .detected_mime
+            .as_deref()
+            .is_some_and(|m| m == "application/vnd.rar" || m == "application/x-rar-compressed")
+            || (report.format.basis == "extension" && matches!(extension.as_str(), "cbr" | "rar"))
+        {
+            rar::inspect(path, &mut report);
         } else if report.format.bucket == "Images" && options.thumbnail.is_some() {
             match std::fs::File::open(path) {
                 Ok(file) => thumbnail::write(
