@@ -122,3 +122,19 @@ physical density. Image classification is explicitly heuristic, not OCR proof.
 `--probe-ocr` adds local English Tesseract word counts and mean confidence;
 missing trained data produces a partial report, never an automatic download.
 See [Phase 4 notes](PHASE4-NOTES.md) for bounds and six-page verification.
+
+## Phase 5: Markdown and persistent extraction
+
+`litx inspect` now defaults to a five-page PDF preview and 500 word tokens.
+`litx extract` processes full documents, subject to explicit options and safety
+limits, with local OCR enabled unless `--no-ocr` is supplied.
+
+Both commands support a persistent mixed-format JSONL worker through `--batch`,
+first-class Markdown output, and optional exclusive `.md`/`.json` files through
+`--output-dir`. Dataset output remains a five-data-row preview rather than an
+export. iWork uses explicitly partial embedded previews, capped at one page or
+image and 4,000 characters, including for Numbers.
+
+See [Phase 5 notes](PHASE5-NOTES.md) for the worker protocol, dataset and Parquet
+limits, output provenance, and the proposed native/browser boundary. The browser
+boundary is a delivery plan, not a verified WASM build.

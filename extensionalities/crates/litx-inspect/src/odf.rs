@@ -114,6 +114,7 @@ fn spreadsheet(
     for (index, table) in tables.iter().enumerate() {
         let result = (|| -> xml::Result<()> {
             let mut grid = Grid::new(table.attr_ns(TABLE, "name").unwrap_or("").into(), index + 1);
+            let mut markdown = crate::markdown::SheetRows::default();
             let mut row_number = 1usize;
             let mut sheet_chars = 0usize;
             for row in table.descendants(TABLE, "table-row") {
@@ -241,8 +242,28 @@ fn spreadsheet(
                 }
                 if last_text_col > 0 {
                     append("\n", 1);
+                    markdown.push(
+                        row_prefix
+                            .trim_end_matches('\n')
+                            .split('\t')
+                            .enumerate()
+                            .map(|(i, value)| (i + 1, value.to_string()))
+                            .collect(),
+                        repeat_rows,
+                        options.max_chars,
+                    );
                     sheet_chars += row_chars * repeat_rows;
-                    report.append_counted(&row_prefix, row_chars, repeat_rows, options.max_chars);
+                    let preview_repeats = repeat_rows.min(7usize.saturating_sub(row_number));
+                    report.append_counted(
+                        &row_prefix,
+                        row_chars,
+                        preview_repeats,
+                        options.max_chars,
+                    );
+                    report.counts.chars = report
+                        .counts
+                        .chars
+                        .saturating_add(row_chars.saturating_mul(repeat_rows - preview_repeats));
                 }
                 row_number += repeat_rows;
             }
@@ -254,7 +275,9 @@ fn spreadsheet(
                 !table.descendants(DRAW, "image").is_empty(),
                 options,
             );
-            report.sheets.push(grid.finish());
+            let mut sheet = grid.finish();
+            markdown.write(&mut sheet, report, options);
+            report.sheets.push(sheet);
             Ok(())
         })();
         if let Err(error) = result {
@@ -272,7 +295,17 @@ fn unit(
     report: &mut InspectReport,
     options: &InspectOptions,
 ) -> xml::Result<()> {
+    let table_start = report.tables.len();
     crate::tables::Context::new(report, "content.xml", kind, index + 1, options).odf_tables(node);
+    if kind == "slide" {
+        crate::markdown::append(
+            report,
+            &format!("## Slide {}\n\n", index + 1),
+            options,
+            "native_structure",
+        );
+    }
+    crate::markdown::odf(node, report, options, table_start);
     let mut chars = 0;
     let mut result = Ok(());
     node.visit(&mut |n| {

@@ -8,6 +8,41 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn identify_pdf_samples_five_pages_and_distinguishes_text_layers_from_scans() {
+    let r = inspect(
+        &fixture("multipage.pdf"),
+        &InspectOptions {
+            identify: true,
+            max_tokens: Some(10_000),
+            max_chars: 100_000,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.counts.pages, Some(6));
+    assert_eq!(r.preflight.len(), 5);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["pdf"]["digital_signal"], "mixed");
+    assert_eq!(v["pdf"]["preview_complete"], true);
+    assert_eq!(v["pdf"]["text_complete"], false);
+    let pages = v["pdf"]["identification_pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 5);
+    assert_eq!(pages[0]["text_layer"], "digital");
+    assert_eq!(pages[1]["text_layer"], "scanned");
+    assert_eq!(pages[1]["ocr_status"], "no_text_detected");
+    assert_eq!(pages[2]["text_layer"], "digital");
+    assert_eq!(pages[2]["ocr_status"], "not_needed");
+    assert_eq!(pages[3]["text_layer"], "no_text_layer");
+    assert!(
+        !r.text
+            .content
+            .contains("Final page confirms full-document extraction.")
+    );
+    assert_eq!(r.pdf.unwrap().geometry.len(), 5);
+}
+
+#[test]
 fn native_pdf_keeps_full_page_counts_and_normalizes_upstream_preflight() {
     let r = inspect(
         &fixture("native.pdf"),
@@ -106,6 +141,7 @@ fn at_least_five_pages_are_checked_while_full_six_page_counts_survive_preview_li
         &fixture("multipage.pdf"),
         &InspectOptions {
             max_chars: 12,
+            max_pages: None,
             ..Default::default()
         },
     );
@@ -131,6 +167,7 @@ fn at_least_five_pages_are_checked_while_full_six_page_counts_survive_preview_li
         &fixture("multipage.pdf"),
         &InspectOptions {
             max_chars: 4096,
+            max_pages: None,
             max_units: usize::MAX,
             ..Default::default()
         },

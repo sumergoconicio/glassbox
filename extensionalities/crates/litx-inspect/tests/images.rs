@@ -8,6 +8,47 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn identify_images_extracts_text_and_reports_clean_negative_scans() {
+    let directory = fixture("../target/tests").join(format!(
+        "identify-image-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("text.png");
+    let rendered = inspect(
+        &fixture("native.pdf"),
+        &InspectOptions {
+            thumbnail: Some(path.clone()),
+            thumbnail_max_edge: 800,
+            max_units: 0,
+            ..Default::default()
+        },
+    );
+    assert!(rendered.errors.is_empty(), "{:?}", rendered.errors);
+    let options = InspectOptions {
+        identify: true,
+        ..Default::default()
+    };
+    let r = inspect(&path, &options);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["image"]["ocr_status"], "text_detected");
+    assert_eq!(r.text.origin, "ocr");
+    assert!(r.text.content.contains("Native PDF"), "{}", r.text.content);
+    let blank = inspect(&fixture("image.png"), &options);
+    assert!(blank.errors.is_empty(), "{:?}", blank.errors);
+    assert_eq!(
+        serde_json::to_value(&blank).unwrap()["image"]["ocr_status"],
+        "no_text_detected"
+    );
+    assert!(blank.text.content.is_empty());
+}
+
+#[test]
 fn scan_like_histogram_and_dpi_are_heuristics_not_ocr_evidence() {
     let r = inspect(&fixture("document-image.png"), &Default::default());
     assert!(r.errors.is_empty(), "{:?}", r.errors);

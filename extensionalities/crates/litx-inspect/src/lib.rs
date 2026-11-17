@@ -8,19 +8,32 @@ mod detect;
 mod djvu;
 mod epub;
 mod images;
+mod iwork;
+mod json_profile;
+mod markdown;
 mod mobi;
 mod odf;
 mod office;
+mod parquet;
+#[cfg(all(feature = "parquet-preview", not(target_arch = "wasm32")))]
+mod parquet_rows;
 mod pdf;
 mod profile;
 mod rar;
 mod spreadsheet;
 mod tables;
+mod tabular;
+mod text;
 mod thumbnail;
 mod xml;
 pub use images::{ImageAnalysis, OcrProbe};
+pub use iwork::DerivedPreview;
+pub use json_profile::JsonProfile;
+pub use markdown::Markdown;
+pub use parquet::ParquetProfile;
 pub use pdf::{PdfAnalysis, PdfGeometry};
 pub use tables::{DocumentTable, TableCell};
+pub use tabular::DatasetPreview;
 
 /// Explicitly linked libav bindings, never part of the default binary.
 #[cfg(feature = "ffmpeg-link")]
@@ -28,6 +41,9 @@ pub use ffmpeg_next as linked_ffmpeg;
 
 #[derive(Debug, Clone)]
 pub struct InspectOptions {
+    pub identify: bool,
+    pub max_tokens: Option<usize>,
+    pub max_pages: Option<usize>,
     pub max_chars: usize,
     pub max_units: usize,
     pub thumbnail: Option<PathBuf>,
@@ -39,6 +55,9 @@ pub struct InspectOptions {
 impl Default for InspectOptions {
     fn default() -> Self {
         Self {
+            identify: false,
+            max_tokens: None,
+            max_pages: Some(5),
             max_chars: 16_000,
             max_units: 5,
             thumbnail: None,
@@ -89,6 +108,8 @@ pub struct Counts {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Text {
+    pub tokens: usize,
+    pub token_basis: &'static str,
     pub content: String,
     pub truncated: bool,
     pub chars: usize,
@@ -154,6 +175,9 @@ pub struct Column {
 
 #[derive(Debug, Serialize)]
 pub struct Sheet {
+    pub preview_rows: Vec<Vec<String>>,
+    pub preview_truncated: bool,
+    pub headers_preview: Vec<Option<String>>,
     pub name: String,
     pub index: usize,
     pub used_range: Option<String>,
@@ -169,6 +193,17 @@ pub struct Sheet {
 
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_preview: Option<DerivedPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<DatasetPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parquet: Option<ParquetProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<JsonProfile>,
+    pub source_path: PathBuf,
+    pub artifacts: Vec<Artifact>,
+    pub markdown: Markdown,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdf: Option<PdfAnalysis>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,6 +221,12 @@ pub struct InspectReport {
     pub errors: Vec<StageError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packet: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Artifact {
+    pub kind: &'static str,
+    pub path: PathBuf,
 }
 
 impl InspectReport {
@@ -264,8 +305,35 @@ impl InspectReport {
 }
 
 pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
+    Inspector::default().inspect(path, options)
+}
+
+/// Sequential inspection session. OCR models load lazily and stay local to this session.
+#[derive(Default)]
+pub struct Inspector {
+    ocr: images::OcrSession,
+}
+
+impl Inspector {
+    pub fn inspect(&mut self, path: &Path, options: &InspectOptions) -> InspectReport {
+        inspect_with_session(path, options, &mut self.ocr)
+    }
+}
+
+fn inspect_with_session(
+    path: &Path,
+    options: &InspectOptions,
+    ocr: &mut images::OcrSession,
+) -> InspectReport {
     let extension = detect::extension(path);
     let mut report = InspectReport {
+        derived_preview: None,
+        dataset: None,
+        parquet: None,
+        json: None,
+        source_path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        artifacts: vec![],
+        markdown: Markdown::default(),
         pdf: None,
         image: None,
         pages: vec![],
@@ -286,6 +354,7 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
         preflight: vec![],
         text: Text {
             origin: "native".into(),
+            token_basis: "whitespace_words",
             ..Text::default()
         },
         thumbnail: None,
@@ -306,10 +375,23 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
                 || mime.starts_with("application/vnd.openxmlformats-officedocument.")
                 || mime.starts_with("application/vnd.oasis.opendocument.")
                 || mime == "application/vnd.ms-excel.sheet.macroEnabled.12"
+                || mime.starts_with("application/vnd.apple.")
         }) || (report.format.basis == "extension"
             && matches!(
                 report.format.extension.as_str(),
-                "zip" | "cbz" | "epub" | "docx" | "xlsx" | "xlsm" | "pptx" | "odt" | "ods" | "odp"
+                "zip"
+                    | "cbz"
+                    | "epub"
+                    | "docx"
+                    | "xlsx"
+                    | "xlsm"
+                    | "pptx"
+                    | "odt"
+                    | "ods"
+                    | "odp"
+                    | "pages"
+                    | "numbers"
+                    | "key"
             ))
         {
             match archive::Archive::open(path, &mut report) {
@@ -317,6 +399,8 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
                     office::inspect(&mut archive, &mut report, options);
                     epub::inspect(&mut archive, &mut report, options);
                     comics::cbz(&mut archive, &mut report, options);
+                    iwork::inspect(&mut archive, &mut report, options, ocr);
+                    archive::summarize(&mut report, options);
                     // Only allowlisted embedded preview entries may be read.
                     if options.thumbnail.is_some() {
                         for name in [
@@ -370,17 +454,47 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
         } else if report.format.detected_mime.as_deref() == Some("application/pdf")
             || (report.format.basis == "extension" && extension == "pdf")
         {
-            pdf::inspect(path, &mut report, options);
+            pdf::inspect(path, &mut report, options, ocr);
         } else if report.format.bucket == "Images" {
-            images::inspect(path, &mut report, options);
+            images::inspect(path, &mut report, options, ocr);
+        } else if report.format.detected_mime.as_deref() == Some("application/vnd.apache.parquet")
+            || extension == "parquet"
+        {
+            parquet::inspect(path, &mut report, options);
+        } else if report.format.basis == "extension" && matches!(extension.as_str(), "csv" | "tsv")
+            || matches!(
+                report.format.detected_mime.as_deref(),
+                Some("text/csv" | "text/tab-separated-values")
+            )
+        {
+            tabular::csv(path, &mut report, options);
+        } else if report.format.detected_mime.as_deref() == Some("application/json")
+            || (report.format.basis == "extension" && extension == "json")
+        {
+            json_profile::inspect(path, &mut report, options);
+        } else if report.format.basis == "extension"
+            && matches!(report.format.bucket.as_str(), "Text" | "Source Code")
+        {
+            text::inspect(path, &mut report, options);
         }
     }
-    if options.probe_ocr && report.format.bucket != "Images" {
+    if options.probe_ocr && report.format.bucket != "Images" && report.image.is_none() {
         report.error(
             "probe_ocr",
             "OCR probing is supported for raster images only",
         );
     }
+    if report.sheets.iter().any(|s| s.preview_truncated) {
+        report.text.truncated = true;
+    }
+    if let Some(budget) = options.token_budget()
+        && truncate_words(&mut report.text.content, budget)
+    {
+        report.text.chars = report.text.content.chars().count();
+        report.text.truncated = true;
+    }
+    report.text.tokens = report.text.content.split_whitespace().count();
+    markdown::finish(&mut report, options);
     if options.packet {
         report.packet = Some(serde_json::json!({
             "Format": report.format.bucket, "Language": office::language(&report),
@@ -388,4 +502,51 @@ pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
         }));
     }
     report
+}
+
+impl InspectOptions {
+    fn token_budget(&self) -> Option<usize> {
+        self.max_tokens
+            .or((self.identify && self.max_pages.is_some()).then_some(500))
+    }
+}
+
+fn truncate_words(value: &mut String, budget: usize) -> bool {
+    let mut words = value.split_whitespace();
+    let mut end = 0;
+    for word in words.by_ref().take(budget) {
+        end = word.as_ptr() as usize - value.as_ptr() as usize + word.len();
+    }
+    if words.next().is_some() {
+        value.truncate(end);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+    fn one_inspector_reuses_its_ocr_engine_between_files() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/image.png");
+        let options = InspectOptions {
+            probe_ocr: true,
+            ..Default::default()
+        };
+        let mut inspector = Inspector::default();
+        let first = inspector.inspect(&path, &options);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let handle = inspector.ocr.api.as_ref().unwrap().handle.clone();
+        let second = inspector.inspect(&path, &options);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(std::sync::Arc::ptr_eq(
+            &handle,
+            &inspector.ocr.api.as_ref().unwrap().handle
+        ));
+        assert_eq!(second.image.unwrap().probe.unwrap().word_count, 0);
+    }
 }

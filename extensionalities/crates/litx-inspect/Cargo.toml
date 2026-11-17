@@ -7,7 +7,8 @@ publish = false
 description = "Offline, bounded file identification and native Quick Look inspection"
 
 [features]
-default = []
+default = ["parquet-preview"]
+parquet-preview = ["dep:parquet-reader", "dep:bytes"]
 magika = ["dep:magika", "dep:ort"]
 ffmpeg-link = ["dep:ffmpeg-next"]
 
@@ -26,8 +27,14 @@ thiserror = "2"
 encoding_rs = "0.8"
 crc32fast = "1"
 percent-encoding = "2"
+parquet-format-safe = { version = "=0.2.4", default-features = false }
+csv = "1.4"
 tesseract-rs = "0.2"
 tokio = { version = "1", features = ["rt"] }
 # Match the inspected Go scorer's Unicode 15 letter and uppercase categories.
 unicode-general-category = "=0.6.0"
 liteparse = { path = "../../../crates/liteparse", features = ["tesseract"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parquet-reader = { package = "parquet", version = "=57.3.1", default-features = false, features = ["json", "snap", "lz4"], optional = true }
+bytes = { version = "1", optional = true }

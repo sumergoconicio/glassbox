@@ -62,9 +62,16 @@ pub(crate) fn xlsx(
                 return Err("invalid worksheet root".into());
             }
             let mut grid = Grid::new(sheet.attr("name").unwrap_or("").into(), index + 1);
+            let mut markdown = crate::markdown::SheetRows::default();
             let mut chars = 0;
             let mut previous_row = 0;
-            for row in root.descendants(S, "row") {
+            for (preview_index, row) in root.descendants(S, "row").into_iter().enumerate() {
+                let text_cap = if preview_index < 6 {
+                    options.max_chars
+                } else {
+                    report.text.chars
+                };
+                let mut row_values = Vec::new();
                 let row_number: usize = row
                     .attr("r")
                     .map(str::parse)
@@ -127,13 +134,15 @@ pub(crate) fn xlsx(
                     };
                     let formula = cell.children().any(|n| n.is(S, "f"));
                     grid.cell((row_number, col), &value, kind, formula, 1, &mut budget)?;
+                    row_values.push((col, value.clone()));
                     chars += value.chars().count();
                     if col > 1 {
-                        report.append_text("\t", options.max_chars);
+                        report.append_text("\t", text_cap);
                     }
-                    report.append_text(&value, options.max_chars);
+                    report.append_text(&value, text_cap);
                 }
-                report.append_text("\n", options.max_chars);
+                report.append_text("\n", text_cap);
+                markdown.push(row_values, 1, options.max_chars);
             }
             for merge in root.descendants(S, "mergeCell") {
                 let range = merge.attr("ref").ok_or("merge missing reference")?;
@@ -151,7 +160,9 @@ pub(crate) fn xlsx(
                     || !root.descendants(S, "legacyDrawing").is_empty(),
                 options,
             );
-            report.sheets.push(grid.finish());
+            let mut sheet = grid.finish();
+            markdown.write(&mut sheet, report, options);
+            report.sheets.push(sheet);
             Ok(())
         })();
         if let Err(error) = result {

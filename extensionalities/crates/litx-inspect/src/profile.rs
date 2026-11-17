@@ -125,6 +125,9 @@ impl Grid {
     pub fn new(name: String, index: usize) -> Self {
         Self {
             sheet: Sheet {
+                preview_rows: vec![],
+                preview_truncated: false,
+                headers_preview: vec![],
                 name,
                 index,
                 used_range: None,
@@ -265,6 +268,15 @@ impl Grid {
                     b.column.avg_prose_score = b.score_sum / n as f64;
                 }
                 b.column
+            })
+            .collect();
+        self.sheet.headers_preview = (1..=self.sheet.cols.min(5))
+            .map(|index| {
+                self.sheet
+                    .columns
+                    .iter()
+                    .find(|c| c.index == index)
+                    .and_then(|c| c.header.clone())
             })
             .collect();
         self.sheet

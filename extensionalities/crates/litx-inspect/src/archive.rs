@@ -1,4 +1,4 @@
-use crate::{ArchiveEntry, InspectReport};
+use crate::{ArchiveEntry, InspectOptions, InspectReport};
 use std::{
     collections::HashSet,
     fs::File,
@@ -26,6 +26,27 @@ pub(crate) struct Archive {
     inner: ZipArchive<File>,
     pub names: Vec<String>,
     read_bytes: u64,
+}
+
+pub(crate) fn summarize(report: &mut InspectReport, options: &InspectOptions) {
+    if !report.markdown.content.is_empty() {
+        return;
+    }
+    let mut text = format!(
+        "# Archive listing\n\n- Entries: {}\n\n",
+        report.entries.len()
+    );
+    for entry in &report.entries {
+        text.push_str(&format!(
+            "- {} ({} bytes)\n",
+            crate::markdown::escape(&entry.name).replace(['\r', '\n'], " "),
+            entry.size
+        ));
+        if text.len() > options.max_chars.saturating_mul(4) {
+            break;
+        }
+    }
+    crate::markdown::append(report, &text, options, "native_structure");
 }
 
 impl Archive {

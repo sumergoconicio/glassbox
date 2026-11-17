@@ -15,6 +15,7 @@ pub struct ImageAnalysis {
     pub histogram: [usize; 16],
     pub classification: &'static str,
     pub probe: Option<OcrProbe>,
+    pub ocr_status: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,15 +27,44 @@ pub struct OcrProbe {
     pub mean_confidence: f64,
 }
 
-pub(crate) fn inspect(path: &Path, report: &mut InspectReport, options: &InspectOptions) {
-    if let Err(error) = inner(path, report, options) {
+#[derive(Default)]
+pub(crate) struct OcrSession {
+    pub(crate) api: Option<tesseract_rs::TesseractAPI>,
+}
+
+pub(crate) fn inspect(
+    path: &Path,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+    ocr: &mut OcrSession,
+) {
+    let result = (|| -> xml::Result<()> {
+        let mut source = Source::open(path)?;
+        let bytes = source.range(0, source.len as usize)?;
+        inner(bytes, report, options, ocr)
+    })();
+    if let Err(error) = result {
         report.error("image", error);
     }
 }
 
-fn inner(path: &Path, report: &mut InspectReport, options: &InspectOptions) -> xml::Result<()> {
-    let mut source = Source::open(path)?;
-    let bytes = source.range(0, source.len as usize)?;
+pub(crate) fn inspect_bytes(
+    bytes: Vec<u8>,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+    ocr: &mut OcrSession,
+) {
+    if let Err(error) = inner(bytes, report, options, ocr) {
+        report.error("image", error);
+    }
+}
+
+fn inner(
+    bytes: Vec<u8>,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+    ocr: &mut OcrSession,
+) -> xml::Result<()> {
     let mut reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
     let mut limits = Limits::default();
     limits.max_image_width = Some(16_384);
@@ -92,61 +122,84 @@ fn inner(path: &Path, report: &mut InspectReport, options: &InspectOptions) -> x
         histogram,
         classification,
         probe: None,
+        ocr_status: "not_probed",
     });
     if options.thumbnail.is_some() {
         crate::thumbnail::write(Cursor::new(bytes), "downscaled", options, report);
     }
-    if options.probe_ocr && options.max_units > 0 {
-        match probe(&decoded) {
-            Ok(probe) => report.image.as_mut().unwrap().probe = Some(probe),
-            Err(error) => report.error("probe_ocr", error),
+    if (options.probe_ocr || options.identify) && options.max_units > 0 {
+        match probe(&decoded, ocr) {
+            Ok((probe, text)) => {
+                let image = report.image.as_mut().unwrap();
+                image.ocr_status = if probe.word_count > 0 {
+                    "text_detected"
+                } else {
+                    "no_text_detected"
+                };
+                image.probe = Some(probe);
+                report.text.origin = "ocr".into();
+                report.append_text(&text, options.max_chars);
+            }
+            Err(error) => {
+                report.image.as_mut().unwrap().ocr_status = "failed";
+                report.error("probe_ocr", error);
+            }
         }
     }
     Ok(())
 }
 
-fn probe(image: &image::DynamicImage) -> xml::Result<OcrProbe> {
+pub(crate) fn probe(
+    image: &image::DynamicImage,
+    session: &mut OcrSession,
+) -> xml::Result<(OcrProbe, String)> {
     use tesseract_rs::{TessPageSegMode, TesseractAPI};
-    let directory = if let Some(path) = std::env::var_os("TESSDATA_PREFIX") {
-        std::path::PathBuf::from(path)
-    } else {
-        let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(std::path::PathBuf::from(&home).join(".tesseract-rs/tessdata"));
-            candidates.push(
-                std::path::PathBuf::from(home)
-                    .join("Library/Application Support/tesseract-rs/tessdata"),
+    if session.api.is_none() {
+        let directory = if let Some(path) = std::env::var_os("TESSDATA_PREFIX") {
+            std::path::PathBuf::from(path)
+        } else {
+            let mut candidates = Vec::new();
+            if let Some(home) = std::env::var_os("HOME") {
+                candidates.push(std::path::PathBuf::from(&home).join(".tesseract-rs/tessdata"));
+                candidates.push(
+                    std::path::PathBuf::from(home)
+                        .join("Library/Application Support/tesseract-rs/tessdata"),
+                );
+            }
+            candidates.extend(
+                [
+                    "/usr/share/tesseract-ocr/5/tessdata",
+                    "/usr/share/tessdata",
+                    "/opt/homebrew/share/tessdata",
+                ]
+                .map(std::path::PathBuf::from),
             );
+            candidates
+                .into_iter()
+                .find(|p| p.join("eng.traineddata").is_file())
+                .ok_or("local eng.traineddata unavailable; set TESSDATA_PREFIX (no downloads)")?
+        };
+        let metadata = std::fs::metadata(directory.join("eng.traineddata"))
+            .map_err(|_| "local eng.traineddata unavailable; set TESSDATA_PREFIX (no downloads)")?;
+        if metadata.len() == 0 || metadata.len() > 128 << 20 {
+            return Err("local OCR model byte cap exceeded or empty model".into());
         }
-        candidates.extend(
-            [
-                "/usr/share/tesseract-ocr/5/tessdata",
-                "/usr/share/tessdata",
-                "/opt/homebrew/share/tessdata",
-            ]
-            .map(std::path::PathBuf::from),
-        );
-        candidates
-            .into_iter()
-            .find(|p| p.join("eng.traineddata").is_file())
-            .ok_or("local eng.traineddata unavailable; set TESSDATA_PREFIX (no downloads)")?
-    };
-    let metadata = std::fs::metadata(directory.join("eng.traineddata"))
-        .map_err(|_| "local eng.traineddata unavailable; set TESSDATA_PREFIX (no downloads)")?;
-    if metadata.len() == 0 || metadata.len() > 128 << 20 {
-        return Err("local OCR model byte cap exceeded or empty model".into());
+        directory
+            .to_str()
+            .ok_or("local tessdata directory must be UTF-8")?;
+        let api = TesseractAPI::new();
+        api.init(&directory, "eng")?;
+        api.set_page_seg_mode(TessPageSegMode::PSM_AUTO)?;
+        session.api = Some(api);
     }
-    directory
-        .to_str()
-        .ok_or("local tessdata directory must be UTF-8")?;
     let grayscale = if image.width().max(image.height()) > 2048 {
         image.thumbnail(2048, 2048).to_luma8()
     } else {
         image.to_luma8()
     };
-    let api = TesseractAPI::new();
-    api.init(&directory, "eng")?;
-    api.set_page_seg_mode(TessPageSegMode::PSM_AUTO)?;
+    let api = session.api.as_ref().unwrap();
+    api.clear()?;
+    api.clear_adaptive_classifier()?;
     api.set_image(
         grayscale.as_raw(),
         grayscale.width() as i32,
@@ -157,13 +210,15 @@ fn probe(image: &image::DynamicImage) -> xml::Result<OcrProbe> {
     api.set_source_resolution(150)?;
     api.recognize()?;
     let text = api.get_utf8_text()?;
-    Ok(OcrProbe {
+    let result = OcrProbe {
         basis: "probed",
         engine: "tesseract",
         language: "eng",
         word_count: text.split_whitespace().count(),
         mean_confidence: (api.mean_text_conf()? as f64 / 100.0).clamp(0.0, 1.0),
-    })
+    };
+    api.clear()?;
+    Ok((result, text))
 }
 
 fn png_dpi(bytes: &[u8]) -> Option<[f64; 2]> {

@@ -192,6 +192,7 @@ fn inspect_inner(
             metadata(archive, report);
             docx(&root, report, options);
             crate::tables::Context::new(report, &part, "section", 1, options).word_tables(&root);
+            crate::markdown::word(&root, report, options);
         }
         "pptx" => {
             identify(
@@ -308,8 +309,16 @@ fn pptx(
             if !slide.is(P, "sld") {
                 return Err("invalid slide namespace/root".into());
             }
+            let table_start = report.tables.len();
             crate::tables::Context::new(report, &target, "slide", i + 1, options)
                 .drawing_tables(&slide);
+            crate::markdown::append(
+                report,
+                &format!("## Slide {}\n\n", i + 1),
+                options,
+                "native_structure",
+            );
+            crate::markdown::drawing(&slide, report, options, table_start);
             let mut chars = 0;
             for paragraph in slide.descendants(A, "p") {
                 let mut text = String::new();

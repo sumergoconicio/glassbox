@@ -110,6 +110,7 @@ fn inner(
             }
             let mut text = String::new();
             visible(&content, &mut text);
+            crate::markdown::xhtml(&content, report, options);
             report.append_text(&text, options.max_chars);
             Ok(())
         })();
