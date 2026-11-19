@@ -8,6 +8,9 @@ use crate::{
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+/// Cumulative expanded-text cap for a single ODF document table cell.
+const ODF_CELL_TEXT_CAP: usize = 16 << 20;
+
 #[derive(Debug, Serialize)]
 pub struct DocumentTable {
     pub index: usize,
@@ -43,6 +46,7 @@ pub(crate) struct Context<'a> {
     pub unit: usize,
     remaining: usize,
     cell_count: usize,
+    expansion: Option<&'a mut crate::odf::ExpansionBudget>,
 }
 
 impl<'a> Context<'a> {
@@ -68,7 +72,15 @@ impl<'a> Context<'a> {
             unit,
             remaining: options.max_chars.saturating_sub(used),
             cell_count,
+            expansion: None,
         }
+    }
+
+    /// Attach the document-wide ODF text-expansion budget shared across all
+    /// table cells in the document. Required before `odf_tables`.
+    pub fn with_expansion(mut self, budget: &'a mut crate::odf::ExpansionBudget) -> Self {
+        self.expansion = Some(budget);
+        self
     }
 
     fn empty(&mut self, parent: Option<usize>) -> xml::Result<usize> {
@@ -161,13 +173,13 @@ impl<'a> Context<'a> {
     ) -> Option<usize> {
         let start = self.report.tables.len();
         let remaining = self.remaining;
-        let cell_count = self.cell_count;
         match parse(self, node, parent) {
             Ok(index) => Some(index),
             Err(error) => {
                 self.report.tables.truncate(start);
+                // Output budget is re-granted with the dropped table, but failed
+                // expansion work stays charged to the aggregate cell_count.
                 self.remaining = remaining;
-                self.cell_count = cell_count;
                 self.report
                     .error("table", format!("{}: {error}", self.part));
                 None
@@ -224,6 +236,40 @@ impl<'a> Context<'a> {
             if repeat_rows == 0 || repeat_rows > 200_000usize.saturating_sub(row_number) {
                 return Err("ODF document table row expansion cap exceeded".into());
             }
+            // Expand each source cell's text once, outside the repetition loops.
+            let mut sources = Vec::new();
+            for cell in row
+                .children()
+                .filter(|n| n.is(TABLE, "table-cell") || n.is(TABLE, "covered-table-cell"))
+            {
+                let repeat_cols = number(cell.attr_ns(TABLE, "number-columns-repeated"), 1)?;
+                if repeat_cols == 0 {
+                    return Err("ODF document table column expansion cap exceeded".into());
+                }
+                let (row_span, column_span, value, nested) = if cell.is(TABLE, "covered-table-cell")
+                {
+                    (0, 0, String::new(), vec![])
+                } else {
+                    let row_span = number(cell.attr_ns(TABLE, "number-rows-spanned"), 1)?;
+                    let column_span = number(cell.attr_ns(TABLE, "number-columns-spanned"), 1)?;
+                    let (value, nested) = odf_cell_content(
+                        cell,
+                        ODF_CELL_TEXT_CAP,
+                        self.expansion
+                            .as_deref_mut()
+                            .ok_or("ODF document expansion budget missing")?,
+                    )?;
+                    (row_span, column_span, value, nested)
+                };
+                sources.push(ExpandedCell {
+                    node: cell,
+                    repeat_cols,
+                    row_span,
+                    column_span,
+                    value,
+                    nested,
+                });
+            }
             for _ in 0..repeat_rows {
                 row_number += 1;
                 occupied.row(row_number);
@@ -231,36 +277,35 @@ impl<'a> Context<'a> {
                     headers.push(row_number);
                 }
                 let mut column = 0usize;
-                for cell in row
-                    .children()
-                    .filter(|n| n.is(TABLE, "table-cell") || n.is(TABLE, "covered-table-cell"))
-                {
-                    let repeat_cols = number(cell.attr_ns(TABLE, "number-columns-repeated"), 1)?;
-                    if repeat_cols == 0
-                        || column.checked_add(repeat_cols).is_none_or(|n| n > 16_384)
+                for source in &sources {
+                    if column
+                        .checked_add(source.repeat_cols)
+                        .is_none_or(|n| n > 16_384)
                     {
                         return Err("ODF document table column expansion cap exceeded".into());
                     }
-                    for _ in 0..repeat_cols {
+                    for _ in 0..source.repeat_cols {
                         column += 1;
                         expanded_cells += 1;
                         if expanded_cells > 200_000 {
                             return Err("ODF document table cell expansion cap exceeded".into());
                         }
-                        if cell.is(TABLE, "covered-table-cell") {
+                        if source.node.is(TABLE, "covered-table-cell") {
                             occupied.cover(column).ok_or("orphan ODF covered cell")?;
                             continue;
                         }
-                        let row_span = number(cell.attr_ns(TABLE, "number-rows-spanned"), 1)?;
-                        let column_span = number(cell.attr_ns(TABLE, "number-columns-spanned"), 1)?;
-                        let (value, nested) = odf_cell_content(cell)?;
-                        let mut origin =
-                            self.cell(row_number, column, row_span, column_span, &value)?;
+                        let mut origin = self.cell(
+                            row_number,
+                            column,
+                            source.row_span,
+                            source.column_span,
+                            &source.value,
+                        )?;
                         occupied.insert(&origin, cells.len())?;
-                        for nested in nested {
+                        for &nested in &source.nested {
                             origin.nested_tables.push(self.odf(nested, Some(id))?);
                         }
-                        cols = cols.max(column + column_span - 1);
+                        cols = cols.max(column + source.column_span - 1);
                         cells.push(origin);
                     }
                 }
@@ -508,27 +553,57 @@ fn odf_rows(root: &Node) -> Vec<(&Node, bool)> {
     rows
 }
 
-fn odf_cell_content(cell: &Node) -> xml::Result<(String, Vec<&Node>)> {
-    fn visit<'a>(node: &'a Node, text: &mut String, nested: &mut Vec<&'a Node>) -> xml::Result<()> {
+/// Source ODF table cell with its text expanded once, before row/column repetition.
+struct ExpandedCell<'a> {
+    node: &'a Node,
+    repeat_cols: usize,
+    row_span: usize,
+    column_span: usize,
+    value: String,
+    nested: Vec<&'a Node>,
+}
+
+fn odf_cell_content<'a>(
+    cell: &'a Node,
+    cap: usize,
+    budget: &mut crate::odf::ExpansionBudget,
+) -> xml::Result<(String, Vec<&'a Node>)> {
+    fn visit<'a>(
+        node: &'a Node,
+        text: &mut String,
+        nested: &mut Vec<&'a Node>,
+        cap: usize,
+        budget: &mut crate::odf::ExpansionBudget,
+    ) -> xml::Result<()> {
         if node.is(TABLE, "table") {
             nested.push(node);
             return Ok(());
         }
         if node.is(T, "p") || node.is(T, "h") {
-            if !text.is_empty() {
+            let piece = budget.text(node)?;
+            let separator = usize::from(!text.is_empty());
+            if text
+                .len()
+                .saturating_add(separator)
+                .saturating_add(piece.len())
+                > cap
+            {
+                return Err("ODF cell text cap exceeded".into());
+            }
+            if separator > 0 {
                 text.push('\n');
             }
-            text.push_str(&crate::odf::text(node)?);
+            text.push_str(&piece);
             return Ok(());
         }
         for child in node.children() {
-            visit(child, text, nested)?;
+            visit(child, text, nested, cap, budget)?;
         }
         Ok(())
     }
     let (mut text, mut nested) = (String::new(), vec![]);
     for child in cell.children() {
-        visit(child, &mut text, &mut nested)?;
+        visit(child, &mut text, &mut nested, cap, budget)?;
     }
     Ok((text, nested))
 }
@@ -577,4 +652,57 @@ fn word_cell_content(cell: &Node) -> (String, Vec<&Node>) {
         visit(child, &mut text, &mut nested);
     }
     (text, nested)
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    fn cell(paragraphs: &str) -> crate::xml::Node {
+        let bytes = format!(
+            "<table:table-cell xmlns:table=\"{}\">{}</table:table-cell>",
+            crate::odf::TABLE,
+            paragraphs
+        );
+        crate::xml::parse(bytes.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn odf_cell_content_shares_document_budget_across_cells() {
+        let paragraph = |text: &str| {
+            format!(
+                "<text:p xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">{text}</text:p>"
+            )
+        };
+        // One shared document budget across cells: 10 - 4 - 4 leaves 2 bytes,
+        // so the third cell's 4-byte paragraph is rejected before allocation.
+        let mut budget = crate::odf::ExpansionBudget::new(10);
+        let a = cell(&paragraph("aaaa"));
+        let (text, _) = super::odf_cell_content(&a, 64, &mut budget).unwrap();
+        assert_eq!(text, "aaaa");
+        let b = cell(&paragraph("bbbb"));
+        let (text, _) = super::odf_cell_content(&b, 64, &mut budget).unwrap();
+        assert_eq!(text, "bbbb");
+        let c = cell(&paragraph("cccc"));
+        let error = super::odf_cell_content(&c, 64, &mut budget).unwrap_err();
+        assert!(
+            error.to_string().contains("document expansion budget"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn odf_cell_content_enforces_cumulative_cap_before_append() {
+        let paragraphs = "<text:p xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">aaaa</text:p>\
+                          <text:p xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">bbbb</text:p>\
+                          <text:p xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">cccc</text:p>";
+        let cell = cell(paragraphs);
+        let mut budget = crate::odf::ExpansionBudget::new(1 << 20);
+        let (text, nested) = super::odf_cell_content(&cell, 64, &mut budget).unwrap();
+        assert_eq!(text, "aaaa\nbbbb\ncccc");
+        assert!(nested.is_empty());
+        // Cap 9 fits "aaaa\nbbbb" exactly; the third paragraph is rejected before append.
+        let error = super::odf_cell_content(&cell, 9, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("cap"), "{error}");
+        // Cap 5 rejects the second paragraph even though the first fits alone.
+        let error = super::odf_cell_content(&cell, 5, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("cap"), "{error}");
+    }
 }

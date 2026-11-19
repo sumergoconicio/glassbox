@@ -34,13 +34,6 @@ pub(crate) fn inspect(
             Ok(Some(bytes)) => {
                 let pdf = name.ends_with(".pdf");
                 let text = name.ends_with(".txt");
-                let basis = if pdf {
-                    "inferred_layout"
-                } else if text {
-                    "text_fallback"
-                } else {
-                    "ocr_text_fallback"
-                };
                 report.derived_preview = Some(DerivedPreview {
                     source_part: name.into(),
                     content_type: if pdf {
@@ -56,13 +49,15 @@ pub(crate) fn inspect(
                 preview_options.max_pages = Some(options.max_pages.unwrap_or(1).min(1));
                 preview_options.max_units = options.max_units.min(1);
                 preview_options.max_chars = options.max_chars.min(4000);
+                // LITX-AUD-019: the notice is provenance-neutral; the actual
+                // preview outcome (native, OCR, or mixed) sets the basis.
                 crate::markdown::append(
                     report,
                     &format!(
                         "> Partial iWork preview from {name}. Original document structure was not decoded.\n\n> Bounded embedded preview: first page/image, at most 4000 characters.\n\n"
                     ),
                     &preview_options,
-                    basis,
+                    "",
                 );
                 if pdf {
                     crate::pdf::inspect_bytes(bytes, report, &preview_options, ocr);
@@ -74,13 +69,15 @@ pub(crate) fn inspect(
                                 report,
                                 &crate::markdown::escape(&report.text.content),
                                 &preview_options,
-                                basis,
+                                "text_fallback",
                             );
                         }
                         Err(error) => report.error("iwork_preview", error),
                     }
                 } else {
                     preview_options.thumbnail = None;
+                    // OCR'd image text appends its own ocr_text_fallback
+                    // Markdown (LITX-AUD-009); nothing more to add here.
                     crate::images::inspect_bytes(bytes.clone(), report, &preview_options, ocr);
                     crate::thumbnail::write(
                         std::io::Cursor::new(bytes),
@@ -88,14 +85,9 @@ pub(crate) fn inspect(
                         options,
                         report,
                     );
-                    if !report.text.content.is_empty() {
-                        crate::markdown::append(
-                            report,
-                            &crate::markdown::escape(&report.text.content),
-                            &preview_options,
-                            "ocr_text_fallback",
-                        );
-                    }
+                }
+                if report.markdown.basis.is_empty() {
+                    report.markdown.basis = "text_fallback";
                 }
                 report.text.origin = "embedded_preview".into();
                 report.text.truncated = true;

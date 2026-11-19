@@ -89,7 +89,8 @@ fn inner(
         return Err("EPUB spine cap exceeded".into());
     }
     report.counts.spine_items = Some(references.len());
-    for reference in references {
+    let partial = references.len() > options.text_unit_limit();
+    for reference in references.into_iter().take(options.text_unit_limit()) {
         let result = (|| -> xml::Result<()> {
             let item = items
                 .get(reference.attr("idref").ok_or("spine item has no idref")?)
@@ -118,6 +119,7 @@ fn inner(
             report.error("epub_text", error);
         }
     }
+    report.text.truncated |= partial;
     if options.thumbnail.is_some() {
         let cover = cover_id.and_then(|id| items.get(id).copied()).or_else(|| {
             items.values().copied().find(|n| {

@@ -177,7 +177,7 @@ fn inspect_inner(
     if part.split('/').any(|p| matches!(p, ".." | "." | "")) || part.contains('\\') {
         return Err("unsafe OOXML main part name".into());
     }
-    let root = read_xml(archive, &part)?;
+    let mut root = read_xml(archive, &part)?;
     if !root.is(ns, root_name) {
         return Err("OOXML main part namespace/root mismatch".into());
     }
@@ -190,9 +190,13 @@ fn inspect_inner(
                 "Word document",
             );
             metadata(archive, report);
+            let paragraphs = root.descendants(W, "p").len();
+            let partial = limit_word_sections(&mut root, options.text_unit_limit());
             docx(&root, report, options);
             crate::tables::Context::new(report, &part, "section", 1, options).word_tables(&root);
             crate::markdown::word(&root, report, options);
+            report.counts.paragraphs = Some(paragraphs);
+            report.text.truncated |= partial;
         }
         "pptx" => {
             identify(
@@ -295,7 +299,7 @@ fn pptx(
     let slides = root.descendants(P, "sldId");
     report.counts.slides = Some(slides.len());
     let rels = relationships(archive, part)?;
-    for (i, slide) in slides.iter().enumerate() {
+    for (i, slide) in slides.iter().take(options.text_unit_limit()).enumerate() {
         let result = (|| -> xml::Result<()> {
             let target = related(
                 &rels,
@@ -348,7 +352,37 @@ fn pptx(
             report.error("slide", format!("slide {}: {e}", i + 1));
         }
     }
+    report.text.truncated |= slides.len() > options.text_unit_limit();
     Ok(())
+}
+
+fn limit_word_sections(root: &mut Node, limit: usize) -> bool {
+    use crate::xml::Content;
+    if limit == usize::MAX {
+        return false;
+    }
+    let Some(body) = root.content.iter_mut().find_map(|item| match item {
+        Content::Element(node) if node.is(W, "body") => Some(node),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let mut sections = 0;
+    let mut partial = false;
+    body.content.retain(|item| {
+        if sections >= limit {
+            partial |= match item {
+                Content::Element(node) => !node.is(W, "sectPr"),
+                Content::Text(text) => !text.trim().is_empty(),
+            };
+            return false;
+        }
+        if let Content::Element(node) = item {
+            sections += node.descendants(W, "sectPr").len();
+        }
+        true
+    });
+    partial
 }
 
 fn docx(root: &Node, report: &mut InspectReport, options: &InspectOptions) {

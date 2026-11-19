@@ -1,3 +1,4 @@
+//! CLI integration regressions for native inspection and extraction reports.
 use std::process::Command;
 
 #[test]
@@ -122,6 +123,46 @@ fn inspect_defaults_to_five_pages_but_extract_uses_the_whole_document() {
             command == "extract"
         );
     }
+}
+
+#[test]
+fn extract_with_explicit_max_pages_keeps_every_word_token() {
+    // LITX-AUD-008: an explicit page limit must not imply the 500-word
+    // identification preview budget during full extraction.
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tests")
+        .join(format!(
+            "extract-pages-tokens-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("words.txt");
+    std::fs::write(&path, "word ".repeat(600)).unwrap();
+    let mut tokens = Vec::new();
+    for args in [
+        vec!["extract", "--no-ocr"],
+        vec!["extract", "--no-ocr", "--max-pages", "6"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+            .args(&args)
+            .arg(&path)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(r["errors"], serde_json::json!([]));
+        tokens.push(r["text"]["tokens"].as_u64().unwrap());
+    }
+    assert_eq!(tokens[0], 600);
+    assert_eq!(tokens[1], 600, "{:?}", tokens);
 }
 
 #[test]
@@ -321,6 +362,107 @@ fn inspect_emits_a_report_and_optional_packet() {
     assert!(report["claims"].is_array());
     assert!(report["errors"].is_array());
     assert!(report["packet"].get("Domains").is_none());
+}
+
+/// Verify missing OCR data still fails PDF honestly while DjVu never requests OCR.
+///
+/// Accepts no inputs and returns unit. Panics if the PDF loses its OCR failure
+/// provenance or DjVu initializes OCR, emits analysis, or misses the static
+/// identification-only diagnostic.
+#[test]
+fn missing_ocr_model_marks_pdf_incomplete_and_djvu_stays_identification_only() {
+    // LITX-AUD-010: a failed PDF OCR attempt must surface as incomplete text,
+    // never as a clean complete report. DjVu has an independent static support
+    // boundary. The per-process TESSDATA_PREFIX isolates parallel OCR tests.
+    let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tests")
+        .join(format!(
+            "missing-tessdata-prov-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    assert!(!missing.exists());
+    // native.pdf stays within the five-page scan limit, so incomplete flags
+    // can only come from the failed OCR attempt itself.
+    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        .args(["inspect", "--identify", "../../fixtures/native.pdf"])
+        .env("TESSDATA_PREFIX", &missing)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        r["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "pdf_ocr"),
+        "{:?}",
+        r["errors"]
+    );
+    assert_eq!(r["pdf"]["text_complete"], false);
+    assert_eq!(r["text"]["truncated"], true);
+    assert!(
+        r["pdf"]["identification_pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["ocr_status"] == "failed")
+    );
+    // DjVu: the same requested identification mode must not consult tessdata.
+    let info: &[u8] = &[2, 88, 3, 32, 26, 0, 44, 1, 22, 1];
+    let mut page = b"DJVU".to_vec();
+    page.extend_from_slice(b"INFO");
+    page.extend_from_slice(&(info.len() as u32).to_be_bytes());
+    page.extend_from_slice(info);
+    let mut form = b"FORM".to_vec();
+    form.extend_from_slice(&(page.len() as u32).to_be_bytes());
+    form.extend_from_slice(&page);
+    let mut bytes = b"AT&T".to_vec();
+    bytes.extend_from_slice(&form);
+    let djvu = missing.with_file_name(format!(
+        "blank-{}.djvu",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&djvu, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        .args(["inspect", "--identify"])
+        .arg(&djvu)
+        .env("TESSDATA_PREFIX", &missing)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = r["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["stage"], "djvu");
+    assert_eq!(
+        errors[0]["message"],
+        "DjVu extraction is unsupported; identification only"
+    );
+    assert!(r["djvu"].is_null());
+    assert_eq!(r["pages"], serde_json::json!([]));
+    assert_eq!(r["preflight"], serde_json::json!([]));
+    assert_eq!(r["text"]["content"], "");
+    assert_eq!(r["text"]["truncated"], true);
+    assert_eq!(r["markdown"]["truncated"], true);
+    assert!(r["thumbnail"].is_null());
+    assert!(!missing.exists());
 }
 
 #[test]

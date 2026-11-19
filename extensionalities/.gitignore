@@ -9,7 +9,8 @@
 !tmp/
 !temp/
 
-# Build products and secrets remain local.
+# Build products, local scratch sandbox, and secrets remain local.
 target/
+sandbox/
 .env
 .env.*

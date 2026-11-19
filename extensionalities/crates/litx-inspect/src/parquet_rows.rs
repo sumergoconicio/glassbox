@@ -1,5 +1,6 @@
-//! Snapshot selected chunks and validate page sizes before invoking the record decoder.
-//! Only codecs with fixed-size output buffers are allowed.
+//! Deferred, unregistered Parquet row-reader reference retained for a future approved task.
+//! This module is absent from `lib.rs` and has no runtime reachability. Its snapshot/page
+//! validation sketches bounded decoding without enabling Parquet extraction in this build.
 use crate::{DatasetPreview, xml};
 use bytes::{Buf, Bytes};
 use parquet_format_safe::{FileMetaData, PageHeader, thrift::protocol::TCompactInputProtocol};
@@ -125,8 +126,24 @@ fn bound_value(value: &mut serde_json::Value, truncated: &mut bool) {
             }
         }
         Value::Object(values) => {
-            for v in values.values_mut() {
-                bound_value(v, truncated);
+            // MAP values get the same bounds as every other preview value: at most
+            // five entries and keys capped at the string limit. Truncated keys that
+            // collide keep the first entry and stay flagged via `truncated`.
+            if values.len() > 5 {
+                *truncated = true;
+            }
+            let entries: Vec<(String, Value)> =
+                std::mem::take(values).into_iter().take(5).collect();
+            for (key, mut value) in entries {
+                let key = match key.char_indices().nth(512) {
+                    Some((index, _)) => {
+                        *truncated = true;
+                        key[..index].to_string()
+                    }
+                    None => key,
+                };
+                bound_value(&mut value, truncated);
+                values.entry(key).or_insert(value);
             }
         }
         _ => {}
@@ -150,6 +167,7 @@ pub(crate) fn preview(
     let mut bytes_read = 0usize;
     let mut expanded = 0usize;
     let mut rows_covered = 0;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
     for group in &metadata.row_groups {
         if rows_covered >= 5 {
             break;
@@ -169,6 +187,20 @@ pub(crate) fn preview(
             if ![0, 1, 7].contains(&meta.codec.0) {
                 return Err("bounded Parquet row preview supports UNCOMPRESSED, SNAPPY and LZ4_RAW codecs; schema remains available".into());
             }
+            if column.file_offset < 0 {
+                return Err(
+                    format!("invalid Parquet chunk file offset {}", column.file_offset).into(),
+                );
+            }
+            if let Some(dictionary) = meta.dictionary_page_offset
+                && dictionary > meta.data_page_offset
+            {
+                return Err(format!(
+                    "invalid Parquet chunk offsets: dictionary_page_offset {dictionary} exceeds data_page_offset {}",
+                    meta.data_page_offset
+                )
+                .into());
+            }
             let start = u64::try_from(
                 meta.dictionary_page_offset
                     .unwrap_or(meta.data_page_offset)
@@ -181,13 +213,25 @@ pub(crate) fn preview(
             if size > CHUNK_CAP || bytes_read > READ_CAP {
                 return Err("Parquet preview exceeds 16 MiB chunk / 64 MiB read cap".into());
             }
-            if start < 4
-                || start
-                    .checked_add(size as u64)
-                    .is_none_or(|end| end > footer_start)
-            {
+            let end = start
+                .checked_add(size as u64)
+                .ok_or("Parquet chunk offset overflow")?;
+            if start < 4 || end > footer_start {
                 return Err("Parquet chunk range outside file data".into());
             }
+            // Chunks are validated page-by-page as read; an overlap would let one
+            // validated range stand in for a different declared chunk when the
+            // decoder resolves snapshot segments, so ranges must stay disjoint.
+            if let Some(&(other_start, other_end)) = ranges
+                .iter()
+                .find(|&&(other_start, other_end)| start < other_end && other_start < end)
+            {
+                return Err(format!(
+                    "overlapping Parquet chunk ranges: [{start}, {end}) and [{other_start}, {other_end})"
+                )
+                .into());
+            }
+            ranges.push((start, end));
             file.seek(SeekFrom::Start(start))?;
             let mut bytes = vec![0; size];
             file.read_exact(&mut bytes)?;

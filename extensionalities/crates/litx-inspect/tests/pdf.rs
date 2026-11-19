@@ -103,6 +103,292 @@ fn pdf_thumbnail_is_opt_in_bounded_and_refuses_to_overwrite() {
     assert_eq!(first, std::fs::read(path).unwrap());
 }
 
+/// Renders the native fixture's first page to a JPEG text image and returns
+/// the encoded bytes with pixel dimensions.
+fn text_jpeg(directory: &std::path::Path) -> (Vec<u8>, u32, u32) {
+    let rendered = directory.join("text-source.png");
+    let r = inspect(
+        &fixture("native.pdf"),
+        &InspectOptions {
+            thumbnail: Some(rendered.clone()),
+            thumbnail_max_edge: 1200,
+            max_units: 0,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let decoded = image::open(&rendered).unwrap().to_rgb8();
+    let (width, height) = (decoded.width(), decoded.height());
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(decoded)
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .unwrap();
+    (jpeg.into_inner(), width, height)
+}
+
+/// Builds a synthetic PDF from per-page specs: `Some(text)` draws a native
+/// Helvetica text line, `None` draws the shared JPEG as a full-page scan.
+fn synthetic_pdf(
+    output: &std::path::Path,
+    pages: &[Option<String>],
+    jpeg: Option<&(Vec<u8>, u32, u32)>,
+) {
+    std::fs::write(output, build_pdf(pages, jpeg, b"", false)).unwrap();
+}
+
+/// Assemble the synthetic PDF bytes. `prefix` prepends raw bytes ahead of
+/// the header (xref offsets are computed after it, so the file stays valid);
+/// `dangling_kid` appends a page-tree kid reference to a missing object so
+/// that page's extraction fails.
+fn build_pdf(
+    pages: &[Option<String>],
+    jpeg: Option<&(Vec<u8>, u32, u32)>,
+    prefix: &[u8],
+    dangling_kid: bool,
+) -> Vec<u8> {
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        Vec::new(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    let mut image_object = 0;
+    if let Some((bytes, width, height)) = jpeg {
+        objects.push(format!("<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n", bytes.len()).into_bytes());
+        image_object = objects.len();
+        objects[image_object - 1].extend_from_slice(bytes);
+        objects[image_object - 1].extend_from_slice(b"\nendstream");
+    }
+    let mut kids = Vec::new();
+    for spec in pages {
+        let (content, resources) = match (spec, jpeg) {
+            (Some(text), _) => (
+                format!("BT /F1 20 Tf 50 700 Td ({text}) Tj ET").into_bytes(),
+                "<< /Font << /F1 3 0 R >> >>".to_string(),
+            ),
+            (None, Some(_)) => (
+                b"q 600 0 0 800 0 0 cm /Scan Do Q".to_vec(),
+                format!("<< /XObject << /Scan {image_object} 0 R >> >>"),
+            ),
+            (None, None) => (Vec::new(), "<< >>".to_string()),
+        };
+        objects.push(format!("<< /Length {} >>\nstream\n", content.len()).into_bytes());
+        let content_object = objects.len();
+        objects[content_object - 1].extend_from_slice(&content);
+        objects[content_object - 1].extend_from_slice(b"\nendstream");
+        objects.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources {resources} /Contents {content_object} 0 R >>").into_bytes());
+        kids.push(objects.len());
+    }
+    if dangling_kid {
+        kids.push(999);
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.iter()
+            .map(|n| format!("{n} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        kids.len()
+    )
+    .into_bytes();
+    let mut data = prefix.to_vec();
+    data.extend_from_slice(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n");
+    let mut offsets = vec![0];
+    for (n, object) in objects.iter().enumerate() {
+        offsets.push(data.len());
+        data.extend(format!("{} 0 obj\n", n + 1).into_bytes());
+        data.extend(object);
+        data.extend(b"\nendobj\n");
+    }
+    let xref = data.len();
+    data.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).into_bytes());
+    for offset in &offsets[1..] {
+        data.extend(format!("{offset:010} 00000 n \n").into_bytes());
+    }
+    data.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len()
+        )
+        .into_bytes(),
+    );
+    data
+}
+
+#[test]
+fn page_extraction_error_marks_the_text_payload_partial() {
+    // LITX-AUD-014: a page whose extraction fails must mark the text payload
+    // partial (text.truncated), not only pdf.text_complete.
+    let directory = scratch("extract-error");
+    let path = directory.join("broken.pdf");
+    std::fs::write(
+        &path,
+        build_pdf(&[Some("First page text".to_string())], None, b"", true),
+    )
+    .unwrap();
+    let r = inspect(
+        &path,
+        &InspectOptions {
+            max_units: 0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.counts.pages, Some(2), "{:?}", r.errors);
+    assert!(
+        r.errors.iter().any(|e| e.stage == "pdf_text"),
+        "{:?}",
+        r.errors
+    );
+    assert!(!r.pdf.as_ref().unwrap().text_complete);
+    assert!(r.text.truncated);
+}
+
+#[test]
+fn space_prefixed_pdf_bytes_inspect_without_conversion_fallback() {
+    // LITX-AUD-014: the default (!identify, max_units > 0) path must compute
+    // complexity from the byte-verified document it already parsed, never
+    // through the upstream conversion fallback. A 16-space prefix defeats the
+    // detector, so extension routing (.pdf) delivers the file to the PDF
+    // inspector, where the upstream byte sniff would misread the spaced
+    // payload as ".bin" and fail conversion (the audit's live repro).
+    let directory = scratch("prefixed-pdf");
+    let path = directory.join("prefixed.pdf");
+    std::fs::write(
+        &path,
+        build_pdf(
+            &[Some("Hello native text".to_string())],
+            None,
+            b"                ",
+            false,
+        ),
+    )
+    .unwrap();
+    let r = inspect(
+        &path,
+        &InspectOptions {
+            max_units: 8,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.counts.pages, Some(1));
+    assert!(r.text.content.contains("Hello native text"));
+    assert_eq!(r.pdf.as_ref().unwrap().complexity.len(), 1);
+    assert_eq!(r.preflight.len(), 1);
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let directory = fixture("../target/tests").join(format!(
+        "pdf-{tag}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn pure_scan_pdf_reports_ocr_provenance() {
+    // LITX-AUD-019: a PDF whose text comes only from OCR must say so.
+    let directory = scratch("pure-scan");
+    let path = directory.join("scan.pdf");
+    synthetic_pdf(&path, &[None, None], Some(&text_jpeg(&directory)));
+    let r = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            max_pages: None,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(r.text.content.contains("Native PDF"));
+    assert_eq!(r.text.origin, "ocr");
+    assert_eq!(r.markdown.basis, "ocr_text_fallback");
+    let pdf = r.pdf.as_ref().unwrap();
+    assert!(pdf.text_complete);
+    for page in &pdf.identification_pages {
+        assert_eq!(page.text_layer, "scanned");
+        assert_eq!(page.ocr_status, "text_detected");
+    }
+}
+
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn mixed_pdf_reports_native_and_ocr_provenance() {
+    // LITX-AUD-019: native text pages plus OCR'd scans are native_and_ocr.
+    let directory = scratch("mixed");
+    let path = directory.join("mixed.pdf");
+    let dense = |page: usize| {
+        format!("Native page {page} provides digital evidence for the mixed provenance check. ")
+            .repeat(9)
+    };
+    let pages = [Some(dense(1)), None, Some(dense(3)), None];
+    synthetic_pdf(&path, &pages, Some(&text_jpeg(&directory)));
+    let r = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            max_pages: None,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(
+        r.text.content.contains("Native page 1"),
+        "{}",
+        r.text.content
+    );
+    assert!(r.text.content.contains("Native PDF"));
+    assert_eq!(r.text.origin, "native_and_ocr");
+    assert_eq!(r.markdown.basis, "mixed");
+    let pdf = r.pdf.as_ref().unwrap();
+    assert_eq!(pdf.identification_pages[0].text_layer, "digital");
+    assert_eq!(pdf.identification_pages[0].ocr_status, "not_needed");
+    assert_eq!(pdf.identification_pages[1].text_layer, "scanned");
+    assert_eq!(pdf.identification_pages[1].ocr_status, "text_detected");
+}
+
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn pdf_ocr_continues_beyond_page_five() {
+    // LITX-AUD-019: full extraction OCRs every scanned page, not just the
+    // first identification preview window.
+    let directory = scratch("seven");
+    let path = directory.join("seven.pdf");
+    synthetic_pdf(&path, &vec![None; 7], Some(&text_jpeg(&directory)));
+    let full = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            max_pages: None,
+            ..Default::default()
+        },
+    );
+    assert!(full.errors.is_empty(), "{:?}", full.errors);
+    let pdf = full.pdf.as_ref().unwrap();
+    assert!(pdf.text_complete);
+    assert_eq!(pdf.identification_pages.len(), 7);
+    for page in &pdf.identification_pages {
+        assert_eq!(page.ocr_status, "text_detected");
+    }
+    assert!(full.markdown.content.contains("## Page 7"));
+    let preview = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            ..Default::default()
+        },
+    );
+    assert!(preview.errors.is_empty(), "{:?}", preview.errors);
+    let pdf = preview.pdf.as_ref().unwrap();
+    assert!(!pdf.text_complete);
+    assert_eq!(pdf.identification_pages.len(), 5);
+    assert!(preview.text.truncated);
+}
+
 #[test]
 fn byte_verified_pdf_works_inside_an_existing_async_runtime() {
     let path = fixture("../target/tests").join(format!(

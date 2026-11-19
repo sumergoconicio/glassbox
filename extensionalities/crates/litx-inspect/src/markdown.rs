@@ -41,6 +41,42 @@ impl SheetRows {
         }
     }
 
+    /// True once the preview character budget is exhausted mid-row.
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Buffer one preview row, bounding each stored cell to the remaining
+    /// character budget and marking the preview truncated when text is cut.
+    pub(crate) fn push_bounded<S: AsRef<str>>(
+        &mut self,
+        cells: &[(usize, S)],
+        repeats: usize,
+        cap: usize,
+    ) {
+        let take = repeats.min(6usize.saturating_sub(self.sampled_rows));
+        self.more_rows |= take < repeats;
+        if take == 0 || self.truncated {
+            return;
+        }
+        let mut bounded = Vec::with_capacity(cells.len());
+        for (col, value) in cells {
+            let value = value.as_ref();
+            let remaining = cap.saturating_sub(self.chars).saturating_sub(4);
+            let chars = value.chars().count();
+            let kept = chars.min(remaining);
+            self.chars = self.chars.saturating_add(kept.saturating_add(4));
+            bounded.push((*col, value.chars().take(kept).collect::<String>()));
+            // Empty cells charge 4 chars of overhead: charging past the cap
+            // without cutting text is still truncation.
+            if kept < chars || self.chars > cap {
+                self.truncated = true;
+                break;
+            }
+        }
+        self.rows.push((bounded, take));
+        self.sampled_rows += take;
+    }
     pub fn write(
         self,
         sheet: &mut crate::Sheet,
@@ -92,10 +128,13 @@ impl SheetRows {
                     header = false;
                 }
                 if report.markdown.truncated {
+                    // The Markdown cap stopped row handling mid-sheet.
+                    sheet.preview_truncated = true;
                     break;
                 }
             }
             if report.markdown.truncated {
+                sheet.preview_truncated = true;
                 break;
             }
         }
@@ -332,6 +371,7 @@ pub(crate) fn odf(
     report: &mut InspectReport,
     options: &InspectOptions,
     mut index: usize,
+    budget: &mut crate::odf::ExpansionBudget,
 ) {
     use crate::odf::{T, TABLE};
     fn walk(
@@ -340,6 +380,8 @@ pub(crate) fn odf(
         report: &mut InspectReport,
         options: &InspectOptions,
         index: &mut usize,
+        budget: &mut crate::odf::ExpansionBudget,
+        failed: &mut bool,
     ) {
         if node.is(TABLE, "table") {
             for _ in 0..node.descendants(TABLE, "table").len() {
@@ -350,37 +392,47 @@ pub(crate) fn odf(
                 *index += 1;
             }
         } else if node.is(T, "p") || node.is(T, "h") {
-            if let Ok(text) = crate::odf::text(node) {
-                let prefix = if node.is(T, "h") {
-                    let level = node
-                        .attr_ns(T, "outline-level")
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(1)
-                        .clamp(1, 6);
-                    format!("{} ", "#".repeat(level))
-                } else if depth > 0 {
-                    format!("{}- ", "  ".repeat(depth.saturating_sub(1).min(8)))
-                } else {
-                    String::new()
-                };
-                append(
-                    report,
-                    &format!("{prefix}{}\n\n", escape(&text)),
-                    options,
-                    "native_structure",
-                );
+            match budget.text(node) {
+                Ok(text) => {
+                    let prefix = if node.is(T, "h") {
+                        let level = node
+                            .attr_ns(T, "outline-level")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .clamp(1, 6);
+                        format!("{} ", "#".repeat(level))
+                    } else if depth > 0 {
+                        format!("{}- ", "  ".repeat(depth.saturating_sub(1).min(8)))
+                    } else {
+                        String::new()
+                    };
+                    append(
+                        report,
+                        &format!("{prefix}{}\n\n", escape(&text)),
+                        options,
+                        "native_structure",
+                    );
+                }
+                Err(error) => {
+                    // One honest error per walk; later paragraphs fail the same way.
+                    if !*failed {
+                        *failed = true;
+                        report.error("markdown", format!("ODF text expansion: {error}"));
+                    }
+                }
             }
         } else {
             let depth = depth + usize::from(node.is(T, "list"));
             for child in node.children() {
-                walk(child, depth, report, options, index);
+                walk(child, depth, report, options, index, budget, failed);
             }
             if node.is(T, "section") {
                 append(report, "\n---\n\n", options, "native_structure");
             }
         }
     }
-    walk(root, 0, report, options, &mut index);
+    let mut failed = false;
+    walk(root, 0, report, options, &mut index, budget, &mut failed);
 }
 
 pub(crate) fn xhtml(root: &Node, report: &mut InspectReport, options: &InspectOptions) {
@@ -456,5 +508,71 @@ pub(crate) fn finish(report: &mut InspectReport, options: &InspectOptions) {
     report.markdown.truncated |= report.text.truncated || !report.errors.is_empty();
     if report.markdown.truncated {
         report.markdown.content.push_str("\n\n> Partial output: preview budget, safety limit, or extraction error. See the JSON report.\n");
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    #[test]
+    fn push_bounded_marks_truncated_when_cell_overhead_exceeds_cap() {
+        let mut rows = super::SheetRows::default();
+        rows.push_bounded(&[(1usize, "H")], 1, 8);
+        assert!(!rows.is_truncated(), "header fits the 8-char budget");
+        // Three empty cells charge 4 chars of per-cell overhead each:
+        // 5 + 12 = 17 exceeds the cap even though no text was cut.
+        rows.push_bounded(&[(1usize, ""), (2, ""), (3, "")], 1, 8);
+        assert!(
+            rows.is_truncated(),
+            "empty-cell overhead charged past the cap must mark truncation"
+        );
+    }
+
+    /// W3-SYS-MARKDOWN-ROWS: truncation records only retained preview rows;
+    /// later repeated and skipped rows set the existing truncation flags
+    /// without pretending their unstored rows entered the preview. Accepts no
+    /// arguments and returns unit; assertions panic on inconsistent row semantics.
+    #[test]
+    fn push_bounded_after_truncation_keeps_stored_row_count_honest() {
+        let mut rows = super::SheetRows::default();
+        rows.push_bounded(&[(1usize, "H")], 1, 8);
+        rows.push_bounded(&[(1usize, ""), (2, ""), (3, "")], 1, 8);
+        assert!(rows.truncated);
+        assert_eq!(rows.sampled_rows, 2);
+        assert_eq!(rows.rows.len(), 2);
+
+        rows.push_bounded(&[(1usize, "later")], 3, 8);
+        rows.push_bounded(&[(1usize, "skipped")], 1, 8);
+        assert_eq!(rows.sampled_rows, 2);
+        assert_eq!(rows.rows.len(), 2);
+        assert!(!rows.more_rows);
+        assert!(rows.truncated);
+
+        rows.push_bounded(&[(1usize, "repeated")], 10, 8);
+        assert_eq!(rows.sampled_rows, 2);
+        assert_eq!(rows.rows.len(), 2);
+        assert!(rows.more_rows);
+        assert!(rows.truncated);
+    }
+
+    /// W3-SYS-MARKDOWN-ROWS: six retained rows fill the preview exactly; a
+    /// seventh observed row is skipped and sets `more_rows` without changing
+    /// the retained row count. Accepts no arguments and returns unit; assertion
+    /// failures identify an incorrect boundary, count, or truncation flag.
+    #[test]
+    fn push_bounded_honors_the_exact_six_row_boundary() {
+        let mut rows = super::SheetRows::default();
+        for _ in 0..6 {
+            rows.push_bounded(&[(1usize, "row")], 1, 100);
+        }
+        assert_eq!(rows.sampled_rows, 6);
+        assert_eq!(rows.rows.len(), 6);
+        assert!(!rows.more_rows);
+        assert!(!rows.truncated);
+
+        rows.push_bounded(&[(1usize, "seventh")], 1, 100);
+        assert_eq!(rows.sampled_rows, 6);
+        assert_eq!(rows.rows.len(), 6);
+        assert!(rows.more_rows);
+        assert!(!rows.truncated);
     }
 }

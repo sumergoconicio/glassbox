@@ -41,7 +41,13 @@ pub struct Loop {
     pub path: String,
     pub count: usize,
     pub fields: Vec<String>,
+    pub fields_truncated: bool,
 }
+
+/// Total `Loop.fields` entries emitted across all array depths.
+const LOOP_FIELDS_CAP: usize = 1_024;
+/// Total `Loop.fields` string bytes emitted across all array depths.
+const LOOP_FIELD_BYTES_CAP: usize = 64 << 10;
 
 struct Seed<'a> {
     profile: &'a mut JsonProfile,
@@ -178,26 +184,38 @@ pub(crate) fn inspect(path: &Path, report: &mut InspectReport, options: &Inspect
         }
         .deserialize(&mut decoder)?;
         decoder.end()?;
+        let mut field_entries = 0usize;
+        let mut field_bytes = 0usize;
         for (path, count) in &profile.arrays {
             if *count < 2 {
                 continue;
             }
             let prefix = format!("{path}.");
-            let fields = profile
-                .leaf_stats
-                .keys()
-                .filter_map(|key| {
-                    if key == path {
-                        Some("<value>".into())
-                    } else {
-                        key.strip_prefix(&prefix).map(str::to_string)
-                    }
-                })
-                .collect();
+            let mut fields = Vec::new();
+            let mut fields_truncated = false;
+            for key in profile.leaf_stats.keys() {
+                let field = if key == path {
+                    "<value>"
+                } else if let Some(suffix) = key.strip_prefix(&prefix) {
+                    suffix
+                } else {
+                    continue;
+                };
+                if field_entries >= LOOP_FIELDS_CAP
+                    || field_bytes + field.len() > LOOP_FIELD_BYTES_CAP
+                {
+                    fields_truncated = true;
+                    break;
+                }
+                field_entries += 1;
+                field_bytes += field.len();
+                fields.push(field.to_string());
+            }
             profile.loops.push(Loop {
                 path: path.clone(),
                 count: *count,
                 fields,
+                fields_truncated,
             });
         }
         let mut markdown = format!(

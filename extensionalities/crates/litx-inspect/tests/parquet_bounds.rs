@@ -1,5 +1,11 @@
 #![cfg(all(feature = "parquet-preview", not(target_arch = "wasm32")))]
 
+//! Hostile Parquet chunk fixtures retained from the audit remediation. Under the
+//! user-approved 2026-11-18 support reduction, Parquet extraction is deferred:
+//! these external-path, unsupported-codec, and oversized-page cases must receive
+//! the static identification-only deferral without any chunk metadata or page
+//! bytes being read. They no longer pin decoder-specific rejection messages.
+
 use litx_inspect::{InspectOptions, inspect};
 use parquet_format_safe::{
     CompressionCodec, FileMetaData,
@@ -38,7 +44,7 @@ fn seed() -> (Vec<u8>, FileMetaData) {
 }
 
 #[test]
-fn unsafe_parquet_chunks_keep_schema_but_never_produce_a_row_preview() {
+fn hostile_parquet_chunks_defer_without_reading_chunk_metadata_or_pages() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/tests")
         .join(format!(
@@ -49,11 +55,7 @@ fn unsafe_parquet_chunks_keep_schema_but_never_produce_a_row_preview() {
                 .as_nanos()
         ));
     std::fs::create_dir_all(&directory).unwrap();
-    for (case, message) in [
-        ("external", "external"),
-        ("codec", "codecs"),
-        ("page", "8 MiB"),
-    ] {
+    for case in ["external", "codec", "page"] {
         let (mut data, mut metadata) = seed();
         let chunk = &mut metadata.row_groups[0].columns[0];
         match case {
@@ -80,15 +82,22 @@ fn unsafe_parquet_chunks_keep_schema_but_never_produce_a_row_preview() {
         let path = directory.join(format!("{case}.parquet"));
         std::fs::write(&path, data).unwrap();
         let report = inspect(&path, &InspectOptions::default());
-        assert_eq!(report.parquet.unwrap().rows, 1, "{case}");
-        assert!(report.dataset.is_none(), "{case}");
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.stage == "parquet_preview" && e.message.contains(message)),
-            "{case}: {:?}",
+            report.errors.iter().any(|e| e.stage == "parquet"
+                && e.message == "Parquet extraction is deferred; identification only"),
+            "{case}: static deferral expected, got {:?}",
             report.errors
+        );
+        assert!(report.parquet.is_none(), "{case}: no footer profile");
+        assert!(report.dataset.is_none(), "{case}: no row preview");
+        assert!(
+            report.text.content.is_empty() && report.text.truncated,
+            "{case}: incomplete empty text"
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("/not-opened"),
+            "{case}: attacker-controlled chunk paths must not be echoed: {json}"
         );
     }
 }

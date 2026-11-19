@@ -176,6 +176,48 @@ fn transparent_background_is_composited_as_white() {
 
 #[test]
 #[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn ocr_text_images_emit_ocr_markdown_provenance() {
+    // LITX-AUD-009: OCR-recovered image text must land in the Markdown
+    // output labeled ocr_text_fallback, not the plain text_fallback.
+    let directory = fixture("../target/tests").join(format!(
+        "ocr-markdown-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("text.png");
+    let pdf = inspect(
+        &fixture("native.pdf"),
+        &InspectOptions {
+            thumbnail: Some(path.clone()),
+            thumbnail_max_edge: 800,
+            max_units: 0,
+            ..Default::default()
+        },
+    );
+    assert!(pdf.errors.is_empty(), "{:?}", pdf.errors);
+    let r = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(r.text.content.contains("Native PDF"));
+    assert_eq!(r.text.origin, "ocr");
+    assert_eq!(r.markdown.basis, "ocr_text_fallback");
+    assert!(
+        r.markdown.content.contains("Native PDF"),
+        "{}",
+        r.markdown.content
+    );
+}
+
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
 fn ocr_probe_recognizes_native_pdf_rendered_words() {
     let directory = fixture("../target/tests").join(format!(
         "real-ocr-{}",

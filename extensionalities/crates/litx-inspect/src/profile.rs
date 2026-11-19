@@ -1,4 +1,7 @@
-//! Telemetry caps and prose scoring ported from jsoninspect, not a language detector.
+//! Structured-data profiling for the `litx-inspect` crate.
+//! File: `profile.rs`.
+//! Responsibility: enforce grid and workbook work budgets while computing
+//! bounded column telemetry and prose scores, not language detection.
 use crate::{Column, Sheet, xml};
 use std::collections::{BTreeMap, HashSet};
 use unicode_general_category::{GeneralCategory, get_general_category};
@@ -101,6 +104,94 @@ pub(crate) fn preview(value: &str) -> String {
     format!("{}...", &value[..end])
 }
 
+/// Maximum logical cell visits charged across one spreadsheet workbook.
+pub(crate) const WORKBOOK_CELL_CAP: usize = 262_144;
+/// Maximum logical value bytes scanned across one spreadsheet workbook.
+pub(crate) const WORKBOOK_VALUE_BYTE_CAP: usize = 64 << 20;
+/// Diagnostic emitted when cumulative workbook value-byte work is exhausted.
+pub(crate) const WORK_VALUE_BUDGET_EXCEEDED: &str =
+    "spreadsheet workbook value-byte budget exhausted";
+
+/// Cumulative logical cell and value-byte work remaining for one workbook.
+/// Failed and empty sheets share this budget with successfully retained sheets.
+pub(crate) struct WorkBudget {
+    cells_remaining: usize,
+    value_bytes_remaining: usize,
+    exhausted: bool,
+}
+
+impl WorkBudget {
+    /// Creates an independent work budget with explicit limits.
+    /// Accepts logical cell-visit and value-byte caps; returns the initialized
+    /// budget; has no failure states.
+    pub(crate) fn new(cell_cap: usize, value_byte_cap: usize) -> Self {
+        Self {
+            cells_remaining: cell_cap,
+            value_bytes_remaining: value_byte_cap,
+            exhausted: false,
+        }
+    }
+
+    /// Charges logical cell visits before cell expansion or profiling.
+    /// Accepts the number of repeated logical cells; returns unit while the
+    /// visit count fits; returns an exhaustion error and stops the workbook
+    /// when the count exceeds the remaining budget.
+    pub(crate) fn charge_cells(&mut self, count: usize) -> xml::Result<()> {
+        if count > self.cells_remaining {
+            self.cells_remaining = 0;
+            self.exhausted = true;
+            return Err("spreadsheet workbook cell budget exhausted".into());
+        }
+        self.cells_remaining -= count;
+        Ok(())
+    }
+
+    /// Charges logical value bytes before full-value scans and text append.
+    /// Accepts the expanded byte count including repetitions; returns unit
+    /// while the count fits; returns an exhaustion error and stops the
+    /// workbook when the count exceeds the remaining budget.
+    pub(crate) fn charge_value_bytes(&mut self, count: usize) -> xml::Result<()> {
+        if count > self.value_bytes_remaining {
+            self.value_bytes_remaining = 0;
+            self.exhausted = true;
+            return Err(WORK_VALUE_BUDGET_EXCEEDED.into());
+        }
+        self.value_bytes_remaining -= count;
+        Ok(())
+    }
+
+    /// Returns the remaining value-byte budget for bounded ODF expansion.
+    /// Accepts no inputs; returns the logical byte count still available;
+    /// has no failure states.
+    pub(crate) fn value_bytes_remaining(&self) -> usize {
+        self.value_bytes_remaining
+    }
+
+    /// Marks value-byte work exhausted after a bounded ODF expansion rejects
+    /// the next source text at the remaining cumulative limit.
+    /// Accepts no inputs; returns unit; has no failure states.
+    pub(crate) fn exhaust_value_bytes(&mut self) {
+        self.value_bytes_remaining = 0;
+        self.exhausted = true;
+    }
+
+    /// Reports whether either work limit rejected an attempted charge.
+    /// Accepts no inputs; returns true only after budget exhaustion; has no
+    /// failure states.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+impl Default for WorkBudget {
+    /// Creates the production workbook budget with approved cumulative caps.
+    /// Accepts no inputs; returns a budget for 262144 cell visits and 64 MiB
+    /// of logical value bytes; has no failure states.
+    fn default() -> Self {
+        Self::new(WORKBOOK_CELL_CAP, WORKBOOK_VALUE_BYTE_CAP)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Budget {
     pub columns: usize,
@@ -167,12 +258,12 @@ impl Grid {
         self.min_row = self.min_row.min(row);
         self.min_col = self.min_col.min(col);
         if formula {
-            self.sheet.formula_count += repeats;
+            accumulate(&mut self.sheet.formula_count, 1, repeats);
         }
         if value.is_empty() {
             return Ok(());
         }
-        self.sheet.non_empty_cells += repeats;
+        accumulate(&mut self.sheet.non_empty_cells, 1, repeats);
         if let std::collections::btree_map::Entry::Vacant(entry) = self.columns.entry(col) {
             if budget.columns >= MAX_COLUMNS {
                 budget.capped = true;
@@ -213,8 +304,8 @@ impl Grid {
         } else if c.inferred_type != kind {
             c.inferred_type = "mixed".into();
         }
-        c.non_empty_count += count;
-        c.total_bytes += value.len() * count;
+        accumulate(&mut c.non_empty_count, 1, count);
+        accumulate(&mut c.total_bytes, value.len(), count);
         c.max_bytes = c.max_bytes.max(value.len());
         let hash = value.bytes().fold(0xcbf29ce484222325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
@@ -248,7 +339,7 @@ impl Grid {
     }
 
     pub fn finish(mut self) -> Sheet {
-        self.sheet.cell_count = self.sheet.rows * self.sheet.cols;
+        self.sheet.cell_count = grid_cell_count(self.sheet.rows, self.sheet.cols);
         if self.sheet.rows > 0 {
             self.sheet.used_range = Some(format!(
                 "{}{}:{}{}",
@@ -280,6 +371,116 @@ impl Grid {
             })
             .collect();
         self.sheet
+    }
+}
+
+/// Width-parameterized saturating arithmetic for telemetry counters.
+/// Production instantiates `usize`; tests instantiate `u32` as a
+/// width-reduced seam proving 32-bit targets (wasm32) saturate instead of
+/// overflowing. Native 64-bit output is exact for every in-range value.
+pub(crate) trait Saturating: Copy {
+    fn sat_add(self, other: Self) -> Self;
+    fn sat_mul(self, other: Self) -> Self;
+}
+
+impl Saturating for usize {
+    fn sat_add(self, other: Self) -> Self {
+        self.saturating_add(other)
+    }
+    fn sat_mul(self, other: Self) -> Self {
+        self.saturating_mul(other)
+    }
+}
+
+#[cfg(test)]
+impl Saturating for u32 {
+    fn sat_add(self, other: Self) -> Self {
+        self.saturating_add(other)
+    }
+    fn sat_mul(self, other: Self) -> Self {
+        self.saturating_mul(other)
+    }
+}
+
+/// `total += value * count`, saturating at the type's maximum instead of
+/// overflowing on narrow targets; exact for every in-range value.
+pub(crate) fn accumulate<T: Saturating>(total: &mut T, value: T, count: T) {
+    *total = total.sat_add(value.sat_mul(count));
+}
+
+/// Total grid cells, saturating rather than overflowing on narrow `usize` targets.
+fn grid_cell_count(rows: usize, cols: usize) -> usize {
+    rows.saturating_mul(cols)
+}
+
+#[cfg(test)]
+mod bounds_tests {
+
+    #[test]
+    fn accumulate_saturates_at_reduced_width_instead_of_wrapping() {
+        // Width-reduced seam for 32-bit targets (wasm32): the production
+        // helper instantiated at u32 saturates where the previous unchecked
+        // `+= value * count` arithmetic wrapped or panicked.
+        let mut total = 0u32;
+        super::accumulate(&mut total, 1u32 << 20, 4_096);
+        assert_eq!(total, u32::MAX, "2^20 * 2^12 must saturate, not wrap to 0");
+        let mut near = u32::MAX - 10;
+        super::accumulate(&mut near, 1, 100);
+        assert_eq!(near, u32::MAX, "addition past the cap must saturate");
+    }
+
+    #[test]
+    fn accumulate_is_exact_on_wide_targets() {
+        // Native 64-bit output is preserved: no saturation below usize::MAX.
+        let mut total = 0usize;
+        super::accumulate(&mut total, 1usize << 20, 1usize << 20);
+        assert_eq!(total, 1usize << 40);
+        super::accumulate(&mut total, 7, 3);
+        assert_eq!(total, (1usize << 40) + 21);
+    }
+
+    #[test]
+    fn grid_cell_accumulates_repeated_cell_telemetry_exactly() {
+        // Regression guard for Grid::cell counters on wide targets.
+        let mut grid = super::Grid::new("S".into(), 1);
+        let mut budget = super::Budget::default();
+        grid.cell((2, 1), "abcd", "string", true, 1_048_575, &mut budget)
+            .unwrap();
+        let sheet = grid.finish();
+        assert_eq!(sheet.formula_count, 1_048_575);
+        assert_eq!(sheet.non_empty_cells, 1_048_575);
+        let column = &sheet.columns[0];
+        assert_eq!(column.non_empty_count, 1_048_575);
+        assert_eq!(column.total_bytes, 4 * 1_048_575);
+    }
+    #[test]
+    fn grid_cell_count_saturates_instead_of_overflowing() {
+        assert_eq!(super::grid_cell_count(1_048_576, 16_384), 17_179_869_184);
+        assert_eq!(super::grid_cell_count(usize::MAX - 1, 4), usize::MAX);
+        assert_eq!(super::grid_cell_count(0, 16_384), 0);
+    }
+
+    #[test]
+    /// Verifies exact cell and value-byte boundaries without large fixtures.
+    /// Accepts no inputs; returns unit; panics if exact charges fail, zero
+    /// charges are rejected, or the first excess charge does not latch exhaustion.
+    fn workbook_work_budget_accepts_exact_boundaries_and_rejects_excess() {
+        let mut cells = super::WorkBudget::new(4, 8);
+        cells.charge_cells(4).unwrap();
+        cells.charge_cells(0).unwrap();
+        assert!(!cells.is_exhausted());
+        let error = cells.charge_cells(1).unwrap_err();
+        assert!(error.to_string().contains("cell budget"), "{error}");
+        assert!(cells.is_exhausted());
+
+        let mut bytes = super::WorkBudget::new(4, 8);
+        bytes.charge_value_bytes(8).unwrap();
+        assert_eq!(bytes.value_bytes_remaining(), 0);
+        bytes.charge_value_bytes(0).unwrap();
+        assert!(!bytes.is_exhausted());
+        let error = bytes.charge_value_bytes(1).unwrap_err();
+        assert!(error.to_string().contains("value-byte budget"), "{error}");
+        assert!(bytes.is_exhausted());
     }
 }
 

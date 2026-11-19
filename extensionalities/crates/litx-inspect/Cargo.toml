@@ -8,7 +8,8 @@ description = "Offline, bounded file identification and native Quick Look inspec
 
 [features]
 default = ["parquet-preview"]
-parquet-preview = ["dep:parquet-reader", "dep:bytes"]
+# Compatibility feature name only; row extraction is deferred and unregistered.
+parquet-preview = []
 magika = ["dep:magika", "dep:ort"]
 ffmpeg-link = ["dep:ffmpeg-next"]
 
@@ -35,6 +36,7 @@ tokio = { version = "1", features = ["rt"] }
 unicode-general-category = "=0.6.0"
 liteparse = { path = "../../../crates/liteparse", features = ["tesseract"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-parquet-reader = { package = "parquet", version = "=57.3.1", default-features = false, features = ["json", "snap", "lz4"], optional = true }
-bytes = { version = "1", optional = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Test fixture writers only; no Parquet decoder is linked into runtime builds.
+parquet-reader = { package = "parquet", version = "=57.3.1", default-features = false, features = ["json", "snap", "lz4"] }
+bytes = { version = "1" }

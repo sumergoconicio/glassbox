@@ -37,21 +37,29 @@ fn every_spreadsheet_sheet_previews_only_five_data_rows() {
     xml.push_str("</office:spreadsheet></office:body></office:document-content>");
     zip.write_all(xml.as_bytes()).unwrap();
     zip.finish().unwrap();
-    let r = inspect(&path, &InspectOptions::default());
-    assert!(r.errors.is_empty(), "{:?}", r.errors);
-    let v = serde_json::to_value(&r).unwrap();
-    for sheet in v["sheets"].as_array().unwrap() {
-        assert_eq!(sheet["rows"], 8);
-        assert_eq!(sheet["preview_rows"].as_array().unwrap().len(), 5);
-        assert_eq!(sheet["preview_rows"][4][0], "Row5");
-        assert_eq!(sheet["preview_truncated"], true);
+    for options in [
+        InspectOptions::default(),
+        InspectOptions {
+            max_pages: None,
+            ..Default::default()
+        },
+    ] {
+        let r = inspect(&path, &options);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r).unwrap();
+        for sheet in v["sheets"].as_array().unwrap() {
+            assert_eq!(sheet["rows"], 8);
+            assert_eq!(sheet["preview_rows"].as_array().unwrap().len(), 5);
+            assert_eq!(sheet["preview_rows"][4][0], "Row5");
+            assert_eq!(sheet["preview_truncated"], true);
+        }
+        let md = v["markdown"]["content"].as_str().unwrap();
+        assert!(
+            md.contains("## Sheet: One") && md.contains("## Sheet: Two"),
+            "{md}"
+        );
+        assert!(!md.contains("Row6"), "{md}");
     }
-    let md = v["markdown"]["content"].as_str().unwrap();
-    assert!(
-        md.contains("## Sheet: One") && md.contains("## Sheet: Two"),
-        "{md}"
-    );
-    assert!(!md.contains("Row6"), "{md}");
 }
 
 #[test]

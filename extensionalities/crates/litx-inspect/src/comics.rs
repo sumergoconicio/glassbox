@@ -13,7 +13,12 @@ pub(crate) fn cbz(archive: &mut Archive, report: &mut InspectReport, options: &I
     if report.format.extension != "cbz" {
         return;
     }
-    for name in archive.names.clone().into_iter().filter(|n| image_name(n)) {
+    for name in archive.names.clone().into_iter().filter(|name| {
+        image_name(name)
+            && !name
+                .split('/')
+                .any(|part| part == "__MACOSX" || part.starts_with("._"))
+    }) {
         let result = (|| -> xml::Result<()> {
             let bytes = archive.read(&name)?.ok_or("missing comic image entry")?;
             let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))

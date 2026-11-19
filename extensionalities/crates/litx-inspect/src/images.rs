@@ -130,8 +130,9 @@ fn inner(
     if (options.probe_ocr || options.identify) && options.max_units > 0 {
         match probe(&decoded, ocr) {
             Ok((probe, text)) => {
+                let word_count = probe.word_count;
                 let image = report.image.as_mut().unwrap();
-                image.ocr_status = if probe.word_count > 0 {
+                image.ocr_status = if word_count > 0 {
                     "text_detected"
                 } else {
                     "no_text_detected"
@@ -139,6 +140,16 @@ fn inner(
                 image.probe = Some(probe);
                 report.text.origin = "ocr".into();
                 report.append_text(&text, options.max_chars);
+                // LITX-AUD-009: OCR-recovered image text joins the Markdown
+                // output with OCR provenance, not a plain text fallback.
+                if word_count > 0 {
+                    crate::markdown::append(
+                        report,
+                        &crate::markdown::escape(&text),
+                        options,
+                        "ocr_text_fallback",
+                    );
+                }
             }
             Err(error) => {
                 report.image.as_mut().unwrap().ocr_status = "failed";

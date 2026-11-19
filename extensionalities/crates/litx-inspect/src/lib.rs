@@ -15,8 +15,6 @@ mod mobi;
 mod odf;
 mod office;
 mod parquet;
-#[cfg(all(feature = "parquet-preview", not(target_arch = "wasm32")))]
-mod parquet_rows;
 mod pdf;
 mod profile;
 mod rar;
@@ -26,6 +24,8 @@ mod tabular;
 mod text;
 mod thumbnail;
 mod xml;
+mod xml_profile;
+pub use djvu::{DjvuAnalysis, DjvuPageSignal};
 pub use images::{ImageAnalysis, OcrProbe};
 pub use iwork::DerivedPreview;
 pub use json_profile::JsonProfile;
@@ -34,6 +34,7 @@ pub use parquet::ParquetProfile;
 pub use pdf::{PdfAnalysis, PdfGeometry};
 pub use tables::{DocumentTable, TableCell};
 pub use tabular::DatasetPreview;
+pub use xml_profile::{XmlName, XmlPath, XmlProfile};
 
 /// Explicitly linked libav bindings, never part of the default binary.
 #[cfg(feature = "ffmpeg-link")]
@@ -194,6 +195,8 @@ pub struct Sheet {
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub djvu: Option<DjvuAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_preview: Option<DerivedPreview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset: Option<DatasetPreview>,
@@ -201,6 +204,8 @@ pub struct InspectReport {
     pub parquet: Option<ParquetProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<JsonProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xml: Option<XmlProfile>,
     pub source_path: PathBuf,
     pub artifacts: Vec<Artifact>,
     pub markdown: Markdown,
@@ -320,6 +325,12 @@ impl Inspector {
     }
 }
 
+/// Inspect one file while reusing the caller's lazy OCR session when supported.
+///
+/// Accepts a source path, inspection limits and output options, and a mutable
+/// session. Returns a report with bounded identification and any supported
+/// extraction. Filesystem, parser, renderer, and OCR failures are recorded in
+/// `report.errors`; unsupported formats retain their static support boundary.
 fn inspect_with_session(
     path: &Path,
     options: &InspectOptions,
@@ -327,10 +338,12 @@ fn inspect_with_session(
 ) -> InspectReport {
     let extension = detect::extension(path);
     let mut report = InspectReport {
+        djvu: None,
         derived_preview: None,
         dataset: None,
         parquet: None,
         json: None,
+        xml: None,
         source_path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
         artifacts: vec![],
         markdown: Markdown::default(),
@@ -402,7 +415,8 @@ fn inspect_with_session(
                     iwork::inspect(&mut archive, &mut report, options, ocr);
                     archive::summarize(&mut report, options);
                     // Only allowlisted embedded preview entries may be read.
-                    if options.thumbnail.is_some() {
+                    // LITX-AUD-012: fall back only when no thumbnail exists.
+                    if options.thumbnail.is_some() && report.thumbnail.is_none() {
                         for name in [
                             "docProps/thumbnail.jpeg",
                             "docProps/thumbnail.png",
@@ -442,7 +456,7 @@ fn inspect_with_session(
             .is_some_and(|m| m.contains("djvu"))
             || (report.format.basis == "extension" && matches!(extension.as_str(), "djvu" | "djv"))
         {
-            djvu::inspect(path, &mut report);
+            djvu::inspect(path, &mut report, options);
         } else if report
             .format
             .detected_mime
@@ -472,6 +486,12 @@ fn inspect_with_session(
             || (report.format.basis == "extension" && extension == "json")
         {
             json_profile::inspect(path, &mut report, options);
+        } else if matches!(
+            report.format.detected_mime.as_deref(),
+            Some("application/xml" | "text/xml")
+        ) || (report.format.basis == "extension" && extension == "xml")
+        {
+            xml_profile::inspect(path, &mut report, options);
         } else if report.format.basis == "extension"
             && matches!(report.format.bucket.as_str(), "Text" | "Source Code")
         {
@@ -486,6 +506,10 @@ fn inspect_with_session(
     }
     if report.sheets.iter().any(|s| s.preview_truncated) {
         report.text.truncated = true;
+    }
+    // LITX-AUD-015: dataset preview limits are partial output too.
+    if let Some(dataset) = &report.dataset {
+        report.text.truncated |= dataset.has_more || dataset.values_truncated;
     }
     if let Some(budget) = options.token_budget()
         && truncate_words(&mut report.text.content, budget)
@@ -505,9 +529,15 @@ fn inspect_with_session(
 }
 
 impl InspectOptions {
+    /// Pages where pagination exists, otherwise slides, sections, or spine items.
+    pub(crate) fn text_unit_limit(&self) -> usize {
+        self.max_pages.unwrap_or(usize::MAX)
+    }
+
     fn token_budget(&self) -> Option<usize> {
+        // Only an explicit word-token budget truncates; page limits never
+        // imply one (LITX-AUD-008).
         self.max_tokens
-            .or((self.identify && self.max_pages.is_some()).then_some(500))
     }
 }
 
@@ -528,6 +558,24 @@ fn truncate_words(value: &mut String, budget: usize) -> bool {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    /// Explicit page limits must never imply a word-token budget; only an
+    /// explicit `max_tokens` caps words (LITX-AUD-008).
+    #[test]
+    fn explicit_pages_without_max_tokens_means_no_token_budget() {
+        let options = InspectOptions {
+            identify: true,
+            max_tokens: None,
+            max_pages: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(options.token_budget(), None);
+        let explicit = InspectOptions {
+            max_tokens: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(explicit.token_budget(), Some(500));
+    }
 
     #[test]
     #[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
