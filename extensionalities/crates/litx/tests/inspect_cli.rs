@@ -16,7 +16,7 @@ fn inspect_defaults_to_500_words_while_extract_preserves_all_text() {
     let path = directory.join("words.txt");
     std::fs::write(&path, "word ".repeat(600)).unwrap();
     for (command, words) in [("inspect", 500), ("extract", 600)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
             .arg(command)
             .arg(&path)
             .arg("--no-ocr")
@@ -43,7 +43,7 @@ fn batch_extract_persists_markdown_and_reports_for_mixed_documents() {
                 .unwrap()
                 .as_nanos()
         ));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["extract", "--batch", "--no-ocr", "--output-dir"])
         .arg(&directory)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -97,7 +97,7 @@ fn batch_extract_persists_markdown_and_reports_for_mixed_documents() {
 #[test]
 fn inspect_defaults_to_five_pages_but_extract_uses_the_whole_document() {
     for (command, expected_pages) in [("inspect", 5), ("extract", 6)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
             .args([command, "../../fixtures/multipage.pdf", "--no-ocr"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
@@ -146,7 +146,7 @@ fn extract_with_explicit_max_pages_keeps_every_word_token() {
         vec!["extract", "--no-ocr"],
         vec!["extract", "--no-ocr", "--max-pages", "6"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
             .args(&args)
             .arg(&path)
             .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -168,7 +168,7 @@ fn extract_with_explicit_max_pages_keeps_every_word_token() {
 #[test]
 fn identify_office_text_obeys_an_explicit_word_token_budget() {
     for name in ["notes.docx", "deck.pptx", "grid.xlsx"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
             .args([
                 "inspect",
                 &format!("../../fixtures/{name}"),
@@ -209,7 +209,7 @@ fn identify_office_text_obeys_an_explicit_word_token_budget() {
 fn batch_rejects_oversized_lines_without_losing_the_next_request() {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["inspect", "--batch"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::piped())
@@ -246,7 +246,7 @@ fn batch_rejects_oversized_lines_without_losing_the_next_request() {
 fn batch_flushes_each_response_before_stdin_closes() {
     use std::io::{BufRead, Write};
     use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["inspect", "--batch"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::piped())
@@ -286,7 +286,7 @@ fn batch_flushes_each_response_before_stdin_closes() {
 fn batch_correlates_requests_and_continues_after_bad_input() {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["inspect", "--batch"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::piped())
@@ -338,7 +338,7 @@ fn batch_correlates_requests_and_continues_after_bad_input() {
 
 #[test]
 fn inspect_emits_a_report_and_optional_packet() {
-    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args([
             "inspect",
             "../../fixtures/hello.txt",
@@ -386,7 +386,7 @@ fn missing_ocr_model_marks_pdf_incomplete_and_djvu_stays_identification_only() {
     assert!(!missing.exists());
     // native.pdf stays within the five-page scan limit, so incomplete flags
     // can only come from the failed OCR attempt itself.
-    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["inspect", "--identify", "../../fixtures/native.pdf"])
         .env("TESSDATA_PREFIX", &missing)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -435,7 +435,7 @@ fn missing_ocr_model_marks_pdf_incomplete_and_djvu_stays_identification_only() {
             .as_nanos()
     ));
     std::fs::write(&djvu, bytes).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["inspect", "--identify"])
         .arg(&djvu)
         .env("TESSDATA_PREFIX", &missing)
@@ -477,7 +477,7 @@ fn missing_local_ocr_model_keeps_native_metrics_without_downloads() {
                 .as_nanos()
         ));
     assert!(!missing.exists());
-    let output = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args([
             "inspect",
             "../../fixtures/document-image.png",

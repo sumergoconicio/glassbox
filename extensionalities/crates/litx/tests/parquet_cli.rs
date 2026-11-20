@@ -42,7 +42,7 @@ fn write(directory: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
 }
 
 fn litx(args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_litx"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
     command
 }

@@ -4,11 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Isolated LiteParse Extended CLI scaffold"
+default-run = "glassbox"
+description = "Glassbox: local file inspection and extraction"
+
+[[bin]]
+name = "glassbox"
+path = "src/main.rs"
 
 [[bin]]
 name = "litx"
-path = "src/main.rs"
+path = "src/bin/litx.rs"
 
 [features]
 default = []

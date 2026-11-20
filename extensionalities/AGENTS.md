@@ -10,7 +10,9 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 - Use the upstream `liteparse` public library through the path dependency. Do not patch its CLI or other upstream-owned files.
 - Build and check with the explicit `extensionalities/Cargo.toml` manifest; commit this workspace's `Cargo.lock`.
 - Keep built-in Tesseract enabled. Do not disable it to make a build pass.
-- `litx` provides native inspection and extraction; it is not an upstream `lit` replacement. Further features, CLI compatibility, and consumer delivery require separate approval.
+- `glassbox` provides native inspection and extraction. `litx` remains a compatibility alias for the same implementation.
+- The Rust package names remain `litx` and `litx-inspect`. Neither command replaces upstream `lit`.
+- Further features and consumer delivery require separate approval.
 - Preserve the root workspace and lockfile during dependency updates. Public API changes can break this workspace even when Git merges cleanly.
 - Keep build products, sandbox files, credentials, and private documents out of commits. Review fixtures before adding them.
 - Do not push, publish, activate delivery bundles, or modify consumer recipes without explicit authorization.
@@ -18,6 +20,7 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 ## Documentation, sandbox, and entrypoints
 
 - Keep non-code development documentation under [`dev/`](dev/README.md), not beside the Cargo workspace files. This `AGENTS.md` remains at the downstream root as the agent entrypoint.
+- [`README.md`](README.md) is the public Glassbox guide. Keep `../README.md` unchanged as upstream documentation.
 - Group each feature's phases in its own `dev/PRDs/YYYYMMDD_<feature-slug>/` folder. The inspection/extraction work is [`20261117_litx-inspect-extract`](dev/PRDs/20261117_litx-inspect-extract/README.md) and XML profiling is [`20261118_xml-structure-profile`](dev/PRDs/20261118_xml-structure-profile/README.md).
 - Keep temporary audit harnesses, dogfood probes, and scratch test fixtures inside [`sandbox/`](sandbox/) (gitignored by `extensionalities/.gitignore`), not in the upstream root or `/tmp`. Clean temporary scratch inputs after runs.
 - Keep code, Cargo manifests/lockfile, scripts, and executable test fixtures in their existing locations. Text fixtures such as `fixtures/hello.txt` are test data, not development documentation.
@@ -25,6 +28,12 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 - Before editing this guide, preserve a dated recoverable original under `dev/instruction-history/` and record its SHA-256. Prior versions: [`20261118-AGENTS.before-prd-routing.md`](dev/instruction-history/20261118-AGENTS.before-prd-routing.md) (`7aec3d6677b48b1ce0e00eea2deb7b3ccd19d5e46fe448f05b0f42f61a89dc56`) and [`20261118-AGENTS.before-downstream-seam.md`](dev/instruction-history/20261118-AGENTS.before-downstream-seam.md) (`8adb95c42350b17cf232029b377d8b1cf7f901c15f04dd603f92f83c0d310e27`).
 
 ## Shared PRD management
+
+The pre-branding guide is preserved in [`20261119-AGENTS.before-glassbox-branding.md`](dev/instruction-history/20261119-AGENTS.before-glassbox-branding.md).
+Its SHA-256 is `b0bafe0f8712a4e648c7cb6ba5bd9805344754c74403e012d6cfd6449c2a9867`.
+
+The guide before README relocation is preserved in [`20261120-AGENTS.before-readme-isolation.md`](dev/instruction-history/20261120-AGENTS.before-readme-isolation.md).
+Its SHA-256 is `86f35f33e121e364f53651a50a988c1ac7c53fd86f40553cd29a0d7ca8d60fa9`.
 
 Use the same shared lifecycle as `~/chai/agents/coding/`; do not copy the manager or agent definitions into this repository.
 
@@ -54,7 +63,7 @@ The migrated inspection/extraction reports are historical evidence linked from a
 
 ## Upstream-sync ignore guard
 
-The user-authorized exception to the upstream-file boundary is the single fork-local rule `/extensionalities/dev/` in the repository-root `../.gitignore`.
+The only user-authorized upstream-file exception is the rule `/extensionalities/dev/` in the repository-root `../.gitignore`.
 
 - Check that exact rule after upstream pulls, merges, rebases, or other syncs, and before staging development records.
 - If a sync removes it, restore only that rule while preserving the other upstream ignore entries.

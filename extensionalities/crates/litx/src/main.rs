@@ -5,7 +5,11 @@ use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "LiteParse Extended scaffold (not a lit replacement)")]
+#[command(
+    name = "glassbox",
+    version,
+    about = "What's in the box?! Local file inspection and extraction."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -232,8 +236,10 @@ mod tests {
 
     #[test]
     fn defaults_command_is_available() {
-        let cli = Cli::try_parse_from(["litx", "defaults"]).unwrap();
-        assert!(matches!(cli.command, Commands::Defaults));
+        for name in ["glassbox", "litx"] {
+            let cli = Cli::try_parse_from([name, "defaults"]).unwrap();
+            assert!(matches!(cli.command, Commands::Defaults));
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ const VALID: &[u8] = b"<catalog><book id=\"SENTINEL-V1\">rust</book><book>xml</b
 const INVALID: &[u8] = b"<a>SENTINEL-BAD1&undefined;</a>";
 
 fn litx(args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_litx"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
     command
 }

@@ -63,7 +63,7 @@ fn native_text_fixture() -> PathBuf {
 /// Accepts argument strings and an optional TESSDATA_PREFIX override. Returns
 /// the captured process output. Panics only if the process cannot be spawned.
 fn run_litx(args: &[&str], tessdata: Option<&Path>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_litx"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command
         .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -177,7 +177,7 @@ fn batch_preserves_the_boundary_and_continues_with_the_next_file() {
     use std::io::Write;
 
     let path = native_text_fixture();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litx"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["extract", "--batch", "--no-ocr"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::piped())
