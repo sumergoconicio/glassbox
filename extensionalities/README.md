@@ -179,14 +179,120 @@ Do not upload private documents, credentials, or raw extraction reports.
 Run downstream checks from the repository root:
 
 ```sh
-cargo fmt --manifest-path extensionalities/Cargo.toml --all --check
+cargo fmt --manifest-path extensionalities/Cargo.toml -p litx -p litx-inspect --check
 cargo test --locked --manifest-path extensionalities/Cargo.toml --workspace
 ```
 
-Keep downstream changes inside `extensionalities/`.
-The only upstream-file exception is the approved ignore rule in the root `.gitignore`.
+Keep downstream implementation inside `extensionalities/`.
+Root exceptions are the approved ignore rule and the two Glassbox workflow entry files.
 The upstream workspace, CLI, and package names remain separate.
 The upstream `lit` command is not a Glassbox compatibility interface.
+
+### Downstream continuous integration
+
+The [Glassbox CI workflow](../.github/workflows/glassbox-ci.yml) checks only the downstream Cargo workspace.
+It compiles upstream dependencies without running their tests or lint checks.
+Checks cover:
+
+- Formatting for `litx` and `litx-inspect`, without following upstream path dependencies.
+- Clippy with warnings denied for downstream targets.
+- Workspace tests and isolated automation tests.
+- Release builds, both command names, batch requests, and offline OCR failure behavior.
+- Linux x64 and ARM64 on standard GitHub-hosted runners.
+- Glassbox workflow syntax and expressions, using pinned actionlint.
+
+Upstream dependency changes also trigger downstream checks.
+Weekly sync PRs always run the full downstream checks.
+Unrelated changes skip expensive jobs; the stable `Glassbox downstream gate` still reports a result.
+This avoids permanently pending required checks.
+Existing ignored Rust tests remain ignored; CI does not provide independent audit clearance.
+
+Run the same checks locally:
+
+```sh
+python3 -B extensionalities/scripts/ci.py format
+python3 -B extensionalities/scripts/ci.py check
+python3 -B extensionalities/scripts/ci.py workflows
+```
+
+Workflow validation additionally requires Go 1.24+ and access to public Go modules.
+The workflow checks do not run upstream workflow files.
+
+### Branch and merge policy
+
+Develop and audit changes locally on a feature branch.
+Push that branch and open a PR targeting Glassbox's `main`.
+GitHub Actions provides the final external check; it does not replace the local audit.
+Wait for every applicable check to succeed.
+Then request explicit permission to merge that PR.
+Passing checks alone never authorize a feature PR merge.
+
+After permission, merge the checked head through GitHub without bypassing protection.
+Fetch the resulting remote commit and fast-forward local `main` to match.
+Stop if local `main` has diverged or contains changes.
+Do not create a separate local merge commit and push it to protected `main`.
+Do not delete the feature branch without separate permission.
+Weekly upstream-sync PRs are the approved automatic exception.
+
+### Weekly upstream synchronization
+
+The [sync workflow](../.github/workflows/glassbox-upstream-sync.yml) runs Mondays at 03:17 UTC.
+It also supports manual dispatch.
+The workflow creates a sync PR, waits for every reported check, and merges only when all succeed.
+Pending or missing checks wait up to 40 minutes.
+Failed, skipped, neutral, or cancelled checks stop the merge.
+Base or head changes also stop the merge.
+Existing open sync PRs require resolution before another sync starts.
+
+The sync uses a precise ownership boundary:
+
+- `extensionalities/` retains its exact Git tree, including its lockfile.
+- `.github/workflows/` retains its exact Git tree.
+- The root ignore file follows upstream, with `/extensionalities/dev/` preserved.
+- All other tracked paths mirror `run-llama/liteparse`'s `main`, including upstream deletions.
+
+Keep fork-specific changes within the protected paths.
+The sync does not preserve other root-level customizations.
+Its merge commit records both the current Glassbox and upstream commits as parents.
+Planning never changes working files, the normal Git index, or branch references.
+The automation never force-pushes, changes credentials, or rewrites downstream code to repair compatibility.
+A failed build or dependency change leaves the PR unmerged.
+
+### Activation checklist
+
+The files alone do not activate weekly synchronization.
+Activation requires separate approval for publication and repository settings.
+The inherited workflows remain active until explicitly disabled.
+Publishing the setup PR before disabling them can start upstream checks.
+
+1. Review local validation and approve the cutover.
+2. Disable the 13 inherited workflows in Glassbox before publishing the setup PR.
+3. Protect `main` and require `Glassbox downstream gate` from GitHub Actions.
+4. Require PRs and up-to-date branches; enforce protection for administrators.
+5. Block force pushes and deletion; require resolved conversations.
+6. Preserve any other existing protection requirements.
+7. Add the separately approved `UPSTREAM_SYNC_TOKEN` repository secret.
+8. Publish the setup branch and PR, then verify the Glassbox jobs on GitHub.
+9. Wait for explicit permission before merging the setup PR.
+10. After merging, verify the weekly schedule and synchronize local `main`.
+
+The sync token needs repository and PR writes, check reads, and access to read branch protection.
+Use `repo` and `workflow` for a classic sync token, subject to your account permissions.
+Workflow publication also needs `workflow`.
+The ordinary CI jobs never receive this token.
+The sync job never executes newly fetched upstream code.
+Use a personal or app token so new PRs can trigger CI.
+Repository approval policies still apply.
+Copying a global token into a repository secret needs explicit approval.
+The workflow does not configure billing, paid runners, package publishing, or spending limits.
+Standard runners do not replace account-level spending controls.
+Use only standard runners for this public repository; do not enable paid runners or extra storage.
+
+Required reviews and other protection rules still apply.
+The sync does not approve PRs, bypass protections, or enable GitHub's native auto-merge setting.
+It requests a normal, head-pinned merge only after every check succeeds.
+After a timeout or interruption, inspect the existing PR before closing or merging it.
+Branches and PRs are never automatically deleted.
 
 ## License and attribution
 

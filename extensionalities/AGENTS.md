@@ -63,10 +63,40 @@ The migrated inspection/extraction reports are historical evidence linked from a
 
 ## Upstream-sync ignore guard
 
-The only user-authorized upstream-file exception is the rule `/extensionalities/dev/` in the repository-root `../.gitignore`.
+User-authorized upstream-file exceptions are the ignore rule and these GitHub-required entry files:
+
+- `../.gitignore`: preserve `/extensionalities/dev/`.
+- `../.github/workflows/glassbox-ci.yml`: downstream checks.
+- `../.github/workflows/glassbox-upstream-sync.yml`: checked upstream synchronization.
+
+Keep workflow implementation and tests under `scripts/`; keep the root README unchanged.
+The sync preserves exact downstream and workflow trees and mirrors upstream-owned paths elsewhere.
+Automatic merging requires every reported check to succeed and enforced, strict required checks on `main`.
+Publication, live activation, credential installation, and billing changes require separate authorization.
+
+The pre-automation guide is preserved in [`20261121-AGENTS.before-ci-automation.md`](dev/instruction-history/20261121-AGENTS.before-ci-automation.md).
+Its SHA-256 is `7e7b23fea299cb8df936dfd96f66a87efc3755c0af8e96b74f2a9a646f0d005a`.
 
 - Check that exact rule after upstream pulls, merges, rebases, or other syncs, and before staging development records.
 - If a sync removes it, restore only that rule while preserving the other upstream ignore entries.
 - From the repository root, verify with `git check-ignore --no-index -v extensionalities/dev/README.md`. The matching rule must be `/extensionalities/dev/` in the root `.gitignore`.
 - Ignoring a directory does not untrack existing files. Do not use `git rm --cached`, force-add ignored records, commit, or alter the index without explicit authorization.
 - Keep private source documents, raw extraction reports, binaries, caches, and generated test evidence under ignored `target/`, not in PRDs.
+
+## Branch, PR, and merge approval
+
+Work on feature branches and complete local audits before opening a PR to Glassbox's `main`.
+GitHub checks are a final external check, not independent audit clearance.
+Run downstream formatting, Clippy, tests, release smoke checks, and Glassbox workflow validation.
+Do not run the inherited upstream test matrices.
+
+Feature PRs, including the CI setup PR, require Sri's explicit merge instruction after checks pass.
+Green checks never supply that permission.
+Weekly upstream-sync PRs are the approved all-green automatic exception.
+Never bypass protection, enable auto-merge for feature PRs, or push directly to `main`.
+After an approved GitHub merge, fetch and fast-forward local `main` to the exact remote commit.
+Preserve the current branch and dirty work; stop on divergence instead of resetting or creating another merge.
+Do not delete branches without separate permission.
+
+The guide before PR activation is preserved in [`20261121-AGENTS.before-pr-activation.md`](dev/instruction-history/20261121-AGENTS.before-pr-activation.md).
+Its SHA-256 is `603911a38e2cb8cebe49b4274f4b73eb126777cd9f87b0f2b3364f0442f97ebf`.
