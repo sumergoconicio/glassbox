@@ -1,10 +1,13 @@
+// Module: glassbox-inspect integration tests.
+// File: parquet.rs.
+// Responsibility: Exercise Parquet identification-only behavior without changing reader behavior.
 //! Parquet identification-only regression tests. On 2026-11-18 the user approved
 //! deferring Parquet extraction ("defer extraction, make a note to return to it
 //! later"): inspect and extract keep format identification but never parse a
 //! footer, schema, row, column, or page. Every Parquet input receives the static
 //! deferral diagnostic with incomplete empty content. These tests pin that
 //! contract for valid, malformed, extension-routed, and magic-routed inputs.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 
 const DEFERRAL: &str = "Parquet extraction is deferred; identification only";
 
@@ -36,7 +39,7 @@ fn workdir(tag: &str) -> std::path::PathBuf {
 
 /// Asserts the user-approved identification-only contract: one static deferral
 /// diagnostic, no Parquet profile or dataset, and honest incomplete empty text.
-fn assert_deferred(report: &litx_inspect::InspectReport) {
+fn assert_deferred(report: &glassbox_inspect::InspectReport) {
     let deferrals: Vec<_> = report
         .errors
         .iter()

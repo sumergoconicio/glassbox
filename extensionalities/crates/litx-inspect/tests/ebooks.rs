@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: ebooks.rs.
+// Responsibility: Exercise ebook identification and extraction contracts without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {

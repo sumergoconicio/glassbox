@@ -1,10 +1,18 @@
-//! V-XML-05: standalone CLI transport parity for XML structural profiling —
-//! fresh versus persistent modes, valid-invalid-valid recovery, pre-EOF flush
-//! and the aggregate exit-code convention for document-level stage errors.
+// Module: glassbox-cli XML metadata transport tests.
+// File: xml_cli.rs.
+// Responsibility: Prove v2 value-free XML inspection, persistent recovery, and explicit legacy profile parity.
+use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+const VALID: &[u8] = b"<catalog><book id=\"SENTINEL-V1\">rust</book><book>xml</book></catalog>";
+const INVALID: &[u8] = b"<a>SENTINEL-BAD1&undefined;</a>";
+
+/// Creates an isolated ignored XML CLI test directory.
+///
+/// Accepts a label. Returns a unique target-directory path. Directory creation
+/// failures panic; source fixtures and production data remain untouched.
 fn workdir(tag: &str) -> PathBuf {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/tests")
@@ -19,87 +27,138 @@ fn workdir(tag: &str) -> PathBuf {
     directory
 }
 
+/// Writes one deterministic XML fixture under the test target directory.
+///
+/// Accepts a directory, file name, and bytes. Returns the written path.
+/// Filesystem failures panic; no checked-in fixture is overwritten.
 fn write(directory: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = directory.join(name);
     std::fs::write(&path, bytes).unwrap();
     path
 }
 
-const VALID: &[u8] = b"<catalog><book id=\"SENTINEL-V1\">rust</book><book>xml</book></catalog>";
-const INVALID: &[u8] = b"<a>SENTINEL-BAD1&undefined;</a>";
-
+/// Creates a Glassbox command rooted at the CLI crate directory.
+///
+/// Accepts argument strings. Returns an unlaunched command. No process or file
+/// mutation occurs until the caller launches it.
 fn litx(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
     command
 }
 
+/// Asserts the v2 XML report contains element paths/counts but no values/profile body.
+///
+/// Accepts a metadata JSON report. Returns unit after checking three elements,
+/// two paths, digest, and value absence. Legacy `xml`/text fields cause a panic.
+fn assert_xml_metadata(report: &Value) {
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["kind"], "inspect");
+    assert_eq!(report["metadata"]["status"], "complete");
+    assert_eq!(
+        report["metadata"]["digest"]["digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(
+        report["metadata"]["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|count| count["unit"] == "xml_element" && count["value"] == 3)
+    );
+    let identifiers = report["metadata"]["schema_identifiers"].as_array().unwrap();
+    assert_eq!(identifiers.len(), 2);
+    assert!(
+        identifiers
+            .iter()
+            .any(|identifier| identifier["name"] == "/catalog/book")
+    );
+    assert!(report.get("xml").is_none());
+    assert!(report.get("text").is_none());
+    assert!(!serde_json::to_string(report).unwrap().contains("SENTINEL"));
+    assert!(
+        !serde_json::to_string(report)
+            .unwrap()
+            .contains("rust</book>")
+    );
+}
+
+/// Verifies v2 inspect and explicit extract publish separate value-free XML models.
+///
+/// Accepts no parameters. Returns unit after comparing schema identifiers with
+/// the legacy structural profile. Attribute/text value leakage or wrong exits panic.
 #[test]
-fn xml_inspect_and_extract_publish_identical_profiles_without_values() {
+fn xml_inspect_and_extract_publish_value_free_structure() {
     let directory = workdir("parity");
     let path = write(&directory, "catalog.xml", VALID);
     let path = path.to_str().unwrap();
-    let inspect = litx(&["inspect", path, "--no-ocr"]).output().unwrap();
+    let inspected = litx(&["inspect", path]).output().unwrap();
     assert!(
-        inspect.status.success(),
+        inspected.status.success(),
         "{}",
-        String::from_utf8_lossy(&inspect.stderr)
+        String::from_utf8_lossy(&inspected.stderr)
     );
-    let extract = litx(&["extract", path, "--no-ocr"]).output().unwrap();
+    let extracted = litx(&["extract", path, "--no-ocr"]).output().unwrap();
+    assert_eq!(extracted.status.code(), Some(2));
+    let fresh: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let full: Value = serde_json::from_slice(&extracted.stdout).unwrap();
+    assert_xml_metadata(&fresh);
+    assert_eq!(full["kind"], "extract");
+    assert_eq!(full["metadata"]["diagnostics"], serde_json::json!([]));
     assert!(
-        extract.status.success(),
-        "{}",
-        String::from_utf8_lossy(&extract.stderr)
+        full["metadata"]["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|count| count["unit"] == "xml_element" && count["value"] == 3)
     );
-    let fresh: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
-    let full: serde_json::Value = serde_json::from_slice(&extract.stdout).unwrap();
-    assert_eq!(fresh["errors"], serde_json::json!([]));
-    assert_eq!(full["errors"], serde_json::json!([]));
     assert_eq!(
-        fresh["xml"], full["xml"],
-        "inspect and extract publish the identical structural profile"
+        full["metadata"]["schema_identifiers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
-    assert_eq!(fresh["xml"]["total_elements"], 3);
-    assert_eq!(fresh["xml"]["paths"].as_array().unwrap().len(), 2);
-    for output in [&inspect.stdout, &extract.stdout] {
-        let text = String::from_utf8_lossy(output);
-        assert!(!text.contains("SENTINEL"), "no attribute values leak");
-        assert!(!text.contains("rust"), "no text values leak");
-    }
+    assert_eq!(full["content"]["units"].as_array().unwrap().len(), 1);
+    assert_eq!(full["content"]["units"][0]["rows"], serde_json::json!([]));
+    assert!(
+        full["content"]["units"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("# XML structure")
+    );
+    assert!(!String::from_utf8_lossy(&extracted.stdout).contains("SENTINEL"));
 }
 
+/// Verifies malformed XML fails closed with exit 1 and content-free diagnostics.
+///
+/// Accepts no parameters. Returns unit after inspecting an undefined entity.
+/// No partial schema profile or sentinel body text may appear in the v2 report.
 #[test]
-fn xml_fresh_cli_fails_closed_on_invalid_input_with_exit_zero() {
+fn xml_fresh_cli_fails_closed_on_invalid_input_with_exit_one() {
     let directory = workdir("invalid");
     let path = write(&directory, "bad.xml", INVALID);
-    let output = litx(&["inspect", path.to_str().unwrap(), "--no-ocr"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "document-level stage errors keep the aggregate exit code 0: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["errors"][0]["stage"], "xml");
-    assert!(report["xml"].is_null(), "no profile on invalid input");
-    // Framework convention: markdown.truncated signals incompleteness from a
-    // stage error; text.truncated only means text content was clipped.
-    assert_eq!(report["markdown"]["truncated"], true);
-    assert_eq!(report["text"]["truncated"], false);
+    let output = litx(&["inspect", path.to_str().unwrap()]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["metadata"]["status"], "failed");
+    assert_eq!(report["metadata"]["diagnostics"][0]["stage"], "metadata");
+    assert!(report.get("xml").is_none());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
         !text.contains("SENTINEL"),
         "content-free diagnostics: {text}"
     );
-    assert!(
-        !report["errors"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains('<')
-    );
 }
 
+/// Verifies valid-invalid-valid batch recovery and fresh transport parity.
+///
+/// Accepts no parameters. Returns unit after three ordered metadata responses.
+/// Aggregate status is 1 for the invalid item; valid reports remain identical,
+/// value-free, and complete after the failure.
 #[test]
 fn xml_batch_recovers_valid_invalid_valid_and_matches_fresh_transport() {
     let directory = workdir("batch");
@@ -117,44 +176,38 @@ fn xml_batch_recovers_valid_invalid_valid_and_matches_fresh_transport() {
     writeln!(input, "{}", serde_json::json!({"id": "v3", "path": good})).unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "stage errors must not fail the batch: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    assert_eq!(output.status.code(), Some(1));
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 3, "one response per request, in order");
-    assert_eq!(responses[0]["id"], "v1");
-    assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[2]["id"], "v3");
-    assert_eq!(responses[0]["report"]["errors"], serde_json::json!([]));
-    assert_eq!(responses[1]["report"]["errors"][0]["stage"], "xml");
-    assert!(
-        responses[1]["report"]["xml"].is_null(),
-        "invalid input publishes no profile"
-    );
-    assert_eq!(responses[2]["report"]["errors"], serde_json::json!([]));
+    assert_eq!(responses.len(), 3);
+    assert_xml_metadata(&responses[0]["report"]);
+    assert_eq!(responses[1]["report"]["metadata"]["status"], "failed");
+    assert_xml_metadata(&responses[2]["report"]);
     assert_eq!(
-        responses[0]["report"]["xml"], responses[2]["report"]["xml"],
-        "the worker recovers cleanly after an invalid document"
+        responses[0]["report"]["metadata"]["schema_identifiers"],
+        responses[2]["report"]["metadata"]["schema_identifiers"]
     );
-    // Persistent transport parity: the batch profile equals a fresh run's.
-    let fresh = litx(&["inspect", good.to_str().unwrap(), "--no-ocr"])
-        .output()
-        .unwrap();
-    let fresh: serde_json::Value = serde_json::from_slice(&fresh.stdout).unwrap();
-    assert_eq!(responses[0]["report"]["xml"], fresh["xml"]);
+
+    let fresh = litx(&["inspect", good.to_str().unwrap()]).output().unwrap();
+    let fresh: Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    assert_eq!(
+        responses[0]["report"]["metadata"]["schema_identifiers"],
+        fresh["metadata"]["schema_identifiers"]
+    );
     let text: String = responses
         .iter()
-        .map(|r| serde_json::to_string(r).unwrap())
+        .map(|response| serde_json::to_string(response).unwrap())
         .collect();
-    assert!(!text.contains("SENTINEL"), "no values leak through batch");
+    assert!(!text.contains("SENTINEL"));
 }
 
+/// Verifies a persistent XML worker flushes metadata before stdin closes.
+///
+/// Accepts no parameters. Returns unit after reading one JSONL response.
+/// Timeout, malformed JSON, wrong element counts, or body fields panic.
 #[test]
 fn xml_batch_flushes_structural_response_before_eof() {
     use std::io::BufRead;
@@ -189,13 +242,17 @@ fn xml_batch_flushes_structural_response_before_eof() {
     }
     child.wait().unwrap();
     reader.join().unwrap();
-    let response: serde_json::Value =
+    let response: Value =
         serde_json::from_str(&response.expect("XML batch response must arrive before EOF"))
             .unwrap();
     assert_eq!(response["id"], "xml-flush");
-    assert_eq!(response["report"]["xml"]["total_elements"], 3);
+    assert_xml_metadata(&response["report"]);
 }
 
+/// Verifies declaration errors do not leak declaration names through v2 diagnostics.
+///
+/// Accepts no parameters. Returns unit after inspecting an invalid declaration.
+/// The operation exits 1 and the serialized report must omit `SECRETATTR`.
 #[test]
 fn xml_declaration_errors_stay_content_free_through_cli_transport() {
     let directory = workdir("decl-leak");
@@ -204,17 +261,11 @@ fn xml_declaration_errors_stay_content_free_through_cli_transport() {
         "decl.xml",
         b"<?xml version=\"1.0\" SECRETATTR=\"x\"?><a/>",
     );
-    let output = litx(&["inspect", path.to_str().unwrap(), "--no-ocr"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "document-level stage errors keep exit 0: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["errors"][0]["stage"], "xml");
-    assert!(report["xml"].is_null());
+    let output = litx(&["inspect", path.to_str().unwrap()]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["metadata"]["status"], "failed");
+    assert!(report.get("xml").is_none());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
         !text.contains("SECRETATTR"),

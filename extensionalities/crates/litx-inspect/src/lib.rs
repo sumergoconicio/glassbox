@@ -1,16 +1,29 @@
-//! Bounded, offline Quick Look. Claims retain their source; they are not verified identities.
+//! Module: glassbox-inspect native file inspection library.
+//! File: lib.rs.
+//! Responsibility: Expose canonical v2 inspection/extraction and the explicitly transitional content API.
+//!
+//! Legacy claims retain their source; they are not verified identities.
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[cfg(not(test))]
+const SHARED_OCR_STAGING_BYTES: usize = 128 << 20;
+#[cfg(test)]
+const SHARED_OCR_STAGING_BYTES: usize = 1 << 20;
 mod archive;
 mod binary;
 mod comics;
 mod detect;
 mod djvu;
 mod epub;
+pub mod hashing;
 mod images;
 mod iwork;
 mod json_profile;
 mod markdown;
+pub mod metadata;
 mod mobi;
 mod odf;
 mod office;
@@ -18,6 +31,8 @@ mod parquet;
 mod pdf;
 mod profile;
 mod rar;
+pub mod reports;
+pub mod selection;
 mod spreadsheet;
 mod tables;
 mod tabular;
@@ -40,6 +55,283 @@ pub use xml_profile::{XmlName, XmlPath, XmlProfile};
 #[cfg(feature = "ffmpeg-link")]
 pub use ffmpeg_next as linked_ffmpeg;
 
+/// Observable counters for one owned file/OCR work budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkBudgetSnapshot {
+    /// Maximum simultaneously owned file leases.
+    pub limit: usize,
+    /// Currently owned file leases.
+    pub active: usize,
+    /// Highest observed simultaneous file/OCR lease count.
+    pub peak_active: usize,
+    /// File operations admitted under this budget.
+    pub files_started: u64,
+    /// File leases released after completion or cancellation.
+    pub files_finished: u64,
+    /// Recognition operations entered inside a file lease.
+    pub ocr_started: u64,
+    /// Recognition operations released without unsafe FFI interruption.
+    pub ocr_finished: u64,
+    /// Whether admission has been permanently cancelled for this session.
+    pub cancelled: bool,
+}
+
+#[derive(Debug)]
+struct WorkBudgetState {
+    active: usize,
+    peak_active: usize,
+    files_started: u64,
+    files_finished: u64,
+    ocr_started: u64,
+    ocr_finished: u64,
+    staging_remaining: usize,
+}
+
+#[derive(Debug)]
+struct WorkBudgetInner {
+    limit: usize,
+    cancelled: AtomicBool,
+    state: Mutex<WorkBudgetState>,
+    available: Condvar,
+}
+
+/// One clonable concurrency budget shared by every file worker and OCR operation.
+#[derive(Debug, Clone)]
+pub struct SharedWorkBudget {
+    inner: Arc<WorkBudgetInner>,
+}
+
+impl SharedWorkBudget {
+    /// Creates a budget whose file and nested recognition work shares N slots.
+    ///
+    /// Accepts a positive total job count. Returns an owned shareable budget,
+    /// or an error for zero before any thread, native library, or file is touched.
+    pub fn new(limit: usize) -> Result<Self, String> {
+        if limit == 0 {
+            return Err("shared file/OCR job budget must be positive".into());
+        }
+        Ok(Self {
+            inner: Arc::new(WorkBudgetInner {
+                limit,
+                cancelled: AtomicBool::new(false),
+                state: Mutex::new(WorkBudgetState {
+                    active: 0,
+                    peak_active: 0,
+                    files_started: 0,
+                    files_finished: 0,
+                    ocr_started: 0,
+                    ocr_finished: 0,
+                    staging_remaining: SHARED_OCR_STAGING_BYTES,
+                }),
+                available: Condvar::new(),
+            }),
+        })
+    }
+
+    /// Acquires one file lease that also authorizes recognition within that file.
+    ///
+    /// Accepts no parameters. Returns a permit after a slot becomes available,
+    /// or None after cancellation. Waiting is condvar-bounded and wakes on release
+    /// or cancellation; no nested permit is acquired by OCR.
+    pub fn acquire(&self) -> Option<WorkPermit> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.active >= self.inner.limit && !self.is_cancelled() {
+            state = self
+                .inner
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        if self.is_cancelled() {
+            return None;
+        }
+        state.active += 1;
+        state.peak_active = state.peak_active.max(state.active);
+        state.files_started = state.files_started.saturating_add(1);
+        Some(WorkPermit {
+            budget: self.clone(),
+            released: false,
+        })
+    }
+
+    /// Stops new file/recognition admission and wakes every waiting file worker.
+    ///
+    /// Accepts no parameters. Returns unit after marking the shared session
+    /// cancelled. Active native work owns its lease until ordinary completion;
+    /// no unsafe asynchronous FFI interruption is attempted.
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.available.notify_all();
+    }
+
+    /// Reserves retained raw/encoded raster allocation capacity across all workers.
+    ///
+    /// Accepts the actual Vec capacity, not payload length. Returns a permit that
+    /// releases bytes on Drop, or None without changing the remaining budget when
+    /// capacity would exceed the shared 128 MiB production (small test) limit.
+    pub(crate) fn reserve_staging(&self, capacity: usize) -> Option<OcrStagingPermit> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.staging_remaining = state.staging_remaining.checked_sub(capacity)?;
+        Some(OcrStagingPermit {
+            budget: self.clone(),
+            capacity,
+            released: false,
+        })
+    }
+
+    /// Reports whether this session has stopped admitting new work.
+    ///
+    /// Accepts no parameters. Returns true after cancellation. This atomic read
+    /// performs no allocation, blocking, native calls, or failure states.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Captures actual file/OCR ownership counters for resource verification.
+    ///
+    /// Accepts no parameters. Returns a consistent counter snapshot, recovering
+    /// poisoned mutex state so instrumentation cannot panic a completed worker.
+    pub fn snapshot(&self) -> WorkBudgetSnapshot {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        WorkBudgetSnapshot {
+            limit: self.inner.limit,
+            active: state.active,
+            peak_active: state.peak_active,
+            files_started: state.files_started,
+            files_finished: state.files_finished,
+            ocr_started: state.ocr_started,
+            ocr_finished: state.ocr_finished,
+            cancelled: self.is_cancelled(),
+        }
+    }
+}
+
+/// Owned file lease; recognition is a nested activity, not another acquired slot.
+#[derive(Debug)]
+pub struct WorkPermit {
+    budget: SharedWorkBudget,
+    released: bool,
+}
+
+impl WorkPermit {
+    /// Enters local recognition while retaining the parent file's one slot.
+    ///
+    /// Accepts no parameters. Returns a nested recognition lease, or None when
+    /// cancellation arrived before recognition began. An active recognition is
+    /// never interrupted and releases its marker during ordinary Drop.
+    pub fn recognition(&self) -> Option<OcrPermit> {
+        if self.budget.is_cancelled() {
+            return None;
+        }
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.ocr_started = state.ocr_started.saturating_add(1);
+        Some(OcrPermit {
+            budget: self.budget.clone(),
+            released: false,
+        })
+    }
+}
+
+impl Drop for WorkPermit {
+    /// Releases the file slot and wakes one waiting worker.
+    ///
+    /// Accepts the owned permit implicitly. Returns unit after updating actual
+    /// ownership counters. Poisoned instrumentation state is recovered; Drop
+    /// cannot panic or leave the active count permanently charged.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active = state.active.saturating_sub(1);
+        state.files_finished = state.files_finished.saturating_add(1);
+        drop(state);
+        self.budget.inner.available.notify_one();
+    }
+}
+
+/// Retained raster-capacity permit shared by every worker in one session.
+#[derive(Debug)]
+pub(crate) struct OcrStagingPermit {
+    budget: SharedWorkBudget,
+    capacity: usize,
+    released: bool,
+}
+
+impl Drop for OcrStagingPermit {
+    /// Returns retained raster capacity after recognition or report failure.
+    ///
+    /// Accepts the owned permit implicitly. Returns unit after restoring the exact
+    /// Vec capacity. Poisoned counters recover without panicking during cleanup.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.staging_remaining = state
+            .staging_remaining
+            .saturating_add(self.capacity)
+            .min(SHARED_OCR_STAGING_BYTES);
+    }
+}
+
+/// Recognition marker held inside an existing [`WorkPermit`].
+#[derive(Debug)]
+pub struct OcrPermit {
+    budget: SharedWorkBudget,
+    released: bool,
+}
+
+impl Drop for OcrPermit {
+    /// Marks ordinary recognition completion without releasing the file lease.
+    ///
+    /// Accepts the owned marker implicitly. Returns unit after updating the
+    /// recognition counter. No thread, model, or native context is destroyed
+    /// early, and poisoned instrumentation cannot cause a Drop panic.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.ocr_finished = state.ocr_finished.saturating_add(1);
+    }
+}
+/// Transitional body-producing options retained until legacy readers migrate to [`reports::InspectOptions`].
 #[derive(Debug, Clone)]
 pub struct InspectOptions {
     pub identify: bool,
@@ -51,9 +343,19 @@ pub struct InspectOptions {
     pub thumbnail_max_edge: u32,
     pub packet: bool,
     pub probe_ocr: bool,
+    #[doc(hidden)]
+    pub native_selection: Option<reports::NativeSelection>,
+    #[doc(hidden)]
+    pub ocr_raster_long_edge: u32,
+    #[doc(hidden)]
+    pub ocr_language: String,
 }
 
 impl Default for InspectOptions {
+    /// Creates legacy preview controls without a native-selection override.
+    ///
+    /// Accepts no parameters. Returns the historical five-unit, 16000-character
+    /// defaults and the approved OCR raster edge. No reader or OCR engine runs.
     fn default() -> Self {
         Self {
             identify: false,
@@ -65,6 +367,9 @@ impl Default for InspectOptions {
             thumbnail_max_edge: 320,
             packet: false,
             probe_ocr: false,
+            native_selection: None,
+            ocr_raster_long_edge: reports::DEFAULT_OCR_RASTER_LONG_EDGE,
+            ocr_language: "eng".into(),
         }
     }
 }
@@ -192,6 +497,7 @@ pub struct Sheet {
     pub columns: Vec<Column>,
 }
 
+/// Transitional body-producing report; it is never projected into [`reports::MetadataReport`].
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +532,12 @@ pub struct InspectReport {
     pub errors: Vec<StageError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packet: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub(crate) native_units: Vec<reports::ContentUnit>,
+    #[serde(skip)]
+    pub(crate) native_unit: reports::NativeUnit,
+    #[serde(skip)]
+    pub(crate) native_available: reports::QualifiedCount,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +546,54 @@ pub struct Artifact {
     pub path: PathBuf,
 }
 
+/// Empty transitional report used by header-only structural readers.
+///
+/// Accepts no parameters. Returns a report with no content, counts, claims, or
+/// artifacts. This constructor performs no I/O and has no failure states.
+impl Default for InspectReport {
+    fn default() -> Self {
+        Self {
+            djvu: None,
+            derived_preview: None,
+            dataset: None,
+            parquet: None,
+            json: None,
+            xml: None,
+            source_path: PathBuf::new(),
+            artifacts: vec![],
+            markdown: Markdown::default(),
+            pdf: None,
+            image: None,
+            pages: vec![],
+            format: Format {
+                extension: String::new(),
+                detected_mime: None,
+                detected_name: None,
+                bucket: "Other".into(),
+                basis: "extension".into(),
+                disagreement: false,
+                detector: "extension".into(),
+            },
+            claims: vec![],
+            counts: Counts::default(),
+            entries: vec![],
+            sheets: vec![],
+            tables: vec![],
+            preflight: vec![],
+            text: Text {
+                origin: "native".into(),
+                token_basis: "whitespace_words",
+                ..Text::default()
+            },
+            thumbnail: None,
+            errors: vec![],
+            packet: None,
+            native_units: Vec::new(),
+            native_unit: reports::NativeUnit::Unknown,
+            native_available: reports::QualifiedCount::default(),
+        }
+    }
+}
 impl InspectReport {
     pub(crate) fn append_text(&mut self, value: &str, cap: usize) {
         let chars = value.chars().count();
@@ -309,22 +669,261 @@ impl InspectReport {
     }
 }
 
-pub fn inspect(path: &Path, options: &InspectOptions) -> InspectReport {
-    Inspector::default().inspect(path, options)
+/// Inspects identity and structure without body extraction or OCR.
+///
+/// Accepts a source path and v2 metadata-only options. Returns a schema-v2
+/// [`reports::MetadataReport`]. Input, hashing, structural, and artifact
+/// failures are qualified inside the report rather than returned as Rust errors.
+pub fn inspect(path: &Path, options: &reports::InspectOptions) -> reports::MetadataReport {
+    match Inspector::with_budget(&options.budget) {
+        Ok(mut inspector) => inspector.inspect(path, options),
+        Err(error) => finalize_public_inspection(unadmitted_metadata(path, &error)),
+    }
 }
 
-/// Sequential inspection session. OCR models load lazily and stay local to this session.
-#[derive(Default)]
+/// Finalizes inspection-only support semantics and structured inert advice.
+///
+/// Accepts a metadata report from the dedicated no-body reader. Returns the
+/// report with successful identification-only inspection distinguished from
+/// unsupported extraction and with exact argument-vector advice where useful.
+/// Missing Unicode path representation suppresses advice rather than lossy
+/// reconstruction; no command is executed and no credentials are introduced.
+fn finalize_public_inspection(mut report: reports::MetadataReport) -> reports::MetadataReport {
+    if report.metadata.extraction_support == reports::SupportStatus::IdentificationOnly
+        && report.metadata.status == reports::OperationStatus::Unsupported
+        && report.metadata.completeness == reports::Completeness::Exact
+    {
+        report.metadata.status = reports::OperationStatus::Complete;
+    }
+    if !report.metadata.advice.is_empty() {
+        return report;
+    }
+    let Some(path) = report.metadata.identity.path.to_str() else {
+        return report;
+    };
+    let advice = match report.metadata.extraction_support {
+        reports::SupportStatus::Supported
+            if report.metadata.encryption != reports::EncryptionStatus::EncryptedInaccessible =>
+        {
+            Some(reports::Advice {
+                operation: reports::AdviceOperation::Extract,
+                arguments: vec!["extract".to_owned(), path.to_owned()],
+                reason: "Native extraction is supported; encryption, OCR need, safety limits, and cost remain separate observations.".to_owned(),
+                cost: reports::AdviceCost::Unknown,
+            })
+        }
+        reports::SupportStatus::IdentificationOnly => Some(reports::Advice {
+            operation: reports::AdviceOperation::Inspect,
+            arguments: vec!["inspect".to_owned(), path.to_owned()],
+            reason: "Identification is available, but content extraction is unsupported; retain this metadata-only operation.".to_owned(),
+            cost: reports::AdviceCost::Unknown,
+        }),
+        _ => None,
+    };
+    report.metadata.advice.extend(advice);
+    report
+}
+
+/// Extracts exactly the requested native units into a canonical v2 report.
+///
+/// Accepts a source path and v2 extraction controls. Returns separate metadata,
+/// selected content, provenance, and coverage. Input, parser, selection, safety,
+/// and local OCR failures are qualified in report diagnostics; no error is hidden.
+pub fn extract(path: &Path, options: &reports::ExtractOptions) -> reports::ExtractReport {
+    match Inspector::with_budget(&options.budget) {
+        Ok(mut inspector) => inspector.extract(path, options),
+        Err(error) => unadmitted_extract(path, options, &error),
+    }
+}
+
+/// Runs the transitional body-producing reader for explicit compatibility callers.
+///
+/// Accepts a source path and legacy content controls. Returns the legacy report
+/// with bounded native/OCR content. Filesystem, parser, renderer, and OCR
+/// failures are recorded in `report.errors`; canonical callers use `extract`.
+pub fn extract_transitional(path: &Path, options: &InspectOptions) -> InspectReport {
+    Inspector::default().extract_transitional(path, options)
+}
+
+/// Per-worker session with content-free inspection and explicitly owned native/OCR work.
+///
+/// Each operation owns one shared file lease. The lazy OCR session lives inside
+/// that lease and never creates a second nested worker pool or cross-request model.
 pub struct Inspector {
     ocr: images::OcrSession,
 }
 
-impl Inspector {
-    pub fn inspect(&mut self, path: &Path, options: &InspectOptions) -> InspectReport {
-        inspect_with_session(path, options, &mut self.ocr)
+impl Default for Inspector {
+    /// Creates a sequential inspector with no loaded OCR model.
+    ///
+    /// Accepts no parameters. Returns an inspector owning one file/OCR slot.
+    /// No filesystem, PDFium, Tesseract, thread, or allocation-heavy work runs.
+    fn default() -> Self {
+        Self {
+            ocr: images::OcrSession::default(),
+        }
     }
 }
 
+/// Builds a failed metadata report without entering the file reader.
+///
+/// Accepts a source path and explanatory diagnostic. Returns a v2 failed report
+/// with the path preserved. No source bytes, PDFium, OCR, or artifact I/O runs.
+fn unadmitted_metadata(path: &Path, message: &str) -> reports::MetadataReport {
+    let mut report = reports::MetadataReport::default();
+    report.metadata.identity.path = path.to_path_buf();
+    report.metadata.status = reports::OperationStatus::Failed;
+    report.metadata.completeness = reports::Completeness::Partial;
+    report.metadata.diagnostics.push(reports::Diagnostic {
+        stage: reports::DiagnosticStage::Internal,
+        severity: reports::DiagnosticSeverity::Error,
+        code: "file_work_not_admitted".into(),
+        message: message.to_owned(),
+        unit_index: None,
+    });
+    report
+}
+
+/// Builds a failed extraction report without entering the file reader.
+///
+/// Accepts a source path, extraction controls, and an admission diagnostic.
+/// Returns a canonical failed v2 extraction with no fabricated content. Input,
+/// hashing, PDFium, OCR, and artifact stages remain unentered after rejection.
+fn unadmitted_extract(
+    path: &Path,
+    options: &reports::ExtractOptions,
+    message: &str,
+) -> reports::ExtractReport {
+    let metadata = unadmitted_metadata(path, message);
+    let mut legacy = InspectReport {
+        source_path: path.to_path_buf(),
+        ..InspectReport::default()
+    };
+    legacy.error("work_budget", message);
+    selection::assemble(metadata, legacy, options)
+}
+
+impl Inspector {
+    /// Creates one worker session from public queue and job controls.
+    ///
+    /// Accepts a session budget. Returns an inspector sharing the declared
+    /// positive file/OCR slots, or an error for zero before any file is opened.
+    pub fn with_budget(budget: &reports::SessionBudget) -> Result<Self, String> {
+        Ok(Self::with_shared_budget(SharedWorkBudget::new(
+            budget.shared_job_slots,
+        )?))
+    }
+
+    /// Creates one worker session attached to the batch's actual shared budget.
+    ///
+    /// Accepts a clone of the owned budget. Returns an inspector whose lazy OCR
+    /// model and active file lease stay within this worker/session. No model loads.
+    pub fn with_shared_budget(budget: SharedWorkBudget) -> Self {
+        Self {
+            ocr: images::OcrSession::with_budget(budget),
+        }
+    }
+
+    /// Inspects one file under the shared lease without body extraction or OCR.
+    ///
+    /// Accepts a source path and v2 metadata options. Returns a typed v2 report;
+    /// cancellation, input, hashing, and structural failures remain diagnostics.
+    pub fn inspect(
+        &mut self,
+        path: &Path,
+        options: &reports::InspectOptions,
+    ) -> reports::MetadataReport {
+        if !self.ocr.begin_file() {
+            return finalize_public_inspection(unadmitted_metadata(
+                path,
+                "operation cancelled before file admission",
+            ));
+        }
+        let report = metadata::inspect(path, options);
+        self.ocr.end_file();
+        finalize_public_inspection(report)
+    }
+
+    /// Extracts native units through the canonical reader and owned OCR session.
+    ///
+    /// Accepts a source path and v2 extraction controls. Returns a typed report
+    /// with source-order units and honest omissions. Rejected inputs (bad
+    /// paths, link components, unopenable or non-regular sources) fail at the
+    /// metadata stage and never reach the native readers. Cancellation, reader,
+    /// model, safety, and input failures remain diagnostics instead of Rust
+    /// exceptions.
+    pub fn extract(
+        &mut self,
+        path: &Path,
+        options: &reports::ExtractOptions,
+    ) -> reports::ExtractReport {
+        if !self.ocr.begin_file() {
+            return unadmitted_extract(path, options, "operation cancelled before file admission");
+        }
+        let metadata = metadata::inspect(
+            path,
+            &reports::InspectOptions {
+                thumbnail: options.thumbnail.clone(),
+                ..reports::InspectOptions::default()
+            },
+        );
+        // A rejected input (bad path, link component, unopenable or
+        // non-regular source) already failed the metadata stage; it must not
+        // reach the native readers, whose own path opens follow links.
+        let input_rejected = metadata.metadata.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == reports::DiagnosticStage::Input
+                && diagnostic.severity == reports::DiagnosticSeverity::Error
+        });
+        let mut legacy = if input_rejected {
+            let mut rejected = InspectReport {
+                source_path: path.to_path_buf(),
+                ..InspectReport::default()
+            };
+            rejected.error("input", "input was rejected before native extraction");
+            rejected
+        } else {
+            let legacy_options = InspectOptions {
+                identify: options.ocr.enabled,
+                max_tokens: options.max_tokens,
+                max_pages: None,
+                max_chars: options.max_chars,
+                max_units: options.max_units,
+                native_selection: Some(options.selection.clone()),
+                ocr_raster_long_edge: options.ocr.raster_long_edge,
+                ocr_language: options.ocr.language.clone(),
+                ..InspectOptions::default()
+            };
+            inspect_with_session(path, &legacy_options, &mut self.ocr)
+        };
+        self.ocr.end_file();
+        if metadata.metadata.extraction_support == reports::SupportStatus::IdentificationOnly {
+            legacy.errors.clear();
+            selection::unsupported(&mut legacy);
+        } else if legacy.dataset.is_some() || legacy.json.is_some() || legacy.xml.is_some() {
+            selection::dataset_fallback(&mut legacy, &options.selection);
+        }
+        selection::assemble(metadata, legacy, options)
+    }
+
+    /// Extracts through the explicitly transitional legacy content adapter.
+    ///
+    /// Accepts a source path and legacy content controls. Returns the legacy
+    /// body-producing report; cancellation, parser, filesystem, renderer, and
+    /// OCR failures remain in `report.errors` for compatibility callers.
+    pub fn extract_transitional(&mut self, path: &Path, options: &InspectOptions) -> InspectReport {
+        if !self.ocr.begin_file() {
+            let mut report = InspectReport {
+                source_path: path.to_path_buf(),
+                ..InspectReport::default()
+            };
+            report.error("work_budget", "operation cancelled before file admission");
+            return report;
+        }
+        let report = inspect_with_session(path, options, &mut self.ocr);
+        self.ocr.end_file();
+        report
+    }
+}
 /// Inspect one file while reusing the caller's lazy OCR session when supported.
 ///
 /// Accepts a source path, inspection limits and output options, and a mutable
@@ -373,10 +972,19 @@ fn inspect_with_session(
         thumbnail: None,
         errors: vec![],
         packet: None,
+        native_units: Vec::new(),
+        native_unit: reports::NativeUnit::Unknown,
+        native_available: reports::QualifiedCount::default(),
     };
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => report.counts.bytes = meta.len(),
-        Ok(_) => report.error("input", "input is not a regular file"),
+    // Enforce the validated no-follow regular-file boundary before any reader
+    // opens the path; symbolic links and non-regular inputs are rejected with
+    // the same precedence as the v2 hashing stage, so no reader can follow a
+    // rejected link or block on a FIFO behind this gate.
+    match crate::hashing::validate_regular_file(path) {
+        Ok((absolute, bytes)) => {
+            report.counts.bytes = bytes;
+            report.source_path = absolute;
+        }
         Err(error) => report.error("input", error),
     }
     if report.errors.is_empty() {
@@ -559,6 +1167,123 @@ fn truncate_words(value: &mut String, budget: usize) -> bool {
 mod session_tests {
     use super::*;
 
+    /// Creates a unique ignored fixture directory for session boundary tests.
+    ///
+    /// Accepts a label. Returns a new target path. Creation failures panic; no
+    /// prior evidence or user file is removed or overwritten.
+    fn workdir(label: &str) -> std::path::PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tests")
+            .join(format!(
+                "session-{label}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Creates extraction controls with OCR disabled for deterministic tests.
+    ///
+    /// Accepts a native selection. Returns default extraction options with the
+    /// requested selection and no model, file, or network access.
+    fn options(selection: reports::NativeSelection) -> reports::ExtractOptions {
+        reports::ExtractOptions {
+            selection,
+            ocr: reports::OcrOptions {
+                enabled: false,
+                ..reports::OcrOptions::default()
+            },
+            ..reports::ExtractOptions::default()
+        }
+    }
+
+    /// Proves a symlinked input is rejected before any native reader runs.
+    ///
+    /// Accepts no parameters. Returns unit after extracting through a symbolic
+    /// link to a two-line text fixture. Any emitted unit, reader-owned count,
+    /// or non-failed status panics; fixture I/O can panic.
+    #[cfg(unix)]
+    #[test]
+    fn rejected_symlink_never_reaches_native_extraction() {
+        let directory = workdir("symlink");
+        let target = directory.join("target.txt");
+        let link = directory.join("link.txt");
+        std::fs::write(&target, "zero\none\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let report = extract(&link, &options(reports::NativeSelection::All));
+        assert!(report.content.units.is_empty(), "reader followed the link");
+        assert_eq!(report.metadata.status, reports::OperationStatus::Failed);
+        assert!(
+            report.selection.available.value.is_none(),
+            "reader-owned line count was fabricated for a rejected input"
+        );
+        assert!(
+            report
+                .metadata
+                .diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.stage == reports::DiagnosticStage::Input
+                        && diagnostic.severity == reports::DiagnosticSeverity::Error,
+                )
+        );
+        assert_eq!(
+            report.selection.omitted,
+            reports::OmissionStatus::PartialFailure
+        );
+    }
+
+    /// Proves a directory input is rejected before any native reader runs.
+    ///
+    /// Accepts no parameters. Returns unit after extracting a directory path.
+    /// Any emitted unit, reader-owned count, or non-failed status panics.
+    #[test]
+    fn rejected_directory_never_reaches_native_extraction() {
+        let directory = workdir("directory");
+        let report = extract(&directory, &options(reports::NativeSelection::All));
+        assert!(report.content.units.is_empty());
+        assert_eq!(report.metadata.status, reports::OperationStatus::Failed);
+        assert!(
+            report
+                .metadata
+                .diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.stage == reports::DiagnosticStage::Input
+                        && diagnostic.severity == reports::DiagnosticSeverity::Error,
+                )
+        );
+    }
+
+    /// Proves the transitional adapter rejects symlinked inputs before readers.
+    ///
+    /// Accepts no parameters. Returns unit after a legacy extraction through a
+    /// symbolic link. Any body content, native unit, or missing input error
+    /// panics; fixture I/O can panic.
+    #[cfg(unix)]
+    #[test]
+    fn transitional_symlink_input_is_rejected_before_readers() {
+        let directory = workdir("transitional-symlink");
+        let target = directory.join("target.txt");
+        let link = directory.join("link.txt");
+        std::fs::write(&target, "zero\none\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let report = extract_transitional(&link, &InspectOptions::default());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.stage == "input" && error.message.contains("symbolic-link")),
+            "{:?}",
+            report.errors
+        );
+        assert!(report.text.content.is_empty());
+        assert!(report.native_units.is_empty());
+    }
+
     /// Explicit page limits must never imply a word-token budget; only an
     /// explicit `max_tokens` caps words (LITX-AUD-008).
     #[test]
@@ -586,10 +1311,10 @@ mod session_tests {
             ..Default::default()
         };
         let mut inspector = Inspector::default();
-        let first = inspector.inspect(&path, &options);
+        let first = inspector.extract_transitional(&path, &options);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         let handle = inspector.ocr.api.as_ref().unwrap().handle.clone();
-        let second = inspector.inspect(&path, &options);
+        let second = inspector.extract_transitional(&path, &options);
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert!(std::sync::Arc::ptr_eq(
             &handle,

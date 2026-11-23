@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: previews.rs.
+// Responsibility: Exercise embedded document preview behavior without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Read, path::PathBuf};
 
 fn fixture(name: &str) -> PathBuf {

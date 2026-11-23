@@ -425,7 +425,7 @@ mod tests {
     fn scratch_report() -> crate::InspectReport {
         let path = fixtures_dir().join("archive-unit-scratch.txt");
         std::fs::write(&path, b"scratch").unwrap();
-        crate::inspect(&path, &crate::InspectOptions::default())
+        crate::extract_transitional(&path, &crate::InspectOptions::default())
     }
 
     /// LITX-AUD-011: reads that fail after decompression work must still charge the

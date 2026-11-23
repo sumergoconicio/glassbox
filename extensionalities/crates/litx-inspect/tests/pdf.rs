@@ -1,4 +1,8 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: pdf.rs.
+// Responsibility: Exercise PDF inspection and extraction behavior without changing reader behavior.
+use glassbox_inspect::reports::{ExtractOptions, OcrOptions, OperationStatus};
+use glassbox_inspect::{InspectOptions, extract, extract_transitional as inspect};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
@@ -465,5 +469,244 @@ fn at_least_five_pages_are_checked_while_full_six_page_counts_survive_preview_li
         full.text
             .content
             .contains("Final page confirms full-document extraction.")
+    );
+}
+
+/// Writes one minimal single-page PDF with a caller-supplied `/Info` string.
+///
+/// Accepts the output path, the raw `/Info` dictionary body, and an optional
+/// marker placed in the content stream. Returns unit. PDF construction or
+/// write failures panic; cross-reference offsets are computed exactly.
+fn info_pdf(path: &std::path::Path, info_body: &str, marker: &str) {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] >>".to_vec(),
+        format!("BT /F1 12 Tf 50 700 Td ({marker}) Tj ET").into_bytes(),
+        format!("<< /Title ({info_body}) >>").into_bytes(),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 000000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    std::fs::write(path, pdf).unwrap();
+}
+
+/// Verifies bounded, sourced `/Info` properties are published for PDFs.
+///
+/// Accepts no parameters. Returns unit after v2 inspection of the native PDF
+/// fixture. Missing title/author properties, wrong source, or body-text
+/// leakage into the metadata report panics.
+#[test]
+fn pdf_info_dictionary_publishes_bounded_embedded_properties() {
+    let path = fixture("native.pdf");
+    let report =
+        glassbox_inspect::inspect(&path, &glassbox_inspect::reports::InspectOptions::default());
+    assert_eq!(
+        report.metadata.status,
+        glassbox_inspect::reports::OperationStatus::Complete
+    );
+    let value = |field: glassbox_inspect::reports::EmbeddedMetadataField| {
+        report
+            .metadata
+            .embedded_metadata
+            .iter()
+            .find(|property| property.field == field)
+            .map(|property| property.value.clone())
+    };
+    assert_eq!(
+        value(glassbox_inspect::reports::EmbeddedMetadataField::Title),
+        Some("Native PDF".to_owned())
+    );
+    assert_eq!(
+        value(glassbox_inspect::reports::EmbeddedMetadataField::Author),
+        Some("Example Author".to_owned())
+    );
+    for property in &report.metadata.embedded_metadata {
+        assert_eq!(
+            property.completeness,
+            glassbox_inspect::reports::Completeness::Exact
+        );
+    }
+    // Body text stays out of the metadata-only report.
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("bounded preview")
+    );
+}
+
+/// Verifies oversized `/Info` values are clipped and disclosed as partial.
+///
+/// Accepts no parameters. Returns unit after v2 inspection of a generated PDF
+/// with an oversized title. Retaining the whole value, missing cap diagnostic,
+/// or a complete status for a clipped property panics.
+#[test]
+fn oversized_pdf_info_values_are_clipped_and_disclosed() {
+    let directory = scratch("oversized-info");
+    let long_title = "T".repeat(5000);
+    let path = directory.join("oversized-info.pdf");
+    info_pdf(&path, &long_title, "BODY_SENTINEL_x9f2");
+    let report =
+        glassbox_inspect::inspect(&path, &glassbox_inspect::reports::InspectOptions::default());
+    let title = report
+        .metadata
+        .embedded_metadata
+        .iter()
+        .find(|property| property.field == glassbox_inspect::reports::EmbeddedMetadataField::Title)
+        .expect("clipped title property");
+    assert_eq!(title.value.chars().count(), 1024);
+    assert_eq!(title.value, "T".repeat(1024));
+    assert_eq!(
+        title.completeness,
+        glassbox_inspect::reports::Completeness::Partial
+    );
+    assert!(
+        report
+            .metadata
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "metadata_cap_exceeded"),
+        "{:#?}",
+        report.metadata.diagnostics
+    );
+    assert_eq!(
+        report.metadata.status,
+        glassbox_inspect::reports::OperationStatus::Partial
+    );
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("BODY_SENTINEL_x9f2")
+    );
+}
+
+/// Verifies an invalid OCR language keeps v2 PDF extraction partial with native text.
+///
+/// Accepts no parameters. Returns unit after v2 extraction of a synthetic
+/// text PDF with an invalid OCR language expression. A failed status,
+/// discarded native text, a missing `pdf_ocr` diagnostic, or fabricated OCR
+/// provenance panics. No model lookup, tessdata directory, or network access
+/// is required because normalization rejects the expression first.
+#[test]
+fn pdf_extract_with_invalid_ocr_language_keeps_native_text_partial() {
+    // COND-10: the PDF path normalizes the requested language before any model
+    // lookup, so an invalid expression keeps the established partial
+    // semantics: native text is retained, the report stays partial, and no
+    // OCR claim is fabricated.
+    let directory = scratch("invalid-ocr-language");
+    let path = directory.join("native.pdf");
+    synthetic_pdf(&path, &[Some("Native PDF text line".to_owned())], None);
+    let extracted = extract(
+        &path,
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: true,
+                language: "eñ".to_owned(),
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert_eq!(extracted.metadata.status, OperationStatus::Partial);
+    assert!(
+        extracted
+            .metadata
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "pdf_ocr"
+                && diagnostic
+                    .message
+                    .contains("invalid local OCR language model name")),
+        "{:#?}",
+        extracted.metadata.diagnostics
+    );
+    assert_eq!(extracted.content.units.len(), 1);
+    let unit = &extracted.content.units[0];
+    assert!(
+        unit.text
+            .as_deref()
+            .is_some_and(|text| text.contains("Native PDF text line"))
+    );
+    assert!(
+        unit.provenance
+            .iter()
+            .all(|provenance| provenance.ocr.is_none())
+    );
+}
+
+/// Verifies an OCR alias initializes and reports the canonical model language.
+///
+/// Accepts no parameters. Returns unit after v2 extraction of a synthetic
+/// scanned PDF with the alias language `en`. A `pdf_ocr` diagnostic, a status
+/// below complete, non-canonical provenance language, or missing recognized
+/// text panics.
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn pdf_ocr_alias_language_inits_and_reports_the_canonical_model() {
+    // COND-10: the recognizer and the reported provenance share one canonical
+    // model expression, so `en` initializes `eng` and provenance says `eng`
+    // instead of failing against a missing non-canonical model.
+    let directory = scratch("alias-language");
+    let path = directory.join("scan.pdf");
+    synthetic_pdf(&path, &[None, None], Some(&text_jpeg(&directory)));
+    let extracted = extract(
+        &path,
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: true,
+                language: "en".to_owned(),
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert!(
+        extracted
+            .metadata
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "pdf_ocr"),
+        "{:#?}",
+        extracted.metadata.diagnostics
+    );
+    assert_eq!(extracted.metadata.status, OperationStatus::Complete);
+    let languages: Vec<&str> = extracted
+        .content
+        .units
+        .iter()
+        .flat_map(|unit| unit.provenance.iter())
+        .filter_map(|provenance| provenance.ocr.as_ref())
+        .map(|ocr| ocr.language.as_str())
+        .collect();
+    assert!(!languages.is_empty());
+    for language in &languages {
+        assert_eq!(language, &"eng");
+    }
+    assert!(
+        extracted.content.units.iter().any(|unit| unit
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("Native PDF"))),
+        "{:#?}",
+        extracted.content.units
     );
 }

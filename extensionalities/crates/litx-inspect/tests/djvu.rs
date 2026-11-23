@@ -1,5 +1,8 @@
+// Module: glassbox-inspect integration tests.
+// File: djvu.rs.
+// Responsibility: Exercise DjVu identification-only contracts without changing reader behavior.
 //! DjVu identification-only contract regressions for library inspection.
-use litx_inspect::{InspectOptions, InspectReport, inspect};
+use glassbox_inspect::{InspectOptions, InspectReport, extract_transitional as inspect};
 use std::path::{Path, PathBuf};
 
 const DIAGNOSTIC: &str = "DjVu extraction is unsupported; identification only";

@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: json_profile.rs.
+// Responsibility: Exercise JSON structural profile behavior without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 
 #[test]
 fn json_counts_scalar_leaves_and_describes_repeated_record_fields() {

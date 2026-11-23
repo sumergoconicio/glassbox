@@ -1139,6 +1139,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "glassbox-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "glassbox-inspect",
+ "libc",
+ "liteparse",
+ "serde_json",
+ "tokio",
+ "web-time",
+]
+
+[[package]]
+name = "glassbox-inspect"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "csv",
+ "encoding_rs",
+ "ffmpeg-next",
+ "file-format",
+ "image",
+ "liteparse",
+ "magika",
+ "ort",
+ "parquet",
+ "parquet-format-safe",
+ "percent-encoding",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tesseract-rs",
+ "thiserror 2.0.21",
+ "tokio",
+ "unicode-general-category",
+ "zip 9.6.1",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1758,43 +1799,6 @@ dependencies = [
  "libloading 0.8.9",
  "tar",
  "ureq",
-]
-
-[[package]]
-name = "litx"
-version = "0.1.0"
-dependencies = [
- "clap",
- "liteparse",
- "litx-inspect",
- "serde_json",
-]
-
-[[package]]
-name = "litx-inspect"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "csv",
- "encoding_rs",
- "ffmpeg-next",
- "file-format",
- "image",
- "liteparse",
- "magika",
- "ort",
- "parquet",
- "parquet-format-safe",
- "percent-encoding",
- "quick-xml",
- "serde",
- "serde_json",
- "tesseract-rs",
- "thiserror 2.0.21",
- "tokio",
- "unicode-general-category",
- "zip 9.6.1",
 ]
 
 [[package]]

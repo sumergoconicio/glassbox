@@ -12,9 +12,26 @@ pub(crate) struct Source {
     read: usize,
 }
 impl Source {
+    /// Opens one validated regular file through the shared no-follow guard.
+    ///
+    /// Accepts a source path. Returns a bounded random-access reader after the
+    /// shared guard rejects every symbolic-link component and non-regular
+    /// input, opens the final component without following links or blocking
+    /// on FIFOs and device nodes (Linux custom flags), and re-checks the
+    /// opened descriptor itself against regular files. Path validation and
+    /// the open race with concurrent path replacement; the post-open
+    /// descriptor check is authoritative for what is actually read, and the
+    /// physical byte cap stays enforced. On non-Linux Unix the open carries
+    /// no custom flags, so the guard relies on path-level link rejection and
+    /// the descriptor check alone.
     pub fn open(path: &Path) -> xml::Result<Self> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let (absolute, _) = crate::hashing::validate_regular_file(path)?;
+        let file = crate::hashing::open_no_follow(&absolute)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err("input is not a regular file".into());
+        }
+        let len = metadata.len();
         if len > 256 << 20 {
             return Err("container physical byte cap exceeded".into());
         }

@@ -1,3 +1,6 @@
+// Module: glassbox-inspect integration tests.
+// File: audit_container_bounds.rs.
+// Responsibility: Exercise audit container and Parquet bounds without changing reader behavior.
 //! Integration tests for the audit remediation container bounds: ZIP EOCD/ZIP64
 //! preflight parity, plus the retained hostile Parquet schema/chunk fixtures.
 //! Parquet extraction is deferred by user decision (2026-11-18): every Parquet
@@ -5,7 +8,7 @@
 //! validation. Synthetic fixtures are preserved under the remediation
 //! evidence directory for CLI and batch survival probes.
 
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use parquet_format_safe::{
     ConvertedType, FieldRepetitionType, FileMetaData, ListType, LogicalType, MapType,
     SchemaElement, Type,

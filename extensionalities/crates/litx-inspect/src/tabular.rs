@@ -61,6 +61,11 @@ pub(crate) fn render(
     crate::markdown::append(report, &markdown, options, "native_structure");
 }
 
+/// Reads a bounded CSV/TSV preview and selects native preview rows.
+///
+/// Accepts a source path, report, and extraction controls. Returns unit after
+/// at most five retained data rows. Invalid CSV, byte/column caps, and invalid
+/// selections become reader diagnostics; a sixth row only marks more source data.
 pub(crate) fn csv(path: &Path, report: &mut InspectReport, options: &InspectOptions) {
     let result = (|| -> xml::Result<()> {
         const MAX_BYTES: u64 = 1 << 20;
@@ -110,7 +115,58 @@ pub(crate) fn csv(path: &Path, report: &mut InspectReport, options: &InspectOpti
                     .collect(),
             );
         }
-        render(&preview, report, options);
+        if let Some(selection) = &options.native_selection {
+            let plan = crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::DatasetRow,
+                preview.rows.len() as u64,
+            )?;
+            if preview.has_more {
+                report.native_available.completeness = crate::reports::Completeness::Partial;
+            }
+            let rows = preview.rows.clone();
+            let selected: Vec<Vec<Value>> = rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| plan.contains(*index as u64 + 1))
+                .map(|(index, row)| {
+                    let text = row
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\t");
+                    report.native_units.push(crate::selection::dataset_unit(
+                        index as u64 + 1,
+                        crate::reports::NativeUnit::DatasetRow,
+                        Some(format!("row {}", index + 1)),
+                        text,
+                        vec![crate::reports::ContentRow {
+                            row_index: index as u64 + 1,
+                            values: row
+                                .iter()
+                                .map(|value| {
+                                    value
+                                        .as_str()
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| value.to_string())
+                                })
+                                .collect(),
+                        }],
+                    ));
+                    row.clone()
+                })
+                .collect();
+            preview.rows = selected;
+            preview.row_limit = 5;
+        } else {
+            render(&preview, report, options);
+        }
         report.dataset = Some(preview);
         Ok(())
     })();

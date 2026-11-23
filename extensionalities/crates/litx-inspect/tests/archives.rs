@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: archives.rs.
+// Responsibility: Exercise archive preview and bounds behavior without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Write, path::PathBuf};
 
 fn archive(extension: &str, entries: &[(&str, &[u8])]) -> PathBuf {
@@ -568,4 +571,118 @@ fn iwork_text_preview_is_bounded_and_labeled_as_derived_text() {
     assert_eq!(r.text.chars, 4000);
     assert_eq!(r.derived_preview.unwrap().content_type, "text/plain");
     assert!(r.markdown.truncated);
+}
+
+/// Returns a checked-in fixture path without reading or mutating its contents.
+///
+/// Accepts a fixture file name. Returns its absolute path. Missing fixtures
+/// fail in the subsequent reader call with a structured report diagnostic.
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(name)
+}
+
+/// Builds v2 extraction controls with OCR disabled for deterministic native tests.
+///
+/// Accepts a native selection. Returns extraction options with the requested
+/// selection. No file, model, or network access occurs.
+fn v2_extract_options(
+    selection: glassbox_inspect::reports::NativeSelection,
+) -> glassbox_inspect::reports::ExtractOptions {
+    glassbox_inspect::reports::ExtractOptions {
+        selection,
+        ocr: glassbox_inspect::reports::OcrOptions {
+            enabled: false,
+            ..glassbox_inspect::reports::OcrOptions::default()
+        },
+        ..glassbox_inspect::reports::ExtractOptions::default()
+    }
+}
+
+/// Verifies generic ZIP and CBZ support agrees with actual extraction.
+///
+/// Accepts no parameters. Returns unit after v2 inspect/extract of a generic
+/// ZIP and a CBZ. Inspect over-reporting extraction support, or extract
+/// disagreeing with the reported boundary, panics.
+#[test]
+fn generic_zip_and_cbz_support_agrees_with_extraction() {
+    let zip = archive(
+        "zip",
+        &[
+            ("one.txt", b"PRIVATE_CONTENT"),
+            ("folder/two.md", b"ALSO_PRIVATE"),
+        ],
+    );
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(64, 80)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let cbz = archive("cbz", &[("cover.png", png.get_ref())]);
+
+    for path in [&zip, &cbz] {
+        let inspected =
+            glassbox_inspect::inspect(path, &glassbox_inspect::reports::InspectOptions::default());
+        // Identification completed, and the support fact must state the same
+        // boundary extraction actually enforces: no native content units.
+        assert_eq!(
+            inspected.metadata.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
+            "{:?}",
+            path
+        );
+        assert_eq!(
+            inspected.metadata.extraction_support,
+            glassbox_inspect::reports::SupportStatus::IdentificationOnly,
+            "{:?}",
+            path
+        );
+        let extracted = glassbox_inspect::extract(
+            path,
+            &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
+        );
+        assert_eq!(
+            extracted.metadata.status,
+            glassbox_inspect::reports::OperationStatus::Unsupported,
+            "{:?}",
+            path
+        );
+        assert_eq!(
+            extracted.selection.omitted,
+            glassbox_inspect::reports::OmissionStatus::Unsupported,
+            "{:?}",
+            path
+        );
+        assert!(extracted.content.units.is_empty(), "{:?}", path);
+    }
+}
+
+/// Verifies EPUB and Office packages keep supported extraction after the
+/// generic ZIP/CBZ support alignment.
+///
+/// Accepts no parameters. Returns unit after v2 inspect/extract of an EPUB
+/// and a DOCX. Downgraded support, missing content units, or a failed
+/// extraction panics.
+#[test]
+fn epub_and_office_packages_keep_supported_extraction() {
+    for (name, expected_units) in [("native.epub", 2), ("notes.docx", 3)] {
+        let path = fixture(name);
+        let inspected =
+            glassbox_inspect::inspect(&path, &glassbox_inspect::reports::InspectOptions::default());
+        assert_eq!(
+            inspected.metadata.extraction_support,
+            glassbox_inspect::reports::SupportStatus::Supported,
+            "{name}"
+        );
+        let extracted = glassbox_inspect::extract(
+            &path,
+            &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
+        );
+        assert_eq!(
+            extracted.metadata.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
+            "{name}: {extracted:#?}"
+        );
+        assert_eq!(extracted.content.units.len(), expected_units, "{name}");
+    }
 }

@@ -19,6 +19,12 @@ pub(crate) fn inspect(archive: &mut Archive, report: &mut InspectReport, options
     }
 }
 
+/// Parses EPUB package structure and extracts selected native spine items.
+///
+/// Accepts an open archive, destination report, and extraction controls. Returns
+/// unit after metadata and selected XHTML text. Invalid packages, missing parts,
+/// unsupported spine media, and unsatisfiable selections return reader errors;
+/// individual selected-item failures remain partial-output diagnostics.
 fn inner(
     archive: &mut Archive,
     report: &mut InspectReport,
@@ -89,37 +95,84 @@ fn inner(
         return Err("EPUB spine cap exceeded".into());
     }
     report.counts.spine_items = Some(references.len());
-    let partial = references.len() > options.text_unit_limit();
-    for reference in references.into_iter().take(options.text_unit_limit()) {
-        let result = (|| -> xml::Result<()> {
-            let item = items
-                .get(reference.attr("idref").ok_or("spine item has no idref")?)
-                .ok_or("spine references missing manifest item")?;
-            if item.attr("media-type") != Some("application/xhtml+xml") {
-                return Err(
-                    "unsupported EPUB spine media type; only XHTML text is extracted".into(),
-                );
+    if let Some(selection) = &options.native_selection {
+        let plan = crate::selection::begin(
+            report,
+            selection,
+            crate::reports::NativeUnit::SpineItem,
+            references.len() as u64,
+        )?;
+        for (index, reference) in references.into_iter().enumerate() {
+            let number = index as u64 + 1;
+            if !plan.contains(number) {
+                continue;
             }
-            let part = resolve(&path, item.attr("href").ok_or("missing spine href")?)?;
-            let content = xml::parse_xhtml(
-                &archive
-                    .read(&part)?
-                    .ok_or_else(|| format!("missing EPUB spine part {part}"))?,
-            )?;
-            if !content.is("http://www.w3.org/1999/xhtml", "html") {
-                return Err("invalid EPUB XHTML root".into());
+            let result = (|| -> xml::Result<()> {
+                let item = items
+                    .get(reference.attr("idref").ok_or("spine item has no idref")?)
+                    .ok_or("spine references missing manifest item")?;
+                if item.attr("media-type") != Some("application/xhtml+xml") {
+                    return Err(
+                        "unsupported EPUB spine media type; only XHTML text is extracted".into(),
+                    );
+                }
+                let part = resolve(&path, item.attr("href").ok_or("missing spine href")?)?;
+                let content = xml::parse_xhtml(
+                    &archive
+                        .read(&part)?
+                        .ok_or_else(|| format!("missing EPUB spine part {part}"))?,
+                )?;
+                if !content.is("http://www.w3.org/1999/xhtml", "html") {
+                    return Err("invalid EPUB XHTML root".into());
+                }
+                let mut text = String::new();
+                visible(&content, &mut text);
+                report.native_units.push(crate::selection::text_unit(
+                    number,
+                    crate::reports::NativeUnit::SpineItem,
+                    Some(part),
+                    text,
+                    crate::reports::ContentOrigin::Native,
+                ));
+                Ok(())
+            })();
+            if let Err(error) = result {
+                report.error("epub_text", format!("spine item {number}: {error}"));
             }
-            let mut text = String::new();
-            visible(&content, &mut text);
-            crate::markdown::xhtml(&content, report, options);
-            report.append_text(&text, options.max_chars);
-            Ok(())
-        })();
-        if let Err(error) = result {
-            report.error("epub_text", error);
         }
+    } else {
+        let partial = references.len() > options.text_unit_limit();
+        for reference in references.into_iter().take(options.text_unit_limit()) {
+            let result = (|| -> xml::Result<()> {
+                let item = items
+                    .get(reference.attr("idref").ok_or("spine item has no idref")?)
+                    .ok_or("spine references missing manifest item")?;
+                if item.attr("media-type") != Some("application/xhtml+xml") {
+                    return Err(
+                        "unsupported EPUB spine media type; only XHTML text is extracted".into(),
+                    );
+                }
+                let part = resolve(&path, item.attr("href").ok_or("missing spine href")?)?;
+                let content = xml::parse_xhtml(
+                    &archive
+                        .read(&part)?
+                        .ok_or_else(|| format!("missing EPUB spine part {part}"))?,
+                )?;
+                if !content.is("http://www.w3.org/1999/xhtml", "html") {
+                    return Err("invalid EPUB XHTML root".into());
+                }
+                let mut text = String::new();
+                visible(&content, &mut text);
+                crate::markdown::xhtml(&content, report, options);
+                report.append_text(&text, options.max_chars);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                report.error("epub_text", error);
+            }
+        }
+        report.text.truncated |= partial;
     }
-    report.text.truncated |= partial;
     if options.thumbnail.is_some() {
         let cover = cover_id.and_then(|id| items.get(id).copied()).or_else(|| {
             items.values().copied().find(|n| {

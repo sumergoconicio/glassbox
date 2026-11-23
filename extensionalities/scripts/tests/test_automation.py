@@ -1,10 +1,16 @@
-"""Isolated automation tests. Retain synthetic repositories under ignored target."""
+"""Module: Glassbox downstream automation tests.
+File: test_automation.py.
+Responsibility: Verify isolated sync, workflow, package-selection, parity, and metadata gates.
+
+Isolated automation tests. Retain synthetic repositories under ignored target."""
 
 import importlib.util
 import itertools
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -311,6 +317,86 @@ class GateTests(unittest.TestCase):
 
 
 class ChangesTests(unittest.TestCase):
+    def test_format_targets_renamed_packages(self):
+        """Verify formatting selects only the renamed downstream packages.
+
+        Accepts no parameters and mocks the subprocess boundary.
+        Returns unit after checking exact Cargo package arguments.
+        Raises AssertionError when legacy package names or an unscoped formatter remains.
+        """
+        with patch.object(ci.subprocess, "run") as run, patch.object(
+                sys, "argv", ["ci.py", "format"]):
+            ci.main()
+        arguments = run.call_args.args[0]
+        self.assertEqual(list(arguments[-5:-1]), [
+            "-p", "glassbox-cli", "-p", "glassbox-inspect"])
+        self.assertNotIn("litx-inspect", arguments)
+
+    def test_full_check_integrates_tracked_parity_metadata_and_extract(self):
+        """Verify the complete local check runs smoke, V-NAME, V-META, and V-SELECT.
+
+        Accepts no parameters and mocks native commands and verification drivers.
+        Returns unit after confirming one invocation of each tracked driver.
+        Raises AssertionError when parity, metadata, or extraction is skipped.
+        """
+        with patch.object(ci, "run"), patch.object(ci, "smoke"), patch.object(
+                ci, "parity") as parity, patch.object(
+                ci, "metadata") as metadata, patch.object(ci, "extract") as extract, patch.object(
+                sys, "argv", ["ci.py", "check"]):
+            ci.main()
+        parity.assert_called_once_with()
+        metadata.assert_called_once_with()
+        extract.assert_called_once_with()
+
+    def test_smoke_distinguishes_metadata_inspection_from_canonical_extraction(self):
+        """Verify smoke requires v2 inspect reports and content-bearing extract reports.
+
+        Accepts no parameters and mocks only the release-binary subprocess boundary.
+        Returns unit after checking single-file, batch, and offline-OCR invocations.
+        Raises AssertionError if smoke accepts a body field or skips the alias checks.
+        """
+        metadata_report = {
+            "schema_version": 2, "kind": "inspect",
+            "metadata": {"status": "complete", "diagnostics": []},
+        }
+        extract_report = {
+            "schema_version": 2, "kind": "extract",
+            "metadata": {"status": "complete", "diagnostics": []},
+            "content": {"units": [{
+                "text": (ci.ROOT / "extensionalities/fixtures/hello.txt").read_text()
+            }]},
+        }
+        calls = []
+
+        def output(arguments, **kwargs):
+            calls.append(arguments)
+            if "--batch" in arguments:
+                return json.dumps({"id": "smoke", "report": metadata_report}).encode()
+            if "--identify" in arguments:
+                self.assertEqual(arguments[1], "extract")
+                return json.dumps({
+                    "errors": [{"code": "ocr_model_missing"}],
+                    "text": {"truncated": True},
+                }).encode()
+            report = metadata_report if arguments[1] == "inspect" else extract_report
+            return json.dumps(report).encode()
+
+        def missing_model(arguments, **kwargs):
+            calls.append(arguments)
+            self.assertEqual(arguments[1], "extract")
+            report = {
+                "kind": "extract", "completeness": "partial",
+                "metadata": {"diagnostics": [{"code": "pdf_ocr"}]},
+                "content": {"units": [{"text": "Native PDF evidence"}]},
+            }
+            return subprocess.CompletedProcess(arguments, 2, json.dumps(report).encode(), b"")
+
+        with patch.object(ci.subprocess, "check_output", side_effect=output), patch.object(
+                ci.subprocess, "run", side_effect=missing_model):
+            ci.smoke()
+        self.assertEqual(sum("--batch" in call for call in calls), 2)
+        self.assertEqual(sum(call[1] == "extract" for call in calls), 3)
+
     def test_workflow_linter_is_pinned_scoped_and_cache_isolated(self):
         with patch.object(ci.subprocess, "run") as run:
             ci.workflows()
@@ -340,6 +426,30 @@ class ChangesTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 1, b"", b"missing")
         with patch.object(ci.subprocess, "run", return_value=result):
             self.assertTrue(ci.needs_checks(Path("."), "base", "head"))
+
+
+class CiNetworkTests(unittest.TestCase):
+    def test_driver_invocations_receive_ci_network_only_inside_ci_runners(self):
+        """Verify parity and metadata pass --ci-network exactly in CI environments.
+
+        Accepts no parameters and mocks the driver subprocess boundary.
+        Returns unit after checking the explicit CI-mode network permission
+        appears in the driver argument vector only when the standard CI
+        environment markers are set.
+        Raises AssertionError when a local run gains network permission or a
+        CI run lacks it.
+        """
+        for command in (ci.parity, ci.metadata):
+            for env, expected in (({"CI": "true"}, True),
+                                  ({"GITHUB_ACTIONS": "true"}, True),
+                                  ({"CI": "false", "GITHUB_ACTIONS": "false"}, False)):
+                with patch.object(ci.subprocess, "run") as run, patch.dict(
+                        os.environ, env):
+                    command()
+                argv = run.call_args.args[0]
+                self.assertEqual("--ci-network" in argv, expected,
+                                 f"{command.__name__} env={env} argv={argv}")
+                self.assertIn("extensionalities/scripts/verify-settling-in.py", argv)
 
 
 if __name__ == "__main__":

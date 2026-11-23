@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: odf.rs.
+// Responsibility: Exercise OpenDocument repeated-cell bounds without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::path::PathBuf;
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -63,4 +66,63 @@ fn odf_text_preserves_mixed_content_and_explicit_language() {
     assert!(!r.preflight[0].needs_ocr);
     assert!(r.preflight[1].needs_ocr);
     assert_eq!(r.packet.unwrap()["Language"], "French");
+}
+
+/// Verifies the ODT table unit keeps exact joined separators and clips early.
+///
+/// Accepts no parameters. Returns unit after two canonical extractions of the
+/// tables fixture. A table unit that loses separators, a clipped unit that is
+/// not the exact prefix of the whole text, or a missing partial disclosure
+/// panics.
+#[test]
+fn odt_table_unit_keeps_separators_and_clips_early_under_character_caps() {
+    use glassbox_inspect::reports::{
+        Completeness, ExtractOptions, NativeSelection, OcrOptions, OmissionStatus, OperationStatus,
+    };
+    let options = |max_chars: usize| ExtractOptions {
+        selection: NativeSelection::All,
+        max_chars,
+        ocr: OcrOptions {
+            enabled: false,
+            ..OcrOptions::default()
+        },
+        ..ExtractOptions::default()
+    };
+
+    // Full request: the atomic table unit carries the exact joined text with
+    // row, cell, and paragraph separators, including nested-table rows.
+    let full = glassbox_inspect::extract(&fixture("tables.odt"), &options(usize::MAX));
+    assert_eq!(full.metadata.status, OperationStatus::Complete);
+    assert_eq!(full.content.units.len(), 2);
+    let table_text = full.content.units[1].text.as_deref().unwrap();
+    assert!(table_text.starts_with("Name\tAnalysis\tStatus"));
+    assert!(table_text.contains('\n'), "{table_text}");
+    assert!(table_text.contains("Nested evidence."), "{table_text}");
+    assert_eq!(full.content.units[1].completeness, Completeness::Exact);
+
+    // Small character cap: the first paragraph consumes 23 characters, the
+    // table unit retains exactly the next 17 characters of the same text —
+    // the early-clipped buffer equals the prefix the full text would clip to,
+    // and the unit is disclosed as partial instead of silently shortened.
+    let clipped = glassbox_inspect::extract(&fixture("tables.odt"), &options(40));
+    assert_eq!(clipped.metadata.status, OperationStatus::Partial);
+    assert_eq!(clipped.selection.omitted, OmissionStatus::SafetyLimit);
+    assert_eq!(
+        clipped.content.units[0].text.as_deref(),
+        Some("A structured ODF table.")
+    );
+    let expected_prefix: String = table_text.chars().take(17).collect();
+    assert_eq!(
+        clipped.content.units[1].text.as_deref(),
+        Some(expected_prefix.as_str()),
+        "clipped unit must equal the exact prefix of the whole table text"
+    );
+    assert_eq!(clipped.content.units[1].completeness, Completeness::Partial);
+    assert!(
+        clipped
+            .metadata
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "content_limit")
+    );
 }

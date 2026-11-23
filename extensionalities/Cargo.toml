@@ -5,3 +5,7 @@ members = ["crates/litx", "crates/litx-inspect"]
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

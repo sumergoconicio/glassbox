@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: raster_bounds.rs.
+// Responsibility: Exercise raster input safety bounds without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Write, path::PathBuf};
 
 #[test]
