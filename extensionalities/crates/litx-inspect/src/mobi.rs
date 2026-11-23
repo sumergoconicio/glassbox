@@ -28,6 +28,11 @@ fn decode(bytes: &[u8], encoding: u32) -> xml::Result<String> {
     }
 }
 
+/// Parses PalmDB structure and extracts selected decoded text records.
+///
+/// Accepts a source path, destination report, and extraction controls. Returns
+/// unit after container metadata and content units. Invalid offsets, encrypted
+/// text, unsupported compression, expansion overflow, and selection errors fail.
 fn inner(path: &Path, report: &mut InspectReport, options: &InspectOptions) -> xml::Result<()> {
     let mut source = Source::open(path)?;
     let pdb = source.range(0, 78)?;
@@ -176,31 +181,66 @@ fn inner(path: &Path, report: &mut InspectReport, options: &InspectOptions) -> x
         if text_length > 32 << 20 {
             return Err("MOBI expanded text cap exceeded".into());
         }
-        let mut text = Vec::new();
         let extras = if header_size >= 228 {
             be32(&head, 240)?
         } else {
             0
         };
-        for i in 1..=text_records {
-            let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
-            let body = strip_trailing(&bytes, extras)?;
-            let decoded = if compression == 1 {
-                body.to_vec()
-            } else {
-                palmdoc(body)?
-            };
-            if decoded.len() > 65_536 || text.len() + decoded.len() > 32 << 20 {
-                return Err("MOBI record expansion cap exceeded".into());
+        if let Some(selection) = &options.native_selection {
+            let plan = crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::MobiTextRecord,
+                text_records as u64,
+            )?;
+            let mut expanded = 0usize;
+            for i in 1..=text_records {
+                if !plan.contains(i as u64) {
+                    continue;
+                }
+                let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
+                let body = strip_trailing(&bytes, extras)?;
+                let mut decoded = if compression == 1 {
+                    body.to_vec()
+                } else {
+                    palmdoc(body)?
+                };
+                expanded = expanded.saturating_add(decoded.len());
+                if decoded.len() > 65_536 || expanded > 32 << 20 {
+                    return Err("MOBI record expansion cap exceeded".into());
+                }
+                decoded.truncate(text_length);
+                let text = markup_text(&decode(&decoded, encoding)?)?;
+                report.native_units.push(crate::selection::text_unit(
+                    i as u64,
+                    crate::reports::NativeUnit::MobiTextRecord,
+                    Some(format!("PalmDB record {i}")),
+                    text,
+                    crate::reports::ContentOrigin::Native,
+                ));
             }
-            text.extend(decoded);
+        } else {
+            let mut text = Vec::new();
+            for i in 1..=text_records {
+                let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
+                let body = strip_trailing(&bytes, extras)?;
+                let decoded = if compression == 1 {
+                    body.to_vec()
+                } else {
+                    palmdoc(body)?
+                };
+                if decoded.len() > 65_536 || text.len() + decoded.len() > 32 << 20 {
+                    return Err("MOBI record expansion cap exceeded".into());
+                }
+                text.extend(decoded);
+            }
+            if text.len() < text_length {
+                return Err("truncated MOBI text".into());
+            }
+            text.truncate(text_length);
+            let text = markup_text(&decode(&text, encoding)?)?;
+            report.append_text(&text, options.max_chars);
         }
-        if text.len() < text_length {
-            return Err("truncated MOBI text".into());
-        }
-        text.truncate(text_length);
-        let text = markup_text(&decode(&text, encoding)?)?;
-        report.append_text(&text, options.max_chars);
         claim(
             report,
             "text_status",

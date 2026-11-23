@@ -1,48 +1,247 @@
-//! CLI integration regressions for native inspection and extraction reports.
-use std::process::Command;
+// Module: glassbox-cli metadata and extraction integration tests.
+// File: inspect_cli.rs.
+// Responsibility: Prove v2 inspect transport, legacy flag migration, exit codes, and transitional extraction behavior.
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
-#[test]
-fn inspect_defaults_to_500_words_while_extract_preserves_all_text() {
-    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// Runs the compiled Glassbox binary from the CLI crate directory.
+///
+/// Accepts argument strings. Returns captured process output. Spawn failures
+/// panic; test assertions own all exit-code and output validation.
+fn run(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap()
+}
+
+/// Parses a JSON process response regardless of its documented inspect exit code.
+///
+/// Accepts captured output. Returns a JSON value. Empty/non-JSON stdout panics
+/// with stderr and the process status; this helper does not assert success.
+fn json(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: status={:?}, stderr={}, stdout={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+/// Creates an isolated ignored directory for generated CLI inputs and outputs.
+///
+/// Accepts a test label. Returns a unique target-directory path. Directory
+/// creation failures panic; no checked-in fixture or production data is changed.
+fn workdir(label: &str) -> PathBuf {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/tests")
         .join(format!(
-            "word-default-{}",
+            "{label}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
     std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("words.txt");
-    std::fs::write(&path, "word ".repeat(600)).unwrap();
-    for (command, words) in [("inspect", 500), ("extract", 600)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-            .arg(command)
-            .arg(&path)
-            .arg("--no-ocr")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["errors"], serde_json::json!([]));
-        assert_eq!(report["text"]["tokens"], words);
-        assert_eq!(report["text"]["truncated"], command == "inspect");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    directory
+}
+
+/// Recursively rejects body fields from a serialized metadata report.
+///
+/// Accepts a JSON value. Returns unit if no legacy text/Markdown/row/cell/OCR
+/// result field exists. A forbidden key panics with its name.
+fn assert_metadata_only(value: &Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                assert!(
+                    !["text", "content", "markdown", "rows", "cells", "ocr_text"]
+                        .contains(&key.as_str()),
+                    "unexpected body key {key}"
+                );
+                assert_metadata_only(child);
+            }
+        }
+        Value::Array(values) => values.iter().for_each(assert_metadata_only),
+        _ => {}
     }
 }
 
+/// Checks the common v2 CLI envelope and complete plain-text metadata result.
+///
+/// Accepts a report. Returns unit after schema/kind/format/digest assertions.
+/// Missing v2 fields, body fields, or a failed operation panic.
+fn assert_text_metadata(report: &Value) {
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["kind"], "inspect");
+    assert_eq!(report["metadata"]["format"]["bucket"], "Text");
+    assert_eq!(report["metadata"]["status"], "complete");
+    assert_eq!(
+        report["metadata"]["digest"]["digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_metadata_only(report);
+}
+
+/// Verifies JSON, pretty JSON, text, and Markdown all carry only v2 metadata.
+///
+/// Accepts no parameters. Returns unit after running every output format.
+/// Legacy body keys, incorrect envelopes, or unexpected process failures panic.
+#[test]
+fn inspect_all_formats_emit_metadata_only_reports() {
+    for args in [
+        vec!["inspect", "../../fixtures/hello.txt"],
+        vec!["inspect", "../../fixtures/hello.txt", "--pretty"],
+        vec!["inspect", "../../fixtures/hello.txt", "--format", "text"],
+        vec![
+            "inspect",
+            "../../fixtures/hello.txt",
+            "--format",
+            "markdown",
+        ],
+    ] {
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("small self-authored inspection fixture"));
+        if args.contains(&"text") || args.contains(&"markdown") {
+            assert!(stdout.contains("Glassbox metadata inspection"));
+            assert!(stdout.contains("SHA-256"));
+            assert!(!stdout.contains("\"text\""));
+        } else {
+            assert_text_metadata(&serde_json::from_str(&stdout).unwrap());
+        }
+    }
+}
+
+/// Verifies every legacy content flag exits 64 with explicit migration advice.
+///
+/// Accepts no parameters. Returns unit after testing all rejected inspect flags.
+/// Any accepted flag, missing advice, or file processing before rejection panics.
+#[test]
+fn inspect_rejects_legacy_content_flags_with_exit_64() {
+    for flag in [
+        "--identify",
+        "--max-pages",
+        "--max-tokens",
+        "--max-chars",
+        "--probe-ocr",
+        "--no-ocr",
+        "--packet",
+    ] {
+        let output = run(&["inspect", "../../fixtures/hello.txt", flag]);
+        assert_eq!(output.status.code(), Some(64), "{flag}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("glassbox extract PATH"), "{flag}: {stderr}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+/// Verifies explicit extract retains full text and native page-limit behavior.
+///
+/// Accepts no parameters. Returns unit after checking 600 words and six PDF pages.
+/// Missing content, unintended truncation, or incomplete page geometry panics.
+#[test]
+fn extract_preserves_full_text_and_page_limits() {
+    let directory = workdir("extract-full-text");
+    let path = directory.join("words.txt");
+    std::fs::write(&path, "word ".repeat(600)).unwrap();
+    let output = run(&["extract", path.to_str().unwrap(), "--no-ocr"]);
+    assert!(output.status.success());
+    let report = json(&output);
+    assert_eq!(report["content"]["units"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["content"]["units"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        600
+    );
+    assert_eq!(report["completeness"], "exact");
+
+    for (args, expected_pages, complete) in [
+        (
+            vec![
+                "extract",
+                "../../fixtures/multipage.pdf",
+                "--no-ocr",
+                "--max-pages",
+                "5",
+            ],
+            5,
+            false,
+        ),
+        (
+            vec!["extract", "../../fixtures/multipage.pdf", "--no-ocr"],
+            6,
+            true,
+        ),
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(0));
+        let report = json(&output);
+        assert_eq!(report["metadata"]["status"], "complete");
+        assert_eq!(
+            report["selection"]["omitted"],
+            if complete { "none" } else { "selection" }
+        );
+        assert_eq!(report["metadata"]["counts"][0]["value"], 6);
+        assert_eq!(
+            report["metadata"]["native_page_signals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(
+            report["completeness"],
+            if complete { "exact" } else { "partial" }
+        );
+        assert_eq!(
+            report["content"]["units"].as_array().unwrap().len(),
+            expected_pages
+        );
+        assert_eq!(
+            report["content"]["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|unit| unit["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Final page confirms full-document extraction.")),
+            complete
+        );
+    }
+}
+
+/// Verifies batch extract still persists Markdown and legacy JSON per document.
+///
+/// Accepts no parameters. Returns unit after three mixed-document responses.
+/// Missing artifacts, overwritten files, content mismatch, or process failure panics.
 #[test]
 fn batch_extract_persists_markdown_and_reports_for_mixed_documents() {
     use std::io::Write;
     use std::process::Stdio;
-    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/tests")
-        .join(format!(
-            "batch-output-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    let directory = workdir("batch-extract-output");
     let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["extract", "--batch", "--no-ocr", "--output-dir"])
         .arg(&directory)
@@ -68,80 +267,51 @@ fn batch_extract_persists_markdown_and_reports_for_mixed_documents() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let reports: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    let reports: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(reports.len(), 3);
     for response in &reports {
         let report = &response["report"];
-        assert_eq!(report["errors"], serde_json::json!([]));
-        assert_eq!(report["artifacts"].as_array().unwrap().len(), 2);
-        for artifact in report["artifacts"].as_array().unwrap() {
+        assert_eq!(report["metadata"]["diagnostics"], serde_json::json!([]));
+        assert_eq!(report["metadata"]["artifacts"].as_array().unwrap().len(), 2);
+        for artifact in report["metadata"]["artifacts"].as_array().unwrap() {
             let bytes = std::fs::read(artifact["path"].as_str().unwrap()).unwrap();
-            if artifact["kind"] == "markdown" {
-                assert_eq!(
-                    String::from_utf8(bytes).unwrap(),
-                    report["markdown"]["content"]
-                );
+            if artifact["kind"] == "markdown_content" {
+                let markdown = String::from_utf8(bytes).unwrap();
+                assert!(!markdown.is_empty());
+                if report["content"]["units"][0]["text"].is_string() {
+                    let expected = report["content"]["units"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap();
+                    assert!(markdown.contains(expected), "{markdown}");
+                }
             } else {
-                let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(saved["source_path"], report["source_path"]);
+                let saved: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    saved["metadata"]["identity"]["path"],
+                    report["metadata"]["identity"]["path"]
+                );
             }
         }
     }
     assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 6);
 }
 
-#[test]
-fn inspect_defaults_to_five_pages_but_extract_uses_the_whole_document() {
-    for (command, expected_pages) in [("inspect", 5), ("extract", 6)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-            .args([command, "../../fixtures/multipage.pdf", "--no-ocr"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(r["errors"], serde_json::json!([]));
-        assert_eq!(r["counts"]["pages"], 6);
-        assert_eq!(
-            r["pdf"]["geometry"].as_array().unwrap().len(),
-            expected_pages
-        );
-        assert_eq!(r["pdf"]["text_complete"], command == "extract");
-        assert_eq!(
-            r["text"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Final page confirms full-document extraction."),
-            command == "extract"
-        );
-    }
-}
-
+/// Verifies explicit page limits never imply a token budget during extraction.
+///
+/// Accepts no parameters. Returns unit after bounded and unbounded extract runs.
+/// Any result below the original 600 word tokens panics.
 #[test]
 fn extract_with_explicit_max_pages_keeps_every_word_token() {
-    // LITX-AUD-008: an explicit page limit must not imply the 500-word
-    // identification preview budget during full extraction.
-    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/tests")
-        .join(format!(
-            "extract-pages-tokens-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = workdir("extract-pages-tokens");
     let path = directory.join("words.txt");
     std::fs::write(&path, "word ".repeat(600)).unwrap();
-    let mut tokens = Vec::new();
     for args in [
         vec!["extract", "--no-ocr"],
         vec!["extract", "--no-ocr", "--max-pages", "6"],
@@ -152,59 +322,57 @@ fn extract_with_explicit_max_pages_keeps_every_word_token() {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(r["errors"], serde_json::json!([]));
-        tokens.push(r["text"]["tokens"].as_u64().unwrap());
-    }
-    assert_eq!(tokens[0], 600);
-    assert_eq!(tokens[1], 600, "{:?}", tokens);
-}
-
-#[test]
-fn identify_office_text_obeys_an_explicit_word_token_budget() {
-    for name in ["notes.docx", "deck.pptx", "grid.xlsx"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-            .args([
-                "inspect",
-                &format!("../../fixtures/{name}"),
-                "--identify",
-                "--max-tokens",
-                "3",
-                "--packet",
-            ])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(r["errors"], serde_json::json!([]));
-        assert_eq!(r["text"]["tokens"], 3);
-        assert_eq!(r["text"]["token_basis"], "whitespace_words");
+        assert!(output.status.success());
+        let report = json(&output);
         assert_eq!(
-            r["text"]["content"]
+            report["content"]["units"][0]["text"]
                 .as_str()
                 .unwrap()
                 .split_whitespace()
                 .count(),
-            3
+            600
         );
-        assert_eq!(r["text"]["truncated"], true);
-        assert_eq!(r["packet"]["excerpt"], r["text"]["content"]);
-        if name == "notes.docx" {
-            assert_eq!(r["text"]["content"], "This is a");
+    }
+}
+
+/// Verifies Office content and packet assertions remain on explicit extract.
+///
+/// Accepts no parameters. Returns unit after bounded DOCX/PPTX/XLSX extraction.
+/// Missing token bounds, packet excerpts, or original body wording panics.
+#[test]
+fn identify_office_text_obeys_an_explicit_word_token_budget() {
+    for name in ["notes.docx", "deck.pptx", "grid.xlsx"] {
+        let output = run(&[
+            "extract",
+            &format!("../../fixtures/{name}"),
+            "--identify",
+            "--max-tokens",
+            "3",
+            "--packet",
+        ]);
+        assert_eq!(output.status.code(), Some(2));
+        let report = json(&output);
+        assert_eq!(report["selection"]["omitted"], "safety_limit");
+        let content = report["content"]["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|unit| unit["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match name {
+            "notes.docx" => assert_eq!(content.trim_end(), "This is a"),
+            "deck.pptx" => assert_eq!(content.trim_end(), "This is the"),
+            "grid.xlsx" => assert_eq!(content.trim_end(), "count\t7"),
+            _ => unreachable!(),
         }
     }
 }
 
+/// Verifies metadata batch isolates oversized lines and processes the next request.
+///
+/// Accepts no parameters. Returns unit after one invalid and one valid JSONL item.
+/// The aggregate exits 64; a lost response or legacy body field fails the test.
 #[test]
 fn batch_rejects_oversized_lines_without_losing_the_next_request() {
     use std::io::Write;
@@ -226,8 +394,8 @@ fn batch_rejects_oversized_lines_without_losing_the_next_request() {
     .unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    assert_eq!(output.status.code(), Some(64));
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -240,8 +408,13 @@ fn batch_rejects_oversized_lines_without_losing_the_next_request() {
             .contains("65536")
     );
     assert_eq!(responses[1]["id"], 9);
+    assert_text_metadata(&responses[1]["report"]);
 }
 
+/// Verifies a persistent metadata worker flushes a complete response before EOF.
+///
+/// Accepts no parameters. Returns unit after reading one JSONL response.
+/// Timeout, malformed JSON, or a legacy body report panics; a stuck child is killed.
 #[test]
 fn batch_flushes_each_response_before_stdin_closes() {
     use std::io::{BufRead, Write};
@@ -277,11 +450,15 @@ fn batch_flushes_each_response_before_stdin_closes() {
     }
     child.wait().unwrap();
     reader.join().unwrap();
-    let response: serde_json::Value =
+    let response: Value =
         serde_json::from_str(&response.expect("worker must respond before EOF")).unwrap();
-    assert_eq!(response["report"]["format"]["bucket"], "Text");
+    assert_text_metadata(&response["report"]);
 }
 
+/// Verifies request correlation, operational failure aggregation, and recovery.
+///
+/// Accepts no parameters. Returns unit after valid, malformed, missing, valid items.
+/// Invalid-plus-failed precedence exits 64 with all four ordered v2 responses.
 #[test]
 fn batch_correlates_requests_and_continues_after_bad_input() {
     use std::io::Write;
@@ -316,170 +493,189 @@ fn batch_correlates_requests_and_continues_after_bad_input() {
     .unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    assert_eq!(output.status.code(), Some(64));
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 4);
-    assert_eq!(responses[0]["id"], "first");
-    assert_eq!(responses[0]["report"]["format"]["bucket"], "Text");
+    assert_text_metadata(&responses[0]["report"]);
     assert_eq!(responses[1]["error"]["stage"], "batch");
-    assert_eq!(responses[2]["id"], 2);
-    assert_eq!(responses[2]["report"]["errors"][0]["stage"], "input");
-    assert_eq!(responses[3]["id"], 3);
-    assert_eq!(responses[3]["report"]["errors"], serde_json::json!([]));
-}
-
-#[test]
-fn inspect_emits_a_report_and_optional_packet() {
-    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-        .args([
-            "inspect",
-            "../../fixtures/hello.txt",
-            "--packet",
-            "--pretty",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        report["counts"]["bytes"],
-        include_bytes!("../../../fixtures/hello.txt").len()
+        responses[2]["report"]["metadata"]["diagnostics"][0]["stage"],
+        "input"
     );
-    assert_eq!(report["packet"]["Format"], "Text");
-    assert!(report["claims"].is_array());
-    assert!(report["errors"].is_array());
-    assert!(report["packet"].get("Domains").is_none());
+    assert_eq!(responses[2]["report"]["metadata"]["status"], "failed");
+    assert_text_metadata(&responses[3]["report"]);
 }
 
-/// Verify missing OCR data still fails PDF honestly while DjVu never requests OCR.
+/// Verifies single-file output-dir writes a v2 JSON report and content-free summary.
 ///
-/// Accepts no inputs and returns unit. Panics if the PDF loses its OCR failure
-/// provenance or DjVu initializes OCR, emits analysis, or misses the static
-/// identification-only diagnostic.
+/// Accepts no parameters. Returns unit after reading both generated artifacts.
+/// Incorrect artifact kinds, body leakage, or non-v2 saved JSON panics.
 #[test]
-fn missing_ocr_model_marks_pdf_incomplete_and_djvu_stays_identification_only() {
-    // LITX-AUD-010: a failed PDF OCR attempt must surface as incomplete text,
-    // never as a clean complete report. DjVu has an independent static support
-    // boundary. The per-process TESSDATA_PREFIX isolates parallel OCR tests.
-    let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/tests")
-        .join(format!(
-            "missing-tessdata-prov-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    assert!(!missing.exists());
-    // native.pdf stays within the five-page scan limit, so incomplete flags
-    // can only come from the failed OCR attempt itself.
+fn inspect_output_dir_persists_metadata_summary_and_json() {
+    let directory = workdir("metadata-output");
     let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-        .args(["inspect", "--identify", "../../fixtures/native.pdf"])
-        .env("TESSDATA_PREFIX", &missing)
+        .args(["inspect", "../../fixtures/hello.txt", "--output-dir"])
+        .arg(&directory)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        r["errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["stage"] == "pdf_ocr"),
-        "{:?}",
-        r["errors"]
-    );
-    assert_eq!(r["pdf"]["text_complete"], false);
-    assert_eq!(r["text"]["truncated"], true);
-    assert!(
-        r["pdf"]["identification_pages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["ocr_status"] == "failed")
-    );
-    // DjVu: the same requested identification mode must not consult tessdata.
-    let info: &[u8] = &[2, 88, 3, 32, 26, 0, 44, 1, 22, 1];
-    let mut page = b"DJVU".to_vec();
-    page.extend_from_slice(b"INFO");
-    page.extend_from_slice(&(info.len() as u32).to_be_bytes());
-    page.extend_from_slice(info);
-    let mut form = b"FORM".to_vec();
-    form.extend_from_slice(&(page.len() as u32).to_be_bytes());
-    form.extend_from_slice(&page);
-    let mut bytes = b"AT&T".to_vec();
-    bytes.extend_from_slice(&form);
-    let djvu = missing.with_file_name(format!(
-        "blank-{}.djvu",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::write(&djvu, bytes).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
-        .args(["inspect", "--identify"])
-        .arg(&djvu)
-        .env("TESSDATA_PREFIX", &missing)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let errors = r["errors"].as_array().unwrap();
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    assert_eq!(errors[0]["stage"], "djvu");
+    assert!(output.status.success());
+    let report = json(&output);
+    assert_text_metadata(&report);
+    assert_eq!(report["metadata"]["artifacts"].as_array().unwrap().len(), 2);
+    for artifact in report["metadata"]["artifacts"].as_array().unwrap() {
+        let bytes = std::fs::read(artifact["path"].as_str().unwrap()).unwrap();
+        if artifact["kind"] == "metadata_json" {
+            let saved: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_text_metadata(&saved);
+        } else {
+            let summary = String::from_utf8(bytes).unwrap();
+            assert!(summary.contains("Glassbox metadata inspection"));
+            assert!(!summary.contains("small self-authored inspection fixture"));
+        }
+    }
+}
+
+/// Verifies inspect's public 0/1 exits and identification-only completion.
+///
+/// Accepts no parameters. Returns unit after text, DjVu, and corrupt PDF runs.
+/// Any unexpected exit code, missing digest, or content-producing report panics.
+#[test]
+fn inspect_exit_codes_distinguish_complete_identification_and_failed() {
+    let complete = run(&["inspect", "../../fixtures/hello.txt"]);
+    assert_eq!(complete.status.code(), Some(0));
+    assert_text_metadata(&json(&complete));
+
+    let identification = run(&["inspect", "../../fixtures/single.djvu"]);
+    assert_eq!(identification.status.code(), Some(0));
+    let report = json(&identification);
+    assert_eq!(report["metadata"]["status"], "complete");
     assert_eq!(
-        errors[0]["message"],
-        "DjVu extraction is unsupported; identification only"
+        report["metadata"]["extraction_support"],
+        "identification_only"
     );
-    assert!(r["djvu"].is_null());
-    assert_eq!(r["pages"], serde_json::json!([]));
-    assert_eq!(r["preflight"], serde_json::json!([]));
-    assert_eq!(r["text"]["content"], "");
-    assert_eq!(r["text"]["truncated"], true);
-    assert_eq!(r["markdown"]["truncated"], true);
-    assert!(r["thumbnail"].is_null());
+    assert_metadata_only(&report);
+
+    let failed = run(&["inspect", "../../fixtures/broken.pdf"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let report = json(&failed);
+    assert_eq!(report["metadata"]["status"], "failed");
+    assert_eq!(
+        report["metadata"]["digest"]["digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_metadata_only(&report);
+}
+
+/// Verifies a closed stdout pipe becomes an operational error, not a panic.
+///
+/// Accepts no parameters. Returns unit after closing the child's stdout reader.
+/// Exit 101, a signal exit, or a missing I/O diagnostic fails this regression.
+#[test]
+fn closed_stdout_returns_operational_exit_without_panicking() {
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args(["inspect", "../../fixtures/hello.txt"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Broken pipe"));
+}
+
+/// Verifies CLI thumbnail generation is opt-in, bounded, and recorded in v2.
+///
+/// Accepts no parameters. Returns unit after ordinary and explicit PDF runs.
+/// Default rendering, oversized output, missing artifact, or body fields panic.
+#[test]
+fn inspect_thumbnail_is_opt_in_and_bounded() {
+    let ordinary = run(&["inspect", "../../fixtures/native.pdf"]);
+    assert!(ordinary.status.success());
+    assert_eq!(
+        json(&ordinary)["metadata"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let directory = workdir("metadata-thumbnail");
+    let thumbnail = directory.join("page.png");
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args(["inspect", "../../fixtures/native.pdf", "--thumbnail"])
+        .arg(&thumbnail)
+        .args(["--thumbnail-max-edge", "64"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert_metadata_only(&report);
+    let artifact = &report["metadata"]["artifacts"][0];
+    assert!(artifact["width"].as_u64().unwrap() <= 64);
+    assert!(artifact["height"].as_u64().unwrap() <= 64);
+    assert!(std::fs::metadata(thumbnail).unwrap().len() > 0);
+}
+
+/// Verifies missing OCR data remains a qualified explicit-extraction failure.
+///
+/// Accepts no parameters. Returns unit after extracting the native PDF with an
+/// isolated missing tessdata path. Lost OCR provenance or incomplete flags panic.
+#[test]
+fn missing_ocr_model_marks_pdf_extraction_incomplete() {
+    let missing = workdir("missing-tessdata-prov").join("absent");
+    assert!(!missing.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args(["extract", "--identify", "../../fixtures/native.pdf"])
+        .env("TESSDATA_PREFIX", &missing)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report = json(&output);
+    assert!(
+        report["metadata"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error["code"] == "pdf_ocr")
+    );
+    assert_eq!(report["metadata"]["status"], "partial");
+    assert_eq!(report["completeness"], "partial");
+    assert!(
+        report["content"]["units"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Native PDF evidence")
+    );
     assert!(!missing.exists());
 }
 
+/// Verifies raster OCR probing remains available only through explicit extract.
+///
+/// Accepts no parameters. Returns unit after a missing-model extraction probe.
+/// Lost native classification, missing error provenance, or model creation panics.
 #[test]
 fn missing_local_ocr_model_keeps_native_metrics_without_downloads() {
-    let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/tests")
-        .join(format!(
-            "missing-tessdata-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    let missing = workdir("missing-tessdata").join("absent");
     assert!(!missing.exists());
     let output = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args([
-            "inspect",
+            "extract",
             "../../fixtures/document-image.png",
             "--probe-ocr",
         ])
@@ -487,16 +683,23 @@ fn missing_local_ocr_model_keeps_native_metrics_without_downloads() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
-    assert!(output.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["image"]["classification"], "document_scan_like");
-    assert!(report["image"]["probe"].is_null());
-    assert!(report["errors"].as_array().unwrap().iter().any(|e| {
-        e["stage"] == "probe_ocr"
-            && e["message"]
-                .as_str()
-                .unwrap()
-                .contains("local eng.traineddata")
-    }));
+    assert_eq!(output.status.code(), Some(2));
+    let report = json(&output);
+    assert_eq!(report["metadata"]["format"]["bucket"], "Images");
+    assert_eq!(report["selection"]["unit"], "image");
+    assert!(report["metadata"]["diagnostics"][0]["unit_index"].is_null());
+    assert!(
+        report["metadata"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| {
+                error["code"] == "probe_ocr"
+                    && error["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("local eng.traineddata")
+            })
+    );
     assert!(!missing.exists());
 }

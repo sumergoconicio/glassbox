@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: adversarial.rs.
+// Responsibility: Exercise adversarial archive bounds without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::path::PathBuf;
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

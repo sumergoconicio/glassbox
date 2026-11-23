@@ -1,7 +1,10 @@
+// Module: glassbox-inspect integration tests.
+// File: xml_profile.rs.
+// Responsibility: Exercise XML structural profile behavior without changing reader behavior.
 //! Wave-1 (XML-CORE) behavioral tests for the standalone XML structural profile.
 //! Assertions run against dynamic `serde_json::Value` so a missing `xml`
 //! report field fails at runtime instead of becoming a compile error.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 
 /// Synthetic fixture bytes for the first red/green slice: nested and repeated
 /// elements, one namespaced child, an attribute, an optional child and mixed
@@ -478,7 +481,7 @@ fn xml_extension_does_not_override_byte_verified_formats() {
 /// Asserts the fail-closed contract for one invalid input: an xml-stage
 /// error with a content-free message, no published profile, and honest
 /// truncation flags.
-fn assert_fails_closed(r: &litx_inspect::InspectReport, label: &str, sentinel: &str) {
+fn assert_fails_closed(r: &glassbox_inspect::InspectReport, label: &str, sentinel: &str) {
     let error = r
         .errors
         .iter()
@@ -581,10 +584,10 @@ fn xml_session_recovers_after_invalid_input_without_state_leakage() {
     let directory = unique_dir("recovery");
     let invalid = write_fixture(&directory, "bad.xml", b"<a>SENTINEL-LEAK-R1&oopsy;</a>");
     let valid = write_fixture(&directory, "good.xml", CATALOG);
-    let mut inspector = litx_inspect::Inspector::default();
-    let first = inspector.inspect(&invalid, &InspectOptions::default());
+    let mut inspector = glassbox_inspect::Inspector::default();
+    let first = inspector.extract_transitional(&invalid, &InspectOptions::default());
     assert_fails_closed(&first, "first-invalid", "SENTINEL");
-    let second = inspector.inspect(&valid, &InspectOptions::default());
+    let second = inspector.extract_transitional(&valid, &InspectOptions::default());
     assert!(second.errors.is_empty(), "{:?}", second.errors);
     let v = serde_json::to_value(&second).unwrap();
     assert_eq!(v["xml"]["total_elements"], 7);
@@ -593,7 +596,7 @@ fn xml_session_recovers_after_invalid_input_without_state_leakage() {
 
 /// Asserts one over-limit input fails closed with the expected static cap
 /// message, no profile, and no retained values.
-fn assert_cap_error(r: &litx_inspect::InspectReport, label: &str, message_part: &str) {
+fn assert_cap_error(r: &glassbox_inspect::InspectReport, label: &str, message_part: &str) {
     let error = r
         .errors
         .iter()

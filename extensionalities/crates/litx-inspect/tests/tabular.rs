@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: tabular.rs.
+// Responsibility: Exercise tabular preview behavior without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 
 #[test]
 fn csv_preview_reads_five_data_rows_with_quoted_fields_and_newlines() {

@@ -1,14 +1,16 @@
-//! End-to-end CLI regressions for the DjVu identification-only boundary.
+// Module: glassbox-cli DjVu boundary tests.
+// File: djvu_cli.rs.
+// Responsibility: Prove v2 identification-only inspection and unchanged explicit legacy extraction boundaries.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const DIAGNOSTIC: &str = "DjVu extraction is unsupported; identification only";
 
-/// Return an IFF chunk with a big-endian length and required padding byte.
+/// Returns an IFF chunk with a big-endian length and required padding byte.
 ///
-/// Accepts a four-byte identifier and payload. Returns encoded bytes. The
-/// length conversion is safe for the small deterministic fixtures used here.
+/// Accepts a four-byte identifier and payload. Returns encoded bytes. The small
+/// deterministic fixture cannot overflow the length conversion.
 fn chunk(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut bytes = id.to_vec();
     bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -19,10 +21,10 @@ fn chunk(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Build a standalone DjVu fixture containing formerly supported native text.
+/// Builds a standalone DjVu fixture containing forbidden native text.
 ///
-/// Accepts no inputs. Returns complete bytes with valid DjVu magic and TXTa.
-/// The embedded marker is deliberately invalid for the identification boundary.
+/// Accepts no parameters. Returns valid DjVu bytes with a TXTa marker. No file
+/// I/O occurs; the hidden marker must never appear in either CLI report family.
 fn native_text_document() -> Vec<u8> {
     let text = b"HIDDEN_CLI_NATIVE_TEXT";
     let mut text_payload = (text.len() as u32).to_be_bytes()[1..].to_vec();
@@ -37,18 +39,18 @@ fn native_text_document() -> Vec<u8> {
     bytes
 }
 
-/// Return the stable ignored fixture directory for controller CLI checks.
+/// Returns the stable ignored fixture directory for DjVu CLI checks.
 ///
-/// Accepts no inputs. Returns the absolute path. No filesystem mutation occurs
-/// until the caller explicitly creates the directory or a fixture.
+/// Accepts no parameters. Returns the target path. No mutation occurs until the
+/// caller creates the directory or its deterministic test fixture.
 fn fixture_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/verification/djvu-identification-only/fixtures/cli")
 }
 
-/// Write the native-text CLI fixture under the authorized target directory.
+/// Writes the native-text DjVu fixture under the authorized target directory.
 ///
-/// Accepts no inputs and returns the fixture path. Panics on filesystem errors;
+/// Accepts no parameters. Returns the fixture path. Filesystem errors panic;
 /// only the deterministic test-owned fixture is replaced on repeated runs.
 fn native_text_fixture() -> PathBuf {
     let directory = fixture_directory();
@@ -58,10 +60,10 @@ fn native_text_fixture() -> PathBuf {
     path
 }
 
-/// Run the real `litx` binary with caller-supplied arguments and environment.
+/// Runs Glassbox with an optional isolated tessdata override.
 ///
-/// Accepts argument strings and an optional TESSDATA_PREFIX override. Returns
-/// the captured process output. Panics only if the process cannot be spawned.
+/// Accepts arguments and an optional path. Returns captured process output.
+/// Spawn failures panic; assertions explicitly validate each expected exit code.
 fn run_litx(args: &[&str], tessdata: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command
@@ -75,107 +77,126 @@ fn run_litx(args: &[&str], tessdata: Option<&Path>) -> Output {
     command.output().unwrap()
 }
 
-/// Parse a successful JSON CLI response without discarding process diagnostics.
+/// Parses a report while preserving process diagnostics on malformed output.
 ///
-/// Accepts captured process output. Returns the parsed report. Panics with
-/// stderr on a failed status and with stdout on malformed JSON.
-fn successful_json(output: &Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+/// Accepts captured output. Returns a JSON value. This helper does not require
+/// exit 0 because v2 identification-only inspection deliberately exits 2.
+fn report_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)))
 }
 
-/// Assert the serialized report honors every identification-only invariant.
+/// Asserts canonical extraction retains its static DjVu boundary.
 ///
-/// Accepts a JSON report and whether the generic raster-only probe error is
-/// expected. Returns unit. Panics on extraction output, DjVu analysis, OCR or
-/// thumbnail stages, hidden native text, or a changed static diagnostic.
-fn assert_cli_boundary(report: &Value, allow_probe_error: bool) {
-    assert_eq!(report["format"]["bucket"], "Ebooks");
-    assert_eq!(report["format"]["detected_mime"], "image/vnd.djvu");
-    let errors = report["errors"].as_array().unwrap();
-    let djvu_errors: Vec<_> = errors
-        .iter()
-        .filter(|error| error["stage"] == "djvu")
-        .collect();
-    assert_eq!(djvu_errors.len(), 1, "{errors:?}");
-    assert_eq!(djvu_errors[0]["message"], DIAGNOSTIC);
-    assert!(
-        errors.iter().all(|error| {
-            error["stage"] == "djvu" || (allow_probe_error && error["stage"] == "probe_ocr")
-        }),
-        "{errors:?}"
+/// Accepts a v2 extraction JSON report. Returns unit after checking empty native
+/// units and the static diagnostic. Native text leakage or OCR stages panic.
+fn assert_extract_boundary(report: &Value) {
+    assert_eq!(report["kind"], "extract");
+    assert_eq!(report["metadata"]["format"]["bucket"], "Ebooks");
+    assert_eq!(
+        report["metadata"]["format"]["detected_mime"],
+        "image/vnd.djvu"
     );
-    assert!(report["djvu"].is_null());
-    assert_eq!(report["pages"], serde_json::json!([]));
-    assert!(report["counts"]["pages"].is_null());
-    assert_eq!(report["preflight"], serde_json::json!([]));
-    assert_eq!(report["text"]["content"], "");
-    assert_eq!(report["text"]["chars"], 0);
-    assert_eq!(report["text"]["tokens"], 0);
-    assert_eq!(report["counts"]["chars"], 0);
-    assert_eq!(report["text"]["truncated"], true);
-    assert_eq!(report["markdown"]["truncated"], true);
+    assert_eq!(report["metadata"]["status"], "unsupported");
+    let errors = report["metadata"]["diagnostics"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["stage"], "metadata");
+    assert_eq!(errors[0]["message"], DIAGNOSTIC);
+    assert!(report["metadata"]["djvu"].is_null());
+    assert_eq!(report["content"]["units"], serde_json::json!([]));
+    assert_eq!(report["selection"]["omitted"], "unsupported");
     assert!(
-        !report["text"]["content"]
-            .as_str()
+        !serde_json::to_string(report)
             .unwrap()
             .contains("HIDDEN_CLI_NATIVE_TEXT")
     );
-    assert!(
-        !report["markdown"]["content"]
+}
+
+/// Asserts the v2 report identifies DjVu without native analysis or content.
+///
+/// Accepts a metadata JSON report. Returns unit after checking schema, support,
+/// status, diagnostics, digest, and hidden marker absence. Body fields panic.
+fn assert_metadata_boundary(report: &Value) {
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["kind"], "inspect");
+    assert_eq!(report["metadata"]["format"]["bucket"], "Ebooks");
+    assert_eq!(
+        report["metadata"]["format"]["detected_mime"],
+        "image/vnd.djvu"
+    );
+    assert_eq!(
+        report["metadata"]["extraction_support"],
+        "identification_only"
+    );
+    assert_eq!(report["metadata"]["status"], "complete");
+    assert_eq!(
+        report["metadata"]["diagnostics"][0]["code"],
+        "djvu_identification_only"
+    );
+    assert_eq!(
+        report["metadata"]["digest"]["digest"]
             .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(report.get("text").is_none());
+    assert!(report.get("markdown").is_none());
+    assert!(
+        !serde_json::to_string(report)
             .unwrap()
             .contains("HIDDEN_CLI_NATIVE_TEXT")
     );
-    assert!(report["thumbnail"].is_null());
 }
 
-/// Prove inspect, identify, OCR probe, extract, and thumbnail share one boundary.
+/// Verifies inspect v2, legacy extract, rejected flags, and thumbnails share the boundary.
 ///
-/// Accepts no inputs and returns unit. Panics if any real CLI mode decodes the
-/// native text, creates a thumbnail, invokes OCR, or omits partial-output flags.
+/// Accepts no parameters. Returns unit after running every CLI route. DjVu text
+/// decoding, OCR initialization, incorrect exit codes, or thumbnail creation panics.
 #[test]
 fn all_single_document_cli_modes_are_identification_only() {
     let path = native_text_fixture();
     let path = path.to_str().unwrap();
     let missing = fixture_directory().join("missing-tessdata");
     assert!(!missing.exists());
-    for args in [
-        vec!["inspect", path],
-        vec!["inspect", "--identify", path],
-        vec!["extract", "--no-ocr", path],
-        vec!["extract", path],
-    ] {
-        let report = successful_json(&run_litx(&args, Some(&missing)));
-        assert_cli_boundary(&report, false);
+
+    let inspected = run_litx(&["inspect", path], Some(&missing));
+    assert_eq!(inspected.status.code(), Some(0));
+    assert_metadata_boundary(&report_json(&inspected));
+
+    for args in [vec!["extract", "--no-ocr", path], vec!["extract", path]] {
+        let output = run_litx(&args, Some(&missing));
+        assert_eq!(output.status.code(), Some(2));
+        assert_extract_boundary(&report_json(&output));
     }
-    let report = successful_json(&run_litx(&["inspect", "--probe-ocr", path], Some(&missing)));
-    assert_cli_boundary(&report, true);
+    for flag in ["--identify", "--probe-ocr"] {
+        let output = run_litx(&["inspect", flag, path], Some(&missing));
+        assert_eq!(output.status.code(), Some(64));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("glassbox extract PATH")
+        );
+    }
 
     let thumbnail = fixture_directory().join("forbidden-cli-thumbnail.png");
-    let thumbnail_arg = thumbnail.to_str().unwrap();
-    let report = successful_json(&run_litx(
-        &["inspect", "--identify", "--thumbnail", thumbnail_arg, path],
+    let output = run_litx(
+        &["inspect", "--thumbnail", thumbnail.to_str().unwrap(), path],
         Some(&missing),
-    ));
-    assert_cli_boundary(&report, false);
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_metadata_boundary(&report_json(&output));
     assert!(!thumbnail.exists(), "DjVu thumbnail must not be created");
     assert!(!missing.exists(), "DjVu must not initialize an OCR model");
 }
 
-/// Prove a persistent batch returns the boundary then processes ordinary text.
+/// Verifies persistent legacy extraction retains its boundary and recovers.
 ///
-/// Accepts no inputs and returns unit. Panics on a missing response, DjVu text
-/// extraction, a poisoned session, or failure of the following plain-text file.
+/// Accepts no parameters. Returns unit after DjVu then plain-text batch responses.
+/// Session poisoning, native text leakage, or ordinary-text loss causes a panic.
 #[test]
 fn batch_preserves_the_boundary_and_continues_with_the_next_file() {
     use std::io::Write;
-
     let path = native_text_fixture();
     let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["extract", "--batch", "--no-ocr"])
@@ -195,8 +216,9 @@ fn batch_preserves_the_boundary_and_continues_with_the_next_file() {
     .unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(2),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -206,14 +228,17 @@ fn batch_preserves_the_boundary_and_continues_with_the_next_file() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["id"], "djvu");
-    assert_cli_boundary(&responses[0]["report"], false);
-    assert_eq!(responses[1]["id"], "next");
-    assert_eq!(responses[1]["report"]["format"]["bucket"], "Text");
-    assert_eq!(responses[1]["report"]["errors"], serde_json::json!([]));
-    assert_eq!(responses[1]["report"]["text"]["truncated"], false);
+    assert_extract_boundary(&responses[0]["report"]);
+    assert_eq!(
+        responses[1]["report"]["metadata"]["format"]["bucket"],
+        "Text"
+    );
+    assert_eq!(
+        responses[1]["report"]["metadata"]["diagnostics"],
+        serde_json::json!([])
+    );
     assert!(
-        !responses[1]["report"]["text"]["content"]
+        !responses[1]["report"]["content"]["units"][0]["text"]
             .as_str()
             .unwrap()
             .is_empty()

@@ -1,4 +1,10 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: images.rs.
+// Responsibility: Exercise image inspection and OCR behavior without changing reader behavior.
+use glassbox_inspect::reports::{
+    ContentOrigin, ExtractOptions, NativeUnit, OcrOptions, OperationStatus,
+};
+use glassbox_inspect::{InspectOptions, Inspector, extract, extract_transitional as inspect};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
@@ -249,4 +255,177 @@ fn ocr_probe_recognizes_native_pdf_rendered_words() {
     let probe = r.image.unwrap().probe.unwrap();
     assert!(probe.word_count >= 5, "{probe:?}");
     assert!(probe.mean_confidence > 0.5, "{probe:?}");
+}
+
+/// Creates a unique test-owned directory under the ignored target tree.
+///
+/// Accepts a test label. Returns the created directory path. Creation failures
+/// panic; checked-in fixtures and production data are untouched.
+fn workdir(label: &str) -> PathBuf {
+    let directory = fixture("../target/tests").join(format!(
+        "{label}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+/// Renders one raster with real text from the checked-in native PDF page.
+///
+/// Accepts a test-owned directory. Returns the written PNG path. Thumbnail
+/// rendering and filesystem failures panic; no checked-in fixture is modified.
+fn rendered_text_png(directory: &std::path::Path) -> PathBuf {
+    let path = directory.join("text.png");
+    let rendered = inspect(
+        &fixture("native.pdf"),
+        &InspectOptions {
+            thumbnail: Some(path.clone()),
+            thumbnail_max_edge: 800,
+            max_units: 0,
+            ..Default::default()
+        },
+    );
+    assert!(rendered.errors.is_empty(), "{:?}", rendered.errors);
+    path
+}
+
+#[test]
+fn extract_without_ocr_does_not_claim_recognition() {
+    // COND-10: an image unit extracted with OCR disabled must keep its
+    // provenance free of OCR engine, language, confidence, and raster facts.
+    let report = extract(
+        &fixture("image.png"),
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: false,
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert_eq!(report.metadata.status, OperationStatus::Complete);
+    assert!(
+        report.metadata.diagnostics.is_empty(),
+        "{:?}",
+        report.metadata.diagnostics
+    );
+    assert_eq!(report.content.units.len(), 1);
+    let unit = &report.content.units[0];
+    assert_eq!(unit.unit, NativeUnit::Image);
+    assert_eq!(unit.provenance[0].origin, ContentOrigin::Native);
+    assert_eq!(unit.provenance[0].ocr, None);
+}
+
+#[test]
+fn extract_with_unavailable_ocr_model_keeps_native_unit_unclaimed() {
+    // COND-10: OCR enabled with a missing model records the failure and keeps
+    // the native image unit without any recognition claim.
+    let report = extract(
+        &fixture("image.png"),
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: true,
+                language: "zz".into(),
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert!(
+        report
+            .metadata
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "probe_ocr"),
+        "{:?}",
+        report.metadata.diagnostics
+    );
+    assert_eq!(report.content.units.len(), 1);
+    let unit = &report.content.units[0];
+    assert_eq!(unit.provenance[0].origin, ContentOrigin::Native);
+    assert_eq!(unit.provenance[0].ocr, None);
+    assert_eq!(report.metadata.status, OperationStatus::Partial);
+}
+
+#[test]
+#[ignore = "requires local eng.traineddata, set TESSDATA_PREFIX"]
+fn enabled_english_alias_ocr_reports_canonical_provenance_facts() {
+    // COND-10: the 'en' alias must initialize the canonical 'eng' model, and
+    // the image unit must carry engine, language, confidence, and raster facts.
+    let directory = workdir("ocr-provenance");
+    let path = rendered_text_png(&directory);
+    let mut inspector = Inspector::default();
+    let aliased = inspector.extract(
+        &path,
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: true,
+                language: "en".into(),
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert!(
+        !aliased
+            .metadata
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "probe_ocr"),
+        "{:?}",
+        aliased.metadata.diagnostics
+    );
+    assert_eq!(aliased.content.units.len(), 1);
+    let unit = &aliased.content.units[0];
+    assert_eq!(unit.provenance[0].origin, ContentOrigin::Ocr);
+    let facts = unit.provenance[0]
+        .ocr
+        .as_ref()
+        .expect("OCR provenance facts");
+    assert_eq!(facts.engine, "tesseract");
+    assert_eq!(facts.language, "eng");
+    let confidence = facts.mean_confidence.expect("observed confidence");
+    assert!(confidence > 0.5, "{confidence}");
+    assert_eq!(
+        facts.raster_long_edge,
+        Some(OcrOptions::default().raster_long_edge)
+    );
+    assert!(unit.text.as_deref().unwrap_or("").contains("Native PDF"));
+
+    // The canonical spelling reuses the model loaded for the alias and reports
+    // the same canonical facts from the same worker session.
+    let canonical = inspector.extract(
+        &path,
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: true,
+                language: "eng".into(),
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert_eq!(canonical.content.units.len(), 1);
+    let facts = canonical.content.units[0].provenance[0]
+        .ocr
+        .as_ref()
+        .expect("OCR provenance facts");
+    assert_eq!(facts.language, "eng");
+
+    // The transitional probe observation also reports the canonical model.
+    let legacy = inspect(
+        &path,
+        &InspectOptions {
+            identify: true,
+            ocr_language: "en".into(),
+            ..Default::default()
+        },
+    );
+    assert!(legacy.errors.is_empty(), "{:?}", legacy.errors);
+    let probe = legacy.image.unwrap().probe.unwrap();
+    assert_eq!(probe.language, "eng");
+    assert!(probe.word_count >= 5, "{probe:?}");
 }

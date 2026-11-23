@@ -1,3 +1,6 @@
+// Module: glassbox-inspect integration tests.
+// File: parquet_bounds.rs.
+// Responsibility: Exercise hostile Parquet deferral boundaries without changing reader behavior.
 #![cfg(all(feature = "parquet-preview", not(target_arch = "wasm32")))]
 
 //! Hostile Parquet chunk fixtures retained from the audit remediation. Under the
@@ -6,7 +9,7 @@
 //! the static identification-only deferral without any chunk metadata or page
 //! bytes being read. They no longer pin decoder-specific rejection messages.
 
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use parquet_format_safe::{
     CompressionCodec, FileMetaData,
     thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol},

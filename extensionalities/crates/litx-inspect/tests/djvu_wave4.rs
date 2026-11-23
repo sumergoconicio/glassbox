@@ -1,5 +1,8 @@
+// Module: glassbox-inspect integration tests.
+// File: djvu_wave4.rs.
+// Responsibility: Exercise DjVu malformed-input boundaries without changing reader behavior.
 //! Security regressions for DjVu malformed-input and legacy-fixture boundaries.
-use litx_inspect::{InspectOptions, InspectReport, inspect};
+use glassbox_inspect::{InspectOptions, InspectReport, extract_transitional as inspect};
 use std::path::{Path, PathBuf};
 
 const DIAGNOSTIC: &str = "DjVu extraction is unsupported; identification only";

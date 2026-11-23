@@ -1,6 +1,9 @@
+// Module: glassbox-inspect integration tests.
+// File: audit_provenance.rs.
+// Responsibility: Exercise native and OCR provenance audit regressions without changing reader behavior.
 //! Red/green regression tests for the native/OCR provenance audit findings
 //! (LITX-AUD-008/009/010/012/013/014/015/019). Synthetic inputs only.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::path::PathBuf;
 
 /// Creates a unique writable scratch directory under the shared test target.

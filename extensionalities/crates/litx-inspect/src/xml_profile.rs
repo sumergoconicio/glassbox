@@ -1,6 +1,6 @@
-//! Namespace-aware structural profile of standalone XML, accumulated from the
-//! bounded `quick_xml::NsReader` event stream without retaining a document
-//! tree or any document values.
+//! Module: glassbox-inspect XML structural profiling.
+//! File: xml_profile.rs.
+//! Responsibility: Accumulate bounded namespace-aware structure without retaining document values.
 use crate::{InspectOptions, InspectReport, binary::Source, markdown, xml};
 use quick_xml::{NsReader, events::Event, name::ResolveResult};
 use serde::Serialize;
@@ -35,6 +35,10 @@ const LIVE_COUNTER_CAP: usize = 32_768;
 const PROFILE_BYTE_CAP: usize = 1 << 20;
 /// Maximum structural summary characters; stricter rendering limits win.
 const SUMMARY_CAP: usize = 64 << 10;
+/// Maximum cumulative bytes of expanded schema-path strings. A clip is
+/// reported as an explicit truncation flag so callers record a structured
+/// cap diagnostic instead of treating the report as complete.
+const SCHEMA_PATH_BYTES_CAP: usize = 1 << 20;
 
 /// Structural profile of one standalone XML document. Contains names,
 /// hierarchy, counts and patterns only; never document values.
@@ -848,6 +852,62 @@ fn summary(profile: &XmlProfile) -> (String, bool) {
     (out, false)
 }
 
+/// Profiles standalone XML for the canonical metadata-only report.
+///
+/// Accepts an XML path. Returns a fully validated bounded structural profile.
+/// Source, input-cap, syntax, entity, and serialization-cap failures are
+/// returned; no document text or attribute value is retained in the profile.
+pub(crate) fn metadata(path: &Path) -> xml::Result<XmlProfile> {
+    let mut source = Source::open(path)?;
+    if source.len > INPUT_CAP {
+        return Err("XML input byte cap exceeded".into());
+    }
+    let bytes = source.range(0, source.len as usize)?;
+    let profile = profile(&bytes)?;
+    let mut writer = CountingWriter {
+        remaining: PROFILE_BYTE_CAP,
+    };
+    serde_json::to_writer(&mut writer, &profile)
+        .map_err(|_| "XML profile serialization cap exceeded")?;
+    Ok(profile)
+}
+
+/// Expands interned XML parent links into value-free schema paths.
+///
+/// Accepts a validated profile. Returns the slash-separated paths in profile
+/// order plus whether the cumulative schema-path byte cap stopped expansion
+/// before the last path. Ordinary documents stay far below the cap and expand
+/// completely; a clip is reported explicitly so the caller keeps the genuine
+/// paths, records a structured cap diagnostic, and marks the report partial.
+/// Valid profiles have bounded acyclic parent links, so this helper never
+/// reads text or attribute values and has no failure states.
+pub(crate) fn schema_paths(profile: &XmlProfile) -> (Vec<String>, bool) {
+    schema_paths_with_cap(profile, SCHEMA_PATH_BYTES_CAP)
+}
+
+/// Reduced-limit seam for internal unit tests only; production limits are
+/// unreachable at test scale, never weakened at runtime.
+fn schema_paths_with_cap(profile: &XmlProfile, byte_cap: usize) -> (Vec<String>, bool) {
+    let mut paths = Vec::new();
+    let mut bytes = 0usize;
+    for path in profile.paths.iter() {
+        let mut components = Vec::new();
+        let mut current = Some(path.id);
+        while let Some(id) = current {
+            let item = &profile.paths[id];
+            components.push(display_name(profile, item.name_id));
+            current = item.parent_id;
+        }
+        components.reverse();
+        let rendered = format!("/{}", components.join("/"));
+        match bytes.checked_add(rendered.len()) {
+            Some(total_bytes) if total_bytes <= byte_cap => bytes = total_bytes,
+            _ => return (paths, true),
+        }
+        paths.push(rendered);
+    }
+    (paths, false)
+}
 /// Inspects a standalone XML file: profiles structure only and publishes
 /// `report.xml` solely after the full parse and serialized-size check pass.
 /// The bounded structural summary renders through the existing text and
@@ -900,5 +960,60 @@ mod tests {
         );
         let error = result.expect_err("fourth distinct sibling must fail");
         assert_eq!(error.to_string(), "XML live sibling-counter cap exceeded");
+    }
+
+    /// Builds a two-path profile by hand; profile fields are plain data, so
+    /// expansion tests need no document fixture.
+    fn two_path_profile() -> XmlProfile {
+        let mut profile = XmlProfile::default();
+        profile.namespaces.push("http://example.com/".into());
+        profile.names.push(XmlName {
+            namespace: None,
+            local: "root".into(),
+        });
+        profile.names.push(XmlName {
+            namespace: Some(0),
+            local: "child".into(),
+        });
+        for (id, parent_id, name_id, count, min_occurs, max_occurs) in [
+            (0usize, None, 0usize, 1u64, 1u64, 1u64),
+            (1, Some(0), 1, 2, 0, 2),
+        ] {
+            profile.paths.push(XmlPath {
+                id,
+                parent_id,
+                name_id,
+                count,
+                parents_seen: 1,
+                min_occurs,
+                max_occurs,
+                attributes: BTreeMap::new(),
+                text_instances: 0,
+                children_instances: 0,
+                mixed_instances: 0,
+                children: vec![],
+            });
+        }
+        profile.root_path_id = 0;
+        profile
+    }
+
+    /// Ordinary profiles expand completely under the production byte cap and
+    /// keep the exact deterministic schema-path output with no clip.
+    #[test]
+    fn schema_paths_expand_ordinary_profiles_completely() {
+        let (paths, truncated) = schema_paths(&two_path_profile());
+        assert_eq!(paths, ["/root".to_string(), "/root/ns0:child".to_string()]);
+        assert!(!truncated);
+    }
+
+    /// The cumulative byte cap stops retention and reports the clip as an
+    /// explicit truncation flag: only genuine expanded paths are returned.
+    #[test]
+    fn schema_paths_report_partial_clip_under_reduced_byte_cap() {
+        let profile = two_path_profile();
+        let (paths, truncated) = schema_paths_with_cap(&profile, "/root".len());
+        assert!(truncated);
+        assert_eq!(paths, ["/root".to_string()]);
     }
 }

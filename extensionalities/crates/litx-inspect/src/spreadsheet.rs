@@ -93,10 +93,28 @@ pub(crate) fn xlsx(
 ) -> xml::Result<()> {
     let sheets = root.descendants(S, "sheet");
     report.counts.sheets = Some(sheets.len());
-    // W3-SYS-SPREADSHEET-SHEETS: a hard ceiling binds both full extraction and
-    // arbitrarily large explicit page limits; smaller user limits still win.
-    let sheet_limit = options.text_unit_limit().min(WORKBOOK_SHEET_CAP);
-    let sheet_capped = sheets.len() > sheet_limit;
+    let selection_plan = match &options.native_selection {
+        Some(selection) => {
+            if sheets.len() > WORKBOOK_SHEET_CAP {
+                return Err("workbook sheet cap exceeded".into());
+            }
+            Some(crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::Worksheet,
+                sheets.len() as u64,
+            )?)
+        }
+        None => None,
+    };
+    // Legacy previews retain their five-sheet default; v2 selection is resolved
+    // against workbook order before any worksheet is decoded.
+    let sheet_limit = if selection_plan.is_some() {
+        WORKBOOK_SHEET_CAP
+    } else {
+        options.text_unit_limit().min(WORKBOOK_SHEET_CAP)
+    };
+    let sheet_capped = selection_plan.is_none() && sheets.len() > sheet_limit;
     let rels = office::relationships(archive, part)?;
     // Index once instead of rescanning every relationship for every sheet.
     // Vectors preserve duplicate-ID detection for each referenced ID.
@@ -138,6 +156,12 @@ pub(crate) fn xlsx(
     let mut work_capped = false;
     let mut attempted_sheets = 0usize;
     for (index, sheet) in sheets.iter().take(sheet_limit).enumerate() {
+        if selection_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.contains(index as u64 + 1))
+        {
+            continue;
+        }
         attempted_sheets = index + 1;
         let result = (|| -> xml::Result<()> {
             let target = related_indexed(
@@ -267,6 +291,36 @@ pub(crate) fn xlsx(
             );
             let mut sheet = grid.finish();
             markdown.write(&mut sheet, report, options);
+            if selection_plan.is_some() {
+                let rows = sheet
+                    .preview_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row_index, row)| crate::reports::ContentRow {
+                        row_index: row_index as u64 + 1,
+                        values: row.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let text = sheet
+                    .preview_rows
+                    .iter()
+                    .map(|row| row.join("\t"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut unit = crate::selection::dataset_unit(
+                    index as u64 + 1,
+                    crate::reports::NativeUnit::Worksheet,
+                    Some(target.clone()),
+                    text,
+                    rows,
+                );
+                unit.completeness = if sheet.preview_truncated {
+                    crate::reports::Completeness::Partial
+                } else {
+                    crate::reports::Completeness::Exact
+                };
+                report.native_units.push(unit);
+            }
             report.sheets.push(sheet);
             Ok(())
         })();

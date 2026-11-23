@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Downstream CI commands. Requires Python 3.10+, Git, and the native build tools.
+"""Module: Glassbox downstream automation.
+File: ci.py.
+Responsibility: Run scoped formatting, native checks, smoke, and workflow validation.
+
+Downstream CI commands. Requires Python 3.11+, Git, and the native build tools.
 
 Run from the repository root. Checks write only Cargo output and isolated
 fixtures under extensionalities/target. No upstream tests or formatters run.
@@ -61,6 +65,12 @@ def workflows():
 
 
 def smoke():
+    """Exercise release inspect/extract behavior, metadata batching, and offline OCR.
+
+    Accepts no parameters and resolves release binaries through CARGO_TARGET_DIR.
+    Returns unit after asserting v2 inspection and canonical native-unit extraction.
+    Raises subprocess errors or AssertionError for contract, alias, or exit failures.
+    """
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "extensionalities/target"))
     if not target.is_absolute():
         target = ROOT / target
@@ -73,8 +83,19 @@ def smoke():
                 [str(executable), command, str(fixture)], cwd=ROOT, timeout=30
             )
             report = json.loads(output)
-            assert not report["errors"], report["errors"]
-            assert report["text"]["content"].strip() == fixture.read_text().strip()
+            if command == "inspect":
+                assert report["schema_version"] == 2 and report["kind"] == "inspect"
+                assert report["metadata"]["status"] == "complete"
+                assert not report["metadata"]["diagnostics"], report["metadata"]
+                assert "text" not in report and "errors" not in report
+            else:
+                assert report["schema_version"] == 2 and report["kind"] == "extract"
+                assert report["metadata"]["status"] == "complete"
+                assert not report["metadata"]["diagnostics"], report["metadata"]
+                content = "\n".join(
+                    unit.get("text") or "" for unit in report["content"]["units"]
+                )
+                assert content.strip() == fixture.read_text().strip()
             reports.append(report)
         output = subprocess.check_output(
             [str(executable), "inspect", "--batch"],
@@ -83,26 +104,41 @@ def smoke():
             timeout=30,
         )
         response = json.loads(output)
-        assert response["id"] == "smoke" and not response["report"]["errors"]
+        assert response["id"] == "smoke"
+        assert response["report"]["schema_version"] == 2
+        assert "text" not in response["report"]
     assert reports[0] == reports[2] and reports[1] == reports[3]
     with tempfile.TemporaryDirectory(
         prefix="ci-ocr-", dir=ROOT / "extensionalities/target"
     ) as directory:
         # An explicitly missing model must never cause a runtime download.
         env = {**os.environ, "TESSDATA_PREFIX": str(Path(directory) / "missing")}
-        output = subprocess.check_output(
-            [str(target / "release/glassbox"), "inspect", "--identify",
+        completed = subprocess.run(
+            [str(target / "release/glassbox"), "extract", "--identify",
              str(ROOT / "extensionalities/fixtures/native.pdf")],
-            cwd=ROOT, env=env, timeout=30,
+            cwd=ROOT, env=env, timeout=30, capture_output=True, check=False,
         )
-        report = json.loads(output)
-        assert report["errors"] and report["text"]["truncated"]
-    print("PASS: release commands, batch responses, and offline OCR failure")
+        assert completed.returncode == 2, completed.stderr
+        report = json.loads(completed.stdout)
+        assert report["kind"] == "extract" and report["completeness"] == "partial"
+        assert any(item["code"] == "pdf_ocr"
+                   for item in report["metadata"]["diagnostics"])
+        assert "Native PDF evidence" in report["content"]["units"][0]["text"]
+    print("PASS: metadata inspection, canonical extraction, batching, and offline OCR")
 
 
 def main():
+    """Dispatch one scoped downstream automation command.
+
+    Accepts no parameters and reads the command name from process arguments.
+    Returns None after the selected command succeeds.
+    Raises SystemExit for invalid arguments and propagates failed checks, missing tools, and timeouts.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("changes", "format", "check", "smoke", "workflows"))
+    parser.add_argument(
+        "command",
+        choices=("changes", "format", "check", "smoke", "workflows"),
+    )
     args = parser.parse_args()
     if args.command == "changes":
         required = needs_checks(
@@ -119,12 +155,12 @@ def main():
     elif args.command == "format":
         # --all also follows local path dependencies; name only our packages.
         run("cargo", "fmt", "--manifest-path", MANIFEST,
-            "-p", "litx", "-p", "litx-inspect", "--check")
+            "-p", "glassbox-cli", "-p", "glassbox-inspect", "--check")
     elif args.command == "workflows":
         workflows()
     elif args.command == "check":
         run("python3", "-B", "-m", "unittest", "discover",
-            "-s", "extensionalities/scripts/tests", "-v")
+            "-s", "extensionalities/scripts/tests", "-p", "test_automation.py", "-v")
         run("cargo", "clippy", "--locked", "--manifest-path", MANIFEST,
             "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings")
         run("cargo", "test", "--locked", "--manifest-path", MANIFEST, "--workspace")

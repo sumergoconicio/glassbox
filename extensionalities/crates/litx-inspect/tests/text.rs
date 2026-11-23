@@ -1,4 +1,7 @@
-use litx_inspect::{InspectOptions, inspect};
+// Module: glassbox-inspect integration tests.
+// File: text.rs.
+// Responsibility: Exercise text and Markdown extraction behavior without changing reader behavior.
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::path::PathBuf;
 
 #[test]

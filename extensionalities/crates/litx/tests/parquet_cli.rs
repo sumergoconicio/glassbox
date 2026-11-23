@@ -1,17 +1,17 @@
-//! V-PARQUET-DEFER-CLI: CLI transport parity for the user-approved Parquet
-//! support reduction (2026-11-18). Inspect and extract both retain format
-//! identification, emit the static deferral diagnostic with incomplete empty
-//! content, and a persistent batch recovers across valid Parquet, malformed
-//! Parquet, and ordinary text inputs.
+// Module: glassbox-cli Parquet boundary tests.
+// File: parquet_cli.rs.
+// Responsibility: Prove v2 identification-only inspection and unchanged explicit legacy Parquet deferral.
+use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const DEFERRAL: &str = "Parquet extraction is deferred; identification only";
 
-/// Compact-Thrift FileMetaData: version 1, required schema root and two primitive
-/// leaves, zero rows/row groups. A valid footer envelope around an empty data
-/// section; no column data pages exist.
+/// Builds a valid empty Parquet footer with two primitive schema leaves.
+///
+/// Accepts no parameters. Returns deterministic Compact-Thrift test bytes.
+/// No row groups or data pages exist; v2 inspect must not parse even this footer.
 fn valid_parquet_bytes() -> Vec<u8> {
     let footer: &[u8] = b"\x15\x02\x19\x3c\x48\x06schema\x15\x04\x00\x15\x04\x25\x00\x18\x02id\x00\x15\x0c\x25\x02\x18\x04name\x00\x16\x00\x19\x0c\x00";
     let mut bytes = b"PAR1".to_vec();
@@ -21,6 +21,10 @@ fn valid_parquet_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Creates an isolated ignored Parquet test directory.
+///
+/// Accepts a label. Returns a unique target-directory path. Directory creation
+/// failures panic; no source fixture or production data is modified.
 fn workdir(tag: &str) -> PathBuf {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/tests")
@@ -35,87 +39,117 @@ fn workdir(tag: &str) -> PathBuf {
     directory
 }
 
+/// Writes one deterministic Parquet or plain-text fixture.
+///
+/// Accepts a test directory, file name, and bytes. Returns the written path.
+/// Filesystem failures panic; writes remain under the test-owned target tree.
 fn write(directory: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = directory.join(name);
     std::fs::write(&path, bytes).unwrap();
     path
 }
 
+/// Creates a Glassbox command rooted at the CLI crate directory.
+///
+/// Accepts argument strings. Returns an unlaunched command. No process, file,
+/// or environment mutation occurs until the caller launches it.
 fn litx(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_glassbox"));
     command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
     command
 }
 
-/// Asserts the identification-only contract on one CLI JSON report.
-fn assert_deferred(report: &serde_json::Value) {
-    let errors = report["errors"].as_array().unwrap();
+/// Asserts canonical extraction keeps its static Parquet deferral.
+///
+/// Accepts a v2 extraction report. Returns unit after checking empty content,
+/// absent footer profile, and one static diagnostic. Any row preview panics.
+fn assert_extract_deferred(report: &Value) {
+    assert_eq!(report["kind"], "extract");
+    assert_eq!(report["metadata"]["status"], "unsupported");
+    let errors = report["metadata"]["diagnostics"].as_array().unwrap();
     assert_eq!(errors.len(), 1, "one static diagnostic: {errors:?}");
-    assert_eq!(errors[0]["stage"], "parquet");
-    assert_eq!(errors[0]["message"], DEFERRAL, "the diagnostic is static");
-    assert!(report["parquet"].is_null(), "no footer/schema profile");
-    assert!(report["dataset"].is_null(), "no row preview");
-    assert_eq!(report["text"]["content"], "", "no extracted text");
+    assert_eq!(errors[0]["stage"], "metadata");
+    assert_eq!(errors[0]["message"], DEFERRAL);
+    assert!(report["metadata"]["parquet"].is_null());
+    assert!(report["metadata"]["dataset"].is_null());
+    assert_eq!(report["content"]["units"], serde_json::json!([]));
+    assert_eq!(report["selection"]["omitted"], "unsupported");
     assert_eq!(
-        report["text"]["truncated"], true,
-        "omitted text must be marked incomplete"
-    );
-    assert_eq!(
-        report["markdown"]["truncated"], true,
-        "markdown must report partial output"
-    );
-    assert_eq!(
-        report["format"]["detected_mime"], "application/vnd.apache.parquet",
-        "format identification is retained"
+        report["metadata"]["format"]["detected_mime"],
+        "application/vnd.apache.parquet"
     );
 }
 
+/// Asserts v2 Parquet inspection identifies bytes without footer or row parsing.
+///
+/// Accepts a metadata JSON report. Returns unit after checking schema, support,
+/// complete status, diagnostic, digest, and absence of legacy body/profile keys.
+fn assert_metadata_deferred(report: &Value) {
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["kind"], "inspect");
+    assert_eq!(
+        report["metadata"]["format"]["detected_mime"],
+        "application/vnd.apache.parquet"
+    );
+    assert_eq!(
+        report["metadata"]["extraction_support"],
+        "identification_only"
+    );
+    assert_eq!(report["metadata"]["status"], "complete");
+    assert_eq!(
+        report["metadata"]["diagnostics"][0]["code"],
+        "parquet_identification_only"
+    );
+    assert_eq!(
+        report["metadata"]["digest"]["digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(report.get("parquet").is_none());
+    assert!(report.get("dataset").is_none());
+    assert!(report.get("text").is_none());
+    assert!(report.get("markdown").is_none());
+}
+
+/// Verifies inspect v2 and explicit extract retain their separate Parquet contracts.
+///
+/// Accepts no parameters. Returns unit after one report from each operation.
+/// Inspect exits 0; extract exits 2. Footer profiles, rows, or wrong statuses panic.
 #[test]
-fn parquet_inspect_and_extract_both_defer_extraction() {
+fn parquet_inspect_and_extract_keep_separate_boundaries() {
     let directory = workdir("parity");
     let path = write(&directory, "empty.parquet", &valid_parquet_bytes());
     let path = path.to_str().unwrap();
-    let inspect = litx(&["inspect", path, "--no-ocr"]).output().unwrap();
-    assert!(
-        inspect.status.success(),
-        "document-level stage errors keep the aggregate exit code 0: {}",
-        String::from_utf8_lossy(&inspect.stderr)
-    );
-    let extract = litx(&["extract", path, "--no-ocr"]).output().unwrap();
-    assert!(
-        extract.status.success(),
-        "extract keeps the aggregate exit code 0: {}",
-        String::from_utf8_lossy(&extract.stderr)
-    );
-    let fresh: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
-    let full: serde_json::Value = serde_json::from_slice(&extract.stdout).unwrap();
-    assert_deferred(&fresh);
-    assert_deferred(&full);
-    assert_eq!(
-        fresh["errors"], full["errors"],
-        "inspect and extract publish the identical static deferral"
-    );
+    let inspected = litx(&["inspect", path]).output().unwrap();
+    assert_eq!(inspected.status.code(), Some(0));
+    let extracted = litx(&["extract", path, "--no-ocr"]).output().unwrap();
+    assert_eq!(extracted.status.code(), Some(2));
+    assert_metadata_deferred(&serde_json::from_slice(&inspected.stdout).unwrap());
+    assert_extract_deferred(&serde_json::from_slice(&extracted.stdout).unwrap());
 }
 
+/// Verifies malformed Parquet is not footer-parsed and remains identification-only.
+///
+/// Accepts no parameters. Returns unit after inspecting hostile trailing bytes.
+/// The process exits 0 with the same v2 boundary and a trustworthy streamed digest.
 #[test]
-fn malformed_parquet_defers_with_exit_zero_and_static_message() {
+fn malformed_parquet_defers_without_footer_parsing() {
     let directory = workdir("malformed");
-    // PAR1 magic with a hostile garbage tail; no footer parsing may occur.
     let mut bytes = b"PAR1".to_vec();
     bytes.extend_from_slice(&[0xff; 200]);
     let path = write(&directory, "broken.parquet", &bytes);
-    let output = litx(&["inspect", path.to_str().unwrap(), "--no-ocr"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "document-level stage errors keep the aggregate exit code 0: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_deferred(&report);
+    let output = litx(&["inspect", path.to_str().unwrap()]).output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_metadata_deferred(&serde_json::from_slice(&output.stdout).unwrap());
 }
 
+/// Verifies metadata batch recovers across valid, malformed, and text inputs.
+///
+/// Accepts no parameters. Returns unit after three ordered JSONL responses.
+/// Aggregate status is 0 for complete inspection; the text report is complete and
+/// content-free, proving that deferred Parquet inputs do not poison the session.
 #[test]
 fn parquet_batch_recovers_across_valid_malformed_and_text_inputs() {
     let directory = workdir("batch");
@@ -136,32 +170,24 @@ fn parquet_batch_recovers_across_valid_malformed_and_text_inputs() {
     writeln!(input, "{}", serde_json::json!({"id": "t3", "path": text})).unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "stage errors must not fail the batch: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 3, "one response per request, in order");
-    assert_eq!(responses[0]["id"], "p1");
-    assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[2]["id"], "t3");
-    assert_deferred(&responses[0]["report"]);
-    assert_deferred(&responses[1]["report"]);
+    assert_eq!(responses.len(), 3);
+    assert_metadata_deferred(&responses[0]["report"]);
+    assert_metadata_deferred(&responses[1]["report"]);
+    assert_eq!(responses[2]["report"]["metadata"]["status"], "complete");
     assert_eq!(
-        responses[2]["report"]["errors"],
-        serde_json::json!([]),
-        "the worker recovers cleanly after deferred Parquet inputs"
+        responses[2]["report"]["metadata"]["counts"][0]["unit"],
+        "logical_line"
     );
-    assert!(
-        responses[2]["report"]["text"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("ordinary text survives"),
-        "ordinary text still extracts after Parquet deferrals"
-    );
+    assert!(responses[2]["report"].get("text").is_none());
 }

@@ -14,3 +14,9 @@ target/
 sandbox/
 .env
 .env.*
+
+# Local verification harnesses and fixture generator remain local.
+scripts/verify-settling-in.py
+scripts/verify-fidelity.py
+scripts/tests/test_settling_in_driver.py
+fixtures/generate.py

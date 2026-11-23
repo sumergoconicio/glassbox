@@ -1,8 +1,11 @@
+// Module: glassbox-inspect integration tests.
+// File: spreadsheet_wave5.rs.
+// Responsibility: Exercise bounded workbook regression behavior without changing reader behavior.
 //! Wave-5 cumulative workbook regressions for the `litx-inspect` crate.
 //! File: `spreadsheet_wave5.rs`.
 //! Responsibility: prove bounded sheet, cell, and value-byte work across
 //! XLSX/XLSM/ODS while preserving ordinary output and relationship validation.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Write, path::PathBuf};
 
 const CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
@@ -167,7 +170,7 @@ fn extract_options() -> InspectOptions {
 /// Accepts a report, declared sheet count, retained sheet count, and diagnostic
 /// fragment; returns unit; panics with report details when an invariant fails.
 fn assert_partial(
-    report: &litx_inspect::InspectReport,
+    report: &glassbox_inspect::InspectReport,
     declared: usize,
     retained: usize,
     diagnostic: &str,

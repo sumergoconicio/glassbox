@@ -10,8 +10,9 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 - Use the upstream `liteparse` public library through the path dependency. Do not patch its CLI or other upstream-owned files.
 - Build and check with the explicit `extensionalities/Cargo.toml` manifest; commit this workspace's `Cargo.lock`.
 - Keep built-in Tesseract enabled. Do not disable it to make a build pass.
-- `glassbox` provides native inspection and extraction. `litx` remains a compatibility alias for the same implementation.
-- The Rust package names remain `litx` and `litx-inspect`. Neither command replaces upstream `lit`.
+- `glassbox` provides upstream parsing, metadata-only inspection, and extraction. `litx` remains a compatibility alias binary for the same implementation.
+- The Rust packages are `glassbox-cli` and `glassbox-inspect`. The crate directories stay `crates/litx` and `crates/litx-inspect`.
+- Neither command replaces upstream `lit`. Keep `litx` out of public command examples; migration text may name it.
 - Further features and consumer delivery require separate approval.
 - Preserve the root workspace and lockfile during dependency updates. Public API changes can break this workspace even when Git merges cleanly.
 - Keep build products, sandbox files, credentials, and private documents out of commits. Review fixtures before adding them.
@@ -20,12 +21,25 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 ## Documentation, sandbox, and entrypoints
 
 - Keep non-code development documentation under [`dev/`](dev/README.md), not beside the Cargo workspace files. This `AGENTS.md` remains at the downstream root as the agent entrypoint.
+- Public user documentation lives under [`docs/`](docs/README.md). Development records stay under `dev/`.
 - [`README.md`](README.md) is the public Glassbox guide. Keep `../README.md` unchanged as upstream documentation.
-- Group each feature's phases in its own `dev/PRDs/YYYYMMDD_<feature-slug>/` folder. The inspection/extraction work is [`20261117_litx-inspect-extract`](dev/PRDs/20261117_litx-inspect-extract/README.md) and XML profiling is [`20261118_xml-structure-profile`](dev/PRDs/20261118_xml-structure-profile/README.md).
+- Current Glassbox behavior follows the v2 contracts in [`dev/docs/settling-in-interfaces.md`](dev/docs/settling-in-interfaces.md). Inspection is metadata-only; extraction selects native units.
+- Group each feature's phases in its own `dev/PRDs/YYYYMMDD_<feature-slug>/` folder. The inspection/extraction work is [`20261117_litx-inspect-extract`](dev/PRDs/20261117_litx-inspect-extract/README.md), XML profiling is [`20261118_xml-structure-profile`](dev/PRDs/20261118_xml-structure-profile/README.md), and the current unification work is [`20261121_settling_in`](dev/PRDs/20261121_settling_in/spec.md).
 - Keep temporary audit harnesses, dogfood probes, and scratch test fixtures inside [`sandbox/`](sandbox/) (gitignored by `extensionalities/.gitignore`), not in the upstream root or `/tmp`. Clean temporary scratch inputs after runs.
 - Keep code, Cargo manifests/lockfile, scripts, and executable test fixtures in their existing locations. Text fixtures such as `fixtures/hello.txt` are test data, not development documentation.
 - Preserve historical reports and their approvals, limitations, verification claims, and receipts. Moving a report does not make its historical checks current or grant audit clearance.
 - Before editing this guide, preserve a dated recoverable original under `dev/instruction-history/` and record its SHA-256. Prior versions: [`20261118-AGENTS.before-prd-routing.md`](dev/instruction-history/20261118-AGENTS.before-prd-routing.md) (`7aec3d6677b48b1ce0e00eea2deb7b3ccd19d5e46fe448f05b0f42f61a89dc56`) and [`20261118-AGENTS.before-downstream-seam.md`](dev/instruction-history/20261118-AGENTS.before-downstream-seam.md) (`8adb95c42350b17cf232029b377d8b1cf7f901c15f04dd603f92f83c0d310e27`).
+
+## Local build cleanup
+
+- Before a build or verification campaign, reuse an appropriate Cargo target where isolation rules permit. For a local Glassbox-only build, use `--bin glassbox`. Keep the `litx` target in source for compatibility checks.
+- For isolated runs, record the exact disposable paths under `target/` or `sandbox/` before starting. Keep logs, results, and audit evidence separate from disposable build trees.
+- Check for stale build trees before a new campaign, after a run ends or is cancelled, and whenever disk pressure warrants it. If removal of the exact paths was approved in advance, clean them automatically when no job uses them and required evidence is safe. Otherwise, list the exact paths and obtain approval before removal. No scheduler is required.
+- Before cleanup, confirm the paths are local, inside this workspace, ignored by Git, and free of active users, symlinked path components, and nested mounts. Preserve current release binaries, shared caches in use, fixtures, and audit evidence. Do not infer that an old or ignored path is disposable.
+- Remove only the approved paths. Verify the retained outputs and report the net change in available disk space.
+
+The guide before build cleanup is preserved in [`20261123-AGENTS.before-build-cleanup.md`](dev/instruction-history/20261123-AGENTS.before-build-cleanup.md).
+Its SHA-256 is `8fe3daf15467ac995a4ea451e9e8cfd5f394da820e81dd49ac899ef653191f0e`.
 
 ## Shared PRD management
 
@@ -100,3 +114,6 @@ Do not delete branches without separate permission.
 
 The guide before PR activation is preserved in [`20261121-AGENTS.before-pr-activation.md`](dev/instruction-history/20261121-AGENTS.before-pr-activation.md).
 Its SHA-256 is `603911a38e2cb8cebe49b4274f4b73eb126777cd9f87b0f2b3364f0442f97ebf`.
+
+The guide before settling-in documentation is preserved in [`20261122-AGENTS.before-settling-in.md`](dev/instruction-history/20261122-AGENTS.before-settling-in.md).
+Its SHA-256 is `92ae9c00167b064b99278d17b7e2bbe2d644719303090b628a292bcd7e1d54be`.

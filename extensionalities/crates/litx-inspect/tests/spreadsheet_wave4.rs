@@ -1,8 +1,11 @@
+// Module: glassbox-inspect integration tests.
+// File: spreadsheet_wave4.rs.
+// Responsibility: Exercise spreadsheet safety regressions without changing reader behavior.
 //! Wave-4 spreadsheet safety regressions (W3-SYS-SPREADSHEET-WASM32,
 //! W4-SYS-SPREADSHEET-ROWOVERFLOW, W3-SYS-SPREADSHEET-SHEETS). All payloads
 //! are small synthetic XLSX fixtures; every run stays bounded by the
 //! inspection caps and writes only under the shared verification target.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Write, path::PathBuf};
 
 const CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";

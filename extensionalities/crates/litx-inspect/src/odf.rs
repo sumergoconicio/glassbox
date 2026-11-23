@@ -193,24 +193,271 @@ pub(crate) fn inspect(
     } else if ext == "odp" {
         let slides: Vec<_> = body.children().filter(|n| n.is(DRAW, "page")).collect();
         report.counts.slides = Some(slides.len());
-        for (index, slide) in slides.iter().take(options.text_unit_limit()).enumerate() {
-            unit(slide, "slide", index, report, options, &mut expansion)?;
+        if let Some(selection) = &options.native_selection {
+            let plan = crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::Slide,
+                slides.len() as u64,
+            )?;
+            for (index, slide) in slides.into_iter().enumerate() {
+                let number = index as u64 + 1;
+                if plan.contains(number) {
+                    let mut text_nodes = Vec::new();
+                    slide.visit(&mut |node| {
+                        if node.is(T, "p") || node.is(T, "h") {
+                            text_nodes.push(node);
+                        }
+                    });
+                    // COND-11: one buffer with early retention clipping. The
+                    // unit keeps at most one character beyond the extraction
+                    // cap, the expansion budget still charges every
+                    // paragraph, and the paragraph separators stay exact.
+                    let bound = options.max_chars.saturating_add(1);
+                    let mut text = String::new();
+                    let mut retained = 0usize;
+                    for (position, node) in text_nodes.into_iter().enumerate() {
+                        if position > 0 {
+                            append_bounded(&mut text, &mut retained, bound, "\n");
+                        }
+                        let value = expansion.text(node)?;
+                        append_bounded(&mut text, &mut retained, bound, &value);
+                    }
+                    report.native_units.push(crate::selection::text_unit(
+                        number,
+                        crate::reports::NativeUnit::Slide,
+                        Some(format!(
+                            "content.xml#slide/{}",
+                            slide.attr_ns(DRAW, "name").unwrap_or("unnamed")
+                        )),
+                        text,
+                        crate::reports::ContentOrigin::Native,
+                    ));
+                }
+            }
+        } else {
+            for (index, slide) in slides.iter().take(options.text_unit_limit()).enumerate() {
+                unit(slide, "slide", index, report, options, &mut expansion)?;
+            }
+            report.text.truncated |= slides.len() > options.text_unit_limit();
         }
-        report.text.truncated |= slides.len() > options.text_unit_limit();
     } else if ext == "odt" {
         report.counts.paragraphs =
             Some(body.descendants(T, "p").len() + body.descendants(T, "h").len());
-        let sections: Vec<_> = body.children().filter(|n| n.is(T, "section")).collect();
-        if sections.is_empty() {
-            unit(body, "section", 0, report, options, &mut expansion)?;
-        } else {
-            for (index, child) in body.children().take(options.text_unit_limit()).enumerate() {
-                unit(child, "section", index, report, options, &mut expansion)?;
+        if let Some(selection) = &options.native_selection {
+            let mut blocks = Vec::new();
+            for child in body.children() {
+                if child.is(T, "section") {
+                    blocks.extend(child.children().filter(|node| {
+                        node.is(T, "p") || node.is(T, "h") || node.is(TABLE, "table")
+                    }));
+                } else if child.is(T, "p") || child.is(T, "h") || child.is(TABLE, "table") {
+                    blocks.push(child);
+                }
             }
-            report.text.truncated |= body.children().count() > options.text_unit_limit();
+            if blocks.len() > 4096 {
+                return Err("ODT native block cap exceeded".into());
+            }
+            let plan = crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::DocumentBlock,
+                blocks.len() as u64,
+            )?;
+            for (index, block) in blocks.into_iter().enumerate() {
+                let number = index as u64 + 1;
+                if plan.contains(number) {
+                    let text = if block.is(TABLE, "table") {
+                        odf_table_text(block, &mut expansion, options.max_chars)?
+                    } else {
+                        expansion.text(block)?
+                    };
+                    report.native_units.push(crate::selection::text_unit(
+                        number,
+                        crate::reports::NativeUnit::DocumentBlock,
+                        Some(format!("content.xml#body/{number}")),
+                        text,
+                        crate::reports::ContentOrigin::Native,
+                    ));
+                }
+            }
+        } else {
+            let sections: Vec<_> = body.children().filter(|n| n.is(T, "section")).collect();
+            if sections.is_empty() {
+                unit(body, "section", 0, report, options, &mut expansion)?;
+            } else {
+                for (index, child) in body.children().take(options.text_unit_limit()).enumerate() {
+                    unit(child, "section", index, report, options, &mut expansion)?;
+                }
+                report.text.truncated |= body.children().count() > options.text_unit_limit();
+            }
         }
     }
     Ok(())
+}
+
+/// Appends text to a bounded unit buffer, clipping retention on a character
+/// boundary.
+///
+/// Accepts the destination text, the retained character counter, the retention
+/// bound, and the text to append. Returns unit. The buffer retains at most
+/// `bound` characters; the cut always lands between Unicode characters, so a
+/// clipped prefix stays valid UTF-8.
+fn append_bounded(out: &mut String, retained: &mut usize, bound: usize, text: &str) {
+    let remaining = bound.saturating_sub(*retained);
+    let end = text
+        .char_indices()
+        .nth(remaining)
+        .map_or(text.len(), |(offset, _)| offset);
+    out.push_str(&text[..end]);
+    *retained += text[..end].chars().count();
+}
+
+/// Expands an atomic ODF table as rows and tab-separated cells in one buffer.
+///
+/// Accepts a table node, the shared expansion budget, and the extraction
+/// character cap. Returns deterministic table text: rows join with newlines,
+/// cells with tabs, and a cell's paragraphs with newlines, matching the joined
+/// representation this replaced. COND-11: the text accumulates directly in one
+/// buffer that retains at most one character beyond the cap, so the peak stays
+/// bounded by the cap instead of a second whole-unit copy while the downstream
+/// content limiter still detects and marks the clipped unit partial; the
+/// expansion budget keeps charging every paragraph, so cap errors are
+/// unchanged. Malformed space counts and expansion-budget exhaustion return
+/// errors. The traversal stops at nested `<table:table>` ownership boundaries:
+/// each nested table is processed once, in place, with its own row and cell
+/// traversal, so every inner paragraph appears and charges the budget exactly
+/// once, in natural document order.
+fn odf_table_text(
+    table: &Node,
+    expansion: &mut ExpansionBudget,
+    max_chars: usize,
+) -> xml::Result<String> {
+    let bound = max_chars.saturating_add(1);
+    let mut out = String::new();
+    let mut retained = 0usize;
+    let mut first_line = true;
+    append_table_text(
+        table,
+        &mut out,
+        &mut retained,
+        bound,
+        expansion,
+        &mut first_line,
+    )?;
+    Ok(out)
+}
+
+/// Appends one table's owned rows and cells into the shared unit buffer.
+///
+/// Accepts the owning table node, the shared buffer, the retained character
+/// counter, the retention bound, the shared expansion budget, and the shared
+/// line-separator state. Returns unit. Rows owned by this table join with
+/// newlines and their cells with tabs. The walk descends through row-group
+/// wrappers such as `table:table-header-rows` but stops at nested
+/// `table:table` boundaries, consistent with `tables.rs::odf_rows`, so no row
+/// or paragraph is visited twice. The separator state arrives from and returns
+/// to the enclosing cell, so a nested table lands in natural document order.
+fn append_table_text(
+    table: &Node,
+    out: &mut String,
+    retained: &mut usize,
+    bound: usize,
+    expansion: &mut ExpansionBudget,
+    first_line: &mut bool,
+) -> xml::Result<()> {
+    for row in owned_table_rows(table) {
+        if !*first_line {
+            append_bounded(out, retained, bound, "\n");
+        }
+        *first_line = false;
+        let mut first_cell = true;
+        for cell in row
+            .children()
+            .filter(|node| node.is(TABLE, "table-cell") || node.is(TABLE, "covered-table-cell"))
+        {
+            if !first_cell {
+                append_bounded(out, retained, bound, "\t");
+            }
+            first_cell = false;
+            let mut first_content = true;
+            append_cell_text(cell, out, retained, bound, expansion, &mut first_content)?;
+        }
+    }
+    Ok(())
+}
+
+/// Appends one cell's owned paragraphs and nested tables in document order.
+///
+/// Accepts the cell node, the shared buffer, the retained character counter,
+/// the retention bound, the shared expansion budget, and the cell's
+/// line-separator state. Returns unit. Paragraphs owned by this cell join
+/// with newlines, descending through wrappers such as `text:list` but never
+/// across nested-table boundaries. Each nested `<table:table>` is processed
+/// once, in place, with its own row and cell traversal that shares this
+/// cell's separator state, so inner paragraphs appear and charge the budget
+/// exactly once.
+fn append_cell_text(
+    cell: &Node,
+    out: &mut String,
+    retained: &mut usize,
+    bound: usize,
+    expansion: &mut ExpansionBudget,
+    first_line: &mut bool,
+) -> xml::Result<()> {
+    fn visit(
+        node: &Node,
+        out: &mut String,
+        retained: &mut usize,
+        bound: usize,
+        expansion: &mut ExpansionBudget,
+        first_line: &mut bool,
+    ) -> xml::Result<()> {
+        for child in node.children() {
+            if child.is(TABLE, "table") {
+                // A nested table is owned by this cell: process it once, in
+                // place, with its own row and cell traversal.
+                append_table_text(child, out, retained, bound, expansion, first_line)?;
+            } else if child.is(T, "p") {
+                if !*first_line {
+                    append_bounded(out, retained, bound, "\n");
+                }
+                *first_line = false;
+                let value = expansion.text(child)?;
+                append_bounded(out, retained, bound, &value);
+            } else {
+                visit(child, out, retained, bound, expansion, first_line)?;
+            }
+        }
+        Ok(())
+    }
+    visit(cell, out, retained, bound, expansion, first_line)
+}
+
+/// Collects the rows owned by one ODF table.
+///
+/// Accepts the owning table node. Returns its owned `table:table-row` nodes
+/// in document order. The walk descends through row-group wrappers but stops
+/// at nested `table:table` boundaries, matching `tables.rs::odf_rows`, so no
+/// row belongs to two tables.
+fn owned_table_rows(table: &Node) -> Vec<&Node> {
+    fn visit<'a>(node: &'a Node, rows: &mut Vec<&'a Node>) {
+        if node.is(TABLE, "table") {
+            return;
+        }
+        if node.is(TABLE, "table-row") {
+            rows.push(node);
+            return;
+        }
+        for child in node.children() {
+            visit(child, rows);
+        }
+    }
+    let mut rows = Vec::new();
+    for child in table.children() {
+        visit(child, &mut rows);
+    }
+    rows
 }
 
 fn positive(node: &Node, key: &str, cap: usize) -> xml::Result<usize> {
@@ -234,16 +481,40 @@ fn spreadsheet(
     use crate::profile::{Budget, Grid, accumulate, column_name};
     let tables: Vec<_> = body.children().filter(|n| n.is(TABLE, "table")).collect();
     report.counts.sheets = Some(tables.len());
-    let sheet_limit = options
-        .text_unit_limit()
-        .min(crate::spreadsheet::WORKBOOK_SHEET_CAP);
-    let sheet_capped = tables.len() > sheet_limit;
+    let selection_plan = match &options.native_selection {
+        Some(selection) => {
+            if tables.len() > crate::spreadsheet::WORKBOOK_SHEET_CAP {
+                return Err("workbook sheet cap exceeded".into());
+            }
+            Some(crate::selection::begin(
+                report,
+                selection,
+                crate::reports::NativeUnit::Worksheet,
+                tables.len() as u64,
+            )?)
+        }
+        None => None,
+    };
+    let sheet_limit = if selection_plan.is_some() {
+        crate::spreadsheet::WORKBOOK_SHEET_CAP
+    } else {
+        options
+            .text_unit_limit()
+            .min(crate::spreadsheet::WORKBOOK_SHEET_CAP)
+    };
+    let sheet_capped = selection_plan.is_none() && tables.len() > sheet_limit;
     let mut budget = Budget::default();
     let mut work = WorkBudget::default();
     let mut expanded_bytes = 0usize;
     let mut work_capped = false;
     let mut attempted_sheets = 0usize;
     for (index, table) in tables.iter().take(sheet_limit).enumerate() {
+        if selection_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.contains(index as u64 + 1))
+        {
+            continue;
+        }
         attempted_sheets = index + 1;
         let result = (|| -> xml::Result<()> {
             let mut grid = Grid::new(table.attr_ns(TABLE, "name").unwrap_or("").into(), index + 1);
@@ -424,6 +695,36 @@ fn spreadsheet(
             );
             let mut sheet = grid.finish();
             markdown.write(&mut sheet, report, options);
+            if selection_plan.is_some() {
+                let rows = sheet
+                    .preview_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row_index, row)| crate::reports::ContentRow {
+                        row_index: row_index as u64 + 1,
+                        values: row.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let text = sheet
+                    .preview_rows
+                    .iter()
+                    .map(|row| row.join("\t"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut unit = crate::selection::dataset_unit(
+                    index as u64 + 1,
+                    crate::reports::NativeUnit::Worksheet,
+                    Some(format!("content.xml#sheet/{}", sheet.name)),
+                    text,
+                    rows,
+                );
+                unit.completeness = if sheet.preview_truncated {
+                    crate::reports::Completeness::Partial
+                } else {
+                    crate::reports::Completeness::Exact
+                };
+                report.native_units.push(unit);
+            }
             report.sheets.push(sheet);
             Ok(())
         })();
@@ -579,5 +880,152 @@ mod bounds_tests {
         let error = super::cell_text(&paragraphs, 8, 2, 40, &mut work).unwrap_err();
         assert!(error.to_string().contains("value-byte budget"), "{error}");
         assert!(work.is_exhausted());
+    }
+
+    /// Builds one ODF table node from row/cell/paragraph markup for tests.
+    ///
+    /// Accepts the inner table markup. Returns the parsed `table:table` node.
+    /// Parse failures panic; no filesystem or archive access occurs.
+    fn table(markup: &str) -> crate::xml::Node {
+        let bytes = format!(
+            "<table:table xmlns:table=\"{}\" xmlns:text=\"{}\">{markup}</table:table>",
+            super::TABLE,
+            super::T
+        );
+        crate::xml::parse(bytes.as_bytes()).unwrap()
+    }
+
+    /// Checks exact row/cell/paragraph separators without any clipping.
+    #[test]
+    fn odf_table_text_joins_rows_cells_and_paragraphs_exactly() {
+        let node = table(
+            "<table:table-row>\
+             <table:table-cell><text:p>a</text:p></table:table-cell>\
+             <table:table-cell><text:p>b</text:p><text:p>c</text:p></table:table-cell>\
+             </table:table-row>\
+             <table:table-row>\
+             <table:table-cell><text:p>d</text:p></table:table-cell>\
+             </table:table-row>",
+        );
+        let mut expansion = super::ExpansionBudget::new(super::ODF_EXPANDED_CAP);
+        let text = super::odf_table_text(&node, &mut expansion, usize::MAX).unwrap();
+        // Rows join with newlines, cells with tabs, and one cell's paragraphs
+        // with newlines, exactly like the joined representation this replaced.
+        assert_eq!(text, "a\tb\nc\nd");
+    }
+
+    /// Checks early retention clipping against the extraction character cap.
+    #[test]
+    fn odf_table_text_clips_retention_early_on_character_boundaries() {
+        let node = table(
+            "<table:table-row>\
+             <table:table-cell><text:p>a</text:p></table:table-cell>\
+             <table:table-cell><text:p>b</text:p><text:p>c</text:p></table:table-cell>\
+             </table:table-row>\
+             <table:table-row>\
+             <table:table-cell><text:p>d</text:p></table:table-cell>\
+             </table:table-row>",
+        );
+        // The cap-plus-one retention bound keeps the buffer bounded by the
+        // extraction cap instead of the whole expanded unit; the downstream
+        // content limiter still sees one character beyond the cap and marks
+        // the unit partial.
+        let mut expansion = super::ExpansionBudget::new(super::ODF_EXPANDED_CAP);
+        let text = super::odf_table_text(&node, &mut expansion, 3).unwrap();
+        assert_eq!(text, "a\tb\n");
+        assert_eq!(text.chars().count(), 4);
+        // Unicode boundaries survive the clip: the retained prefix ends
+        // between characters, never inside a multi-byte sequence.
+        let unicode = table(
+            "<table:table-row>\
+             <table:table-cell><text:p>éàü</text:p></table:table-cell>\
+             <table:table-cell><text:p>ö</text:p></table:table-cell>\
+             </table:table-row>",
+        );
+        let mut expansion = super::ExpansionBudget::new(super::ODF_EXPANDED_CAP);
+        // The cap-plus-one bound retains two of the three accented
+        // characters, cutting inside the first paragraph between characters.
+        let text = super::odf_table_text(&unicode, &mut expansion, 1).unwrap();
+        assert_eq!(text, "éà");
+        assert_eq!(text.chars().count(), 2);
+    }
+
+    /// Checks expansion-budget charging and cap errors survive the rewrite.
+    #[test]
+    fn odf_table_text_keeps_charging_the_budget_and_returning_cap_errors() {
+        let node = table(
+            "<table:table-row>\
+             <table:table-cell><text:p>aaaa</text:p></table:table-cell>\
+             <table:table-cell><text:p>bbbb</text:p></table:table-cell>\
+             <table:table-cell><text:p>cccc</text:p></table:table-cell>\
+             </table:table-row>",
+        );
+        // A 8-byte budget fits exactly two 4-byte paragraphs and rejects the
+        // third with the established document-budget error, even when the
+        // retention bound would already have clipped it away.
+        let mut expansion = super::ExpansionBudget::new(8);
+        let error = super::odf_table_text(&node, &mut expansion, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("document expansion budget"),
+            "{error}"
+        );
+    }
+
+    /// Checks nested tables land once, in place, in document order.
+    #[test]
+    fn odf_table_text_emits_nested_tables_once_in_document_order() {
+        // The outer row sits in a row-group wrapper; the cell holds one
+        // paragraph, a doubly nested table, and a closing paragraph.
+        let node = table(
+            "<table:table-header-rows><table:table-row>\
+             <table:table-cell><text:p>OUTER_FIRST</text:p>\
+             <table:table><table:table-row>\
+             <table:table-cell><text:p>MIDDLE</text:p>\
+             <table:table><table:table-row>\
+             <table:table-cell><text:p>INNERMOST</text:p></table:table-cell>\
+             </table:table-row></table:table>\
+             </table:table-cell>\
+             </table:table-row></table:table>\
+             <text:p>OUTER_LAST</text:p>\
+             </table:table-cell>\
+             </table:table-row></table:table-header-rows>",
+        );
+        let mut expansion = super::ExpansionBudget::new(super::ODF_EXPANDED_CAP);
+        let text = super::odf_table_text(&node, &mut expansion, usize::MAX).unwrap();
+        // The wrapper still yields its row, the nested tables keep their own
+        // row and cell delimiters, and each paragraph appears exactly once in
+        // natural document order instead of once per owning level.
+        assert_eq!(text, "OUTER_FIRST\nMIDDLE\nINNERMOST\nOUTER_LAST");
+        assert_eq!(text.matches("INNERMOST").count(), 1);
+    }
+
+    /// Checks one pass charges nested paragraphs exactly once.
+    #[test]
+    fn odf_table_text_charges_nested_paragraphs_exactly_once() {
+        let node = table(
+            "<table:table-row>\
+             <table:table-cell><text:p>OUTER</text:p>\
+             <table:table><table:table-row>\
+             <table:table-cell><text:p>INNER</text:p></table:table-cell>\
+             </table:table-row></table:table>\
+             </table:table-cell>\
+             </table:table-row>",
+        );
+        // The two paragraphs expand to 10 bytes together. An exact budget
+        // proves a single pass: the boundary-less traversal charged INNER
+        // twice, so this budget failed with a document-budget error.
+        let mut expansion = super::ExpansionBudget::new(10);
+        let text = super::odf_table_text(&node, &mut expansion, usize::MAX).unwrap();
+        assert_eq!(text, "OUTER\nINNER");
+        assert_eq!(expansion.remaining, 0);
+        // One byte short of the single pass still fails with the established
+        // document-budget error, proving the charge is neither duplicated
+        // nor skipped.
+        let mut expansion = super::ExpansionBudget::new(9);
+        let error = super::odf_table_text(&node, &mut expansion, usize::MAX).unwrap_err();
+        assert!(
+            error.to_string().contains("document expansion budget"),
+            "{error}"
+        );
     }
 }

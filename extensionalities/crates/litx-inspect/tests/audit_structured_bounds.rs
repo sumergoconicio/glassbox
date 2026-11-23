@@ -1,6 +1,9 @@
+// Module: glassbox-inspect integration tests.
+// File: audit_structured_bounds.rs.
+// Responsibility: Exercise structured-format amplification bounds without changing reader behavior.
 //! Structured-format amplification bounds from audit LITX-AUD-004/005/006/007/016/018.
 //! All payloads are small synthetic fixtures; budgets are injected or inherently bounded.
-use litx_inspect::{InspectOptions, inspect};
+use glassbox_inspect::{InspectOptions, extract_transitional as inspect};
 use std::{io::Write, path::PathBuf};
 
 fn directory(label: &str) -> PathBuf {

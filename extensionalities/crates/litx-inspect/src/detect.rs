@@ -1,3 +1,7 @@
+//! Module: glassbox-inspect bounded format detection.
+//! File: detect.rs.
+//! Responsibility: Identify file families from extensions and bounded byte prefixes.
+
 use crate::{Format, InspectReport};
 use file_format::FileFormat;
 use std::{fs::File, io::Read, path::Path};
@@ -101,6 +105,51 @@ pub(crate) fn detect(path: &Path, report: &mut InspectReport) -> std::io::Result
     Ok(())
 }
 
+/// Identifies one file for the content-free v2 metadata path.
+///
+/// Accepts a path and lowercase extension hint. Returns format labels from a
+/// bounded 65,536-byte prefix. File open/read failures are returned; no body
+/// parser, OCR engine, or optional statistical fallback is invoked.
+pub(crate) fn identify(
+    path: &Path,
+    extension: &str,
+) -> std::io::Result<crate::reports::FormatIdentity> {
+    let mut prefix = Vec::new();
+    File::open(path)?.take(65_536).read_to_end(&mut prefix)?;
+    let format = FileFormat::from_bytes(&prefix);
+    let detected_ext = format.extension();
+    let detected_bucket = bucket(detected_ext);
+    let ambiguous = detected_bucket == "Other" || matches!(format, FileFormat::PlainText);
+    let chosen_bucket = if ambiguous {
+        bucket(extension)
+    } else {
+        detected_bucket
+    };
+    let alias = |value: &str| {
+        match value {
+            "jpeg" => "jpg",
+            "tiff" => "tif",
+            "sqlite3" | "db" => "sqlite",
+            "htm" => "html",
+            "cbz" => "zip",
+            "cbr" => "rar",
+            other => other,
+        }
+        .to_string()
+    };
+    Ok(crate::reports::FormatIdentity {
+        extension: extension.to_owned(),
+        detected_mime: Some(format.media_type().into()),
+        detected_name: Some(format.name().into()),
+        bucket: chosen_bucket.into(),
+        basis: if ambiguous { "extension" } else { "bytes" }.into(),
+        disagreement: !ambiguous
+            && !extension.is_empty()
+            && alias(extension) != alias(detected_ext)
+            && !extension.starts_with(&format!("tar.{detected_ext}")),
+        detector: "file-format".into(),
+    })
+}
 #[cfg(feature = "magika")]
 fn magika_fallback(prefix: &[u8], report: &mut InspectReport) -> crate::xml::Result<()> {
     let path = std::env::var_os("ORT_DYLIB_PATH")

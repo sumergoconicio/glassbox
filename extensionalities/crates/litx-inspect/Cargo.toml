@@ -1,5 +1,8 @@
 [package]
-name = "litx-inspect"
+# Package: glassbox-inspect native file inspection library.
+# File: Cargo.toml.
+# Responsibility: Declare reader features and the reviewed streamed-hashing dependency.
+name = "glassbox-inspect"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -27,6 +30,7 @@ serde_json = "1"
 thiserror = "2"
 encoding_rs = "0.8"
 crc32fast = "1"
+sha2 = "=0.10.9"
 percent-encoding = "2"
 parquet-format-safe = { version = "=0.2.4", default-features = false }
 csv = "1.4"
