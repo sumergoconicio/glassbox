@@ -61,8 +61,8 @@ pub use crate::layout::{LayoutBlock, LayoutCell};
 pub use crate::markdown_layout::{Block, Cell, PositionedBlock, SpanCell, render_blocks};
 pub use crate::ocr::{EncodedOcrImage, OcrImage, OcrImageFormat, OcrResult};
 pub use crate::ocr_merge::{
-    ComplexityReason, LayoutComplexityReason, LayoutComplexityStats, OcrRaster, OcrRenderOptions,
-    PageComplexityStats, PageOcrOutcome,
+    ComplexityReason, LayoutComplexityReason, LayoutComplexityStats, OcrMergeState, OcrRaster,
+    OcrRenderOptions, PageComplexityStats, PageOcrOutcome,
 };
 pub use crate::parser::ScreenshotResult;
 /// The PDFium handle types the pdfium-bound stages take. Re-exported so a
@@ -293,11 +293,12 @@ impl OcrWindow {
         start: usize,
         options: &OcrRenderOptions,
     ) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
+        // One page per round: recognition of each page starts as soon as it is rendered
+        // instead of after the whole round (the document is reopened per round, which is
+        // cheap next to rendering a page).
         match self.available_capacity() {
             0 => Ok((Vec::new(), start)),
-            capacity => {
-                ocr_merge::render_pages_for_ocr_capped(document, pages, start, options, capacity)
-            }
+            _ => ocr_merge::render_pages_for_ocr_capped(document, pages, start, options, 1),
         }
     }
 
@@ -346,6 +347,7 @@ impl OcrWindow {
 /// text, filter engine artifacts, append the surviving results as `OCR`
 /// text items in viewport points. Errors only when every outcome failed and
 /// one of the failed pages had no usable native text (`ocr_failure_fatal`).
+/// Use [`OcrMergeState`] for incremental merging with one final failure check.
 ///
 /// Pass `LiteParseConfig::effective_emit_word_boxes` for `emit_word_boxes`:
 /// each engine result is one word, so this is the only place the OCR path can
@@ -440,8 +442,8 @@ pub struct BlockOptions<'a> {
     pub outline: &'a [OutlineTarget],
     /// Whether and how figures appear in the block list.
     pub image_mode: ImageMode,
-    /// Disable running-chrome suppression (both the cross-page set in the
-    /// signals and the single-page detector).
+    /// Disable running-chrome suppression (the cross-page set in the signals, the
+    /// single-page detector and the layout model's page header / footer blocks).
     pub keep_headers_footers: bool,
 }
 
@@ -479,7 +481,11 @@ pub fn extract_blocks(
     let chrome_indices = if options.keep_headers_footers {
         HashSet::new()
     } else {
-        markdown_layout::detect_single_page_chrome(page, signals.body_size)
+        // Running chrome on this page alone: the single-page heuristics plus the layout model's
+        // page header / footer blocks (the cross-page repetition set cannot see one-page documents).
+        let mut c = markdown_layout::detect_single_page_chrome(page, signals.body_size);
+        c.extend(markdown_layout::model_furniture_lines(page));
+        c
     };
     let mut blocks = markdown_layout::classify_page_with_filters(
         page,
@@ -767,6 +773,9 @@ mod tests {
             vector_graphics: None,
             figures: vec![],
             projected_item_frames: vec![],
+            model_tables: Vec::new(),
+            model_classes: Vec::new(),
+            model_blocks: Vec::new(),
             struct_nodes: vec![],
             image_refs: vec![],
             complexity: None,
