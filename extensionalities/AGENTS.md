@@ -83,6 +83,7 @@ The migrated inspection/extraction reports are historical evidence linked from a
 User-authorized upstream-file exceptions are the ignore rule and these GitHub-required entry files:
 
 - `../.gitignore`: preserve `/extensionalities/dev/`.
+- `../.github/README.md`: Glassbox GitHub landing page.
 - `../.github/workflows/glassbox-ci.yml`: downstream checks.
 - `../.github/workflows/glassbox-upstream-sync.yml`: checked upstream synchronization.
 
@@ -93,6 +94,9 @@ Publication, live activation, credential installation, and billing changes requi
 
 The pre-automation guide is preserved in [`20261121-AGENTS.before-ci-automation.md`](dev/instruction-history/20261121-AGENTS.before-ci-automation.md).
 Its SHA-256 is `7e7b23fea299cb8df936dfd96f66a87efc3755c0af8e96b74f2a9a646f0d005a`.
+
+The guide before the GitHub landing page is preserved in [`20261123-AGENTS.before-github-readme.md`](dev/instruction-history/20261123-AGENTS.before-github-readme.md).
+Its SHA-256 is `d7da2b7cd13da0d0e235b0c35509294431858658786c6d2bfcfb57372928f266`.
 
 - Check that exact rule after upstream pulls, merges, rebases, or other syncs, and before staging development records.
 - If a sync removes it, restore only that rule while preserving the other upstream ignore entries.

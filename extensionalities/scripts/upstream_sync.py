@@ -24,6 +24,7 @@ REPOSITORY = "sumergoconicio/glassbox"
 GATE = "Glassbox downstream gate"
 WORKFLOW = "Glassbox downstream CI"
 PROTECTED = ("extensionalities", ".github/workflows")
+PROTECTED_FILES = (".github/README.md",)
 IGNORE = b"/extensionalities/dev/"
 COAUTHOR = "Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>"
 
@@ -59,19 +60,48 @@ def tree_entries(root, ref):
 
 
 def protected(path):
-    return any(path == p.encode() or path.startswith(p.encode() + b"/") for p in PROTECTED)
+    """Report whether a Git tree path lies inside a protected directory or file slot.
+
+    Accepts path (bytes): repository-relative Git tree entry path.
+    Returns bool: True when path matches a protected directory, a protected file,
+    or any nested path beneath either slot.
+    Raises TypeError or AttributeError if path is not bytes.
+    """
+    return any(
+        path == p.encode() or path.startswith(p.encode() + b"/")
+        for p in (*PROTECTED, *PROTECTED_FILES)
+    )
 
 
 def plan(root, base, upstream):
-    """Mirror upstream-owned paths; overlay exact downstream and workflow trees."""
+    """Build a verified sync tree mirroring upstream while preserving protected overlays.
+
+    Accepts root (Path): repository root, base (str): base commit ref, and
+    upstream (str): upstream commit ref.
+    Returns dict: resolved commit SHAs, resulting tree SHA, upstream tree SHA,
+    GitHub tree overlay entries, and a boolean changed flag.
+    Raises SyncError or subprocess.TimeoutExpired if refs are invalid, protected
+    paths have wrong Git object types or modes, upstream .github or .gitignore
+    shapes are unsafe, .gitignore is not UTF-8, or protected overlays drift.
+    """
     base = oid(root, base + "^{commit}")
     upstream = oid(root, upstream + "^{commit}")
+    base_entries = tree_entries(root, base)
     overlays = []
     for path in PROTECTED:
         tree = oid(root, f"{base}:{path}")
         if git(root, "cat-file", "-t", tree).strip() != b"tree":
             raise SyncError(f"Protected path must be a directory: {path}")
         overlays.append({"path": path, "mode": "040000", "type": "tree", "sha": tree})
+    for path in PROTECTED_FILES:
+        blob = oid(root, f"{base}:{path}")
+        if git(root, "cat-file", "-t", blob).strip() != b"blob":
+            raise SyncError(f"Protected file must be a regular file: {path}")
+        entry = base_entries.get(path.encode(), b"").split()
+        if len(entry) != 3 or entry[0] not in (b"100644", b"100755") or entry[1] != b"blob":
+            raise SyncError(f"Protected file must be a regular file: {path}")
+        mode = entry[0]
+        overlays.append({"path": path, "mode": mode.decode(), "type": "blob", "sha": blob})
     incoming = tree_entries(root, upstream)
     if b".github" in incoming:
         raise SyncError("Upstream .github is not a directory")
@@ -87,7 +117,7 @@ def plan(root, base, upstream):
         raise SyncError("Upstream .gitignore is not UTF-8") from error
     blob = git(root, "hash-object", "-w", "--stdin", data=content).strip()
     selected = {p: m for p, m in incoming.items() if not protected(p)}
-    selected.update({p: m for p, m in tree_entries(root, base).items() if protected(p)})
+    selected.update({p: m for p, m in base_entries.items() if protected(p)})
     selected[b".gitignore"] = ignore[0] + b" blob " + blob
     scratch = root / "extensionalities/target"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -98,7 +128,7 @@ def plan(root, base, upstream):
     tree = git(root, "write-tree", env=env).decode().strip()
     for overlay in overlays:
         if oid(root, f"{tree}:{overlay['path']}") != overlay["sha"]:
-            raise SyncError("Protected tree changed during planning")
+            raise SyncError("Protected overlay changed during planning")
     overlays.append({
         "path": ".gitignore", "mode": ignore[0].decode(),
         "type": "blob", "content": ignore_text,

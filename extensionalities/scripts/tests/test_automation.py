@@ -48,11 +48,18 @@ def green():
 
 class TreeTests(unittest.TestCase):
     def setUp(self):
+        """Create an isolated synthetic Git repository with base protected trees and files.
+
+        Accepts only self (TreeTests).
+        Returns None after populating self.root, self.files, and self.base.
+        Raises subprocess.CalledProcessError or sync.SyncError if Git fixture creation fails.
+        """
         self.root = Path(tempfile.mkdtemp(prefix="test-sync-", dir=TARGET))
         subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
         self.counter = 0
         self.files = {
             ".gitignore": b"target/\n/extensionalities/dev/\n",
+            ".github/README.md": b"# Glassbox\n",
             ".github/workflows/glassbox-ci.yml": b"ours\n",
             "extensionalities/Cargo.toml": b"[workspace]\n",
             "extensionalities/README.md": b"downstream\n",
@@ -90,14 +97,21 @@ class TreeTests(unittest.TestCase):
         return self.commit(files, self.base)
 
     def test_exact_overlay_including_hostile_protected_changes_and_deletions(self):
+        """Verify sync planning preserves all protected trees and files despite hostile upstream edits.
+
+        Accepts only self (TreeTests).
+        Returns None after asserting exact overlay OIDs, upstream mirroring, and index isolation.
+        Raises AssertionError or sync.SyncError if any protected path is altered or working files change.
+        """
         upstream = self.upstream(**{
+            ".github/README.md": b"must not overwrite landing page\n",
             "extensionalities/README.md": b"must not win\n",
             "extensionalities/new.rs": b"must not be imported\n",
             ".github/workflows/new-upstream.yml": b"must not run\n",
             "new.rs": b"upstream code\n",
         })
         result = sync.plan(self.root, self.base, upstream)
-        for path in sync.PROTECTED:
+        for path in (*sync.PROTECTED, *sync.PROTECTED_FILES):
             self.assertEqual(sync.oid(self.root, f"{result['tree']}:{path}"),
                              sync.oid(self.root, f"{self.base}:{path}"))
         entries = sync.tree_entries(self.root, result["tree"])
@@ -115,13 +129,26 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(result["tree"], sync.oid(self.root, self.base + "^{tree}"))
 
     def test_change_detection_handles_renames_out_of_the_downstream_tree(self):
+        """Verify change detection triggers on moved code manifests and skips documentation-only edits.
+
+        Accepts only self (TreeTests).
+        Returns None after checking rename detection and non-code documentation commits.
+        Raises AssertionError or sync.SyncError if Git fixtures fail or relevance classification regresses.
+        """
         files = dict(self.files)
-        files["docs/moved.md"] = files.pop("extensionalities/README.md")
+        files["docs/moved-Cargo.toml"] = files.pop("extensionalities/Cargo.toml")
         head = self.commit(files, self.base)
         self.assertTrue(ci.needs_checks(self.root, self.base, head))
-        files = {**self.files, "README.md": b"unrelated documentation\n"}
-        head = self.commit(files, self.base)
-        self.assertFalse(ci.needs_checks(self.root, self.base, head))
+        for doc_path in (
+            "README.md",
+            ".github/README.md",
+            "extensionalities/AGENTS.md",
+            "extensionalities/docs/automation.md",
+        ):
+            with self.subTest(doc_path=doc_path):
+                doc_files = {**self.files, doc_path: b"documentation update\n"}
+                doc_head = self.commit(doc_files, self.base)
+                self.assertFalse(ci.needs_checks(self.root, self.base, doc_head))
 
     def test_upstream_protected_root_symlink_cannot_replace_downstream(self):
         files = {p: c for p, c in self.files.items() if not p.startswith("extensionalities/")}
@@ -130,6 +157,37 @@ class TreeTests(unittest.TestCase):
         result = sync.plan(self.root, self.base, upstream)
         self.assertEqual(sync.oid(self.root, result["tree"] + ":extensionalities"),
                          sync.oid(self.root, self.base + ":extensionalities"))
+
+    def test_upstream_protected_file_symlink_or_directory_cannot_replace_downstream(self):
+        """Verify hostile upstream symlinks or directories cannot replace protected files and base symlinks fail.
+
+        Accepts only self (TreeTests).
+        Returns None after testing upstream symlink replacement, nested directory leakage, and base symlink rejection.
+        Raises AssertionError or sync.SyncError if protected file integrity is violated.
+        """
+        with self.subTest(case="upstream-symlink"):
+            files = dict(self.files)
+            files[".github/README.md"] = ("120000", b"/outside")
+            upstream = self.commit(files, self.base)
+            result = sync.plan(self.root, self.base, upstream)
+            self.assertEqual(sync.oid(self.root, result["tree"] + ":.github/README.md"),
+                             sync.oid(self.root, self.base + ":.github/README.md"))
+            entries = sync.tree_entries(self.root, result["tree"])
+            self.assertTrue(entries[b".github/README.md"].startswith(b"100644 blob "))
+        with self.subTest(case="upstream-directory"):
+            files = {p: c for p, c in self.files.items() if p != ".github/README.md"}
+            files[".github/README.md/nested.md"] = b"hostile nested file\n"
+            upstream = self.commit(files, self.base)
+            result = sync.plan(self.root, self.base, upstream)
+            self.assertEqual(sync.oid(self.root, result["tree"] + ":.github/README.md"),
+                             sync.oid(self.root, self.base + ":.github/README.md"))
+            entries = sync.tree_entries(self.root, result["tree"])
+            self.assertNotIn(b".github/README.md/nested.md", entries)
+        with self.subTest(case="base-symlink-rejected"):
+            bad_base_files = {**self.files, ".github/README.md": ("120000", b"/outside")}
+            bad_base = self.commit(bad_base_files)
+            with self.assertRaises(sync.SyncError):
+                sync.plan(self.root, bad_base, self.upstream())
 
     def test_unsafe_ignore_or_github_shape_is_rejected(self):
         for path in [".gitignore", ".github"]:
@@ -142,10 +200,18 @@ class TreeTests(unittest.TestCase):
                     sync.plan(self.root, self.base, upstream)
 
     def test_upstream_deletions_of_protected_trees_are_ignored(self):
+        """Verify upstream deletion of protected trees and files does not remove downstream overlays.
+
+        Accepts only self (TreeTests).
+        Returns None after asserting extensionalities, .github/README.md, and ignore guard survive.
+        Raises AssertionError or sync.SyncError if any protected path is dropped.
+        """
         upstream = self.commit({"README.md": b"upstream only\n"}, self.base)
         result = sync.plan(self.root, self.base, upstream)
         self.assertEqual(sync.oid(self.root, result["tree"] + ":extensionalities"),
                          sync.oid(self.root, self.base + ":extensionalities"))
+        self.assertEqual(sync.oid(self.root, result["tree"] + ":.github/README.md"),
+                         sync.oid(self.root, self.base + ":.github/README.md"))
         self.assertEqual(result["overlays"][-1]["content"], "/extensionalities/dev/\n")
 
     def test_ignore_guard_wins_over_later_upstream_negation(self):
@@ -424,12 +490,38 @@ class ChangesTests(unittest.TestCase):
             self.assertTrue(Path(run.call_args.kwargs["env"][key]).is_relative_to(TARGET))
 
     def test_downstream_and_dependency_paths(self):
-        for path in ["extensionalities/README.md", "extensionalities/Cargo.lock",
-                     "crates/liteparse/src/lib.rs", "crates/pdfium-sys/build.rs",
-                     "Cargo.toml", "Cargo.lock", ".cargo/config.toml",
-                     ".github/workflows/glassbox-ci.yml", "rust-toolchain.toml"]:
+        """Verify ci.relevant selects downstream code, manifests, and workflows while skipping docs.
+
+        Accepts only self (ChangesTests).
+        Returns None after checking representative code, dependency, workflow, and docs paths.
+        Raises AssertionError when any path is misclassified by ci.relevant.
+        """
+        for path in [
+            "extensionalities/crates/litx/src/main.rs",
+            "extensionalities/fixtures/hello.txt",
+            "extensionalities/scripts/ci.py",
+            "extensionalities/Cargo.toml",
+            "extensionalities/Cargo.lock",
+            "crates/liteparse/src/lib.rs",
+            "crates/pdfium-sys/build.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config.toml",
+            ".github/workflows/glassbox-ci.yml",
+            "rust-toolchain.toml",
+        ]:
             self.assertTrue(ci.relevant(path), path)
-        for path in ["README.md", "packages/node/README.md", "docs/index.md"]:
+        for path in [
+            "README.md",
+            ".github/README.md",
+            "extensionalities/AGENTS.md",
+            "extensionalities/README.md",
+            "extensionalities/atlas.json",
+            "extensionalities/docs/automation.md",
+            "extensionalities/.gitignore",
+            "packages/node/README.md",
+            "docs/index.md",
+        ]:
             self.assertFalse(ci.relevant(path), path)
 
     def test_missing_diff_is_fail_safe_and_sync_is_always_checked(self):
