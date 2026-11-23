@@ -34,12 +34,15 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 
 - Before a build or verification campaign, reuse an appropriate Cargo target where isolation rules permit. For a local Glassbox-only build, use `--bin glassbox`. Keep the `litx` target in source for compatibility checks.
 - For isolated runs, record the exact disposable paths under `target/` or `sandbox/` before starting. Keep logs, results, and audit evidence separate from disposable build trees.
-- Check for stale build trees before a new campaign, after a run ends or is cancelled, and whenever disk pressure warrants it. If removal of the exact paths was approved in advance, clean them automatically when no job uses them and required evidence is safe. Otherwise, list the exact paths and obtain approval before removal. No scheduler is required.
-- Before cleanup, confirm the paths are local, inside this workspace, ignored by Git, and free of active users, symlinked path components, and nested mounts. Preserve current release binaries, shared caches in use, fixtures, and audit evidence. Do not infer that an old or ignored path is disposable.
-- Remove only the approved paths. Verify the retained outputs and report the net change in available disk space.
+- Check for stale build trees before a new campaign, after a run ends or stops, and under disk pressure. Sri grants standing approval to clean verified stale Cargo build trees under `target/` without asking again. For other paths, list exact targets and obtain approval before removal. No scheduler is required.
+- Before cleanup, confirm each path is local, inside this workspace, ignored by Git, and free of active builds, symlinked path components, and nested mounts. Preserve current release binaries, shared caches in use, fixtures, and audit evidence. Do not treat arbitrary old or ignored files as stale build trees.
+- Remove only verified stale build trees or separately approved paths. Verify the retained outputs and report the net change in available disk space.
 
 The guide before build cleanup is preserved in [`20261123-AGENTS.before-build-cleanup.md`](dev/instruction-history/20261123-AGENTS.before-build-cleanup.md).
 Its SHA-256 is `8fe3daf15467ac995a4ea451e9e8cfd5f394da820e81dd49ac899ef653191f0e`.
+
+The guide before standing stale-build cleanup is preserved in [`20261123-AGENTS.before-auto-build-cleanup.md`](dev/instruction-history/20261123-AGENTS.before-auto-build-cleanup.md).
+Its SHA-256 is `4e01c9650a7f030c0055e219b3b7de572abbb278581d679c587d1730f3c51d75`.
 
 ## Shared PRD management
 
