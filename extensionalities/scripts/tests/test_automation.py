@@ -1,6 +1,6 @@
 """Module: Glassbox downstream automation tests.
 File: test_automation.py.
-Responsibility: Verify isolated sync, workflow, package-selection, parity, and metadata gates.
+Responsibility: Verify isolated sync, workflow, package-selection, smoke, and automation check gates.
 
 Isolated automation tests. Retain synthetic repositories under ignored target."""
 
@@ -332,21 +332,34 @@ class ChangesTests(unittest.TestCase):
             "-p", "glassbox-cli", "-p", "glassbox-inspect"])
         self.assertNotIn("litx-inspect", arguments)
 
-    def test_full_check_integrates_tracked_parity_metadata_and_extract(self):
-        """Verify the complete local check runs smoke, V-NAME, V-META, and V-SELECT.
+    def test_full_check_runs_automation_tests_rust_checks_and_smoke(self):
+        """Verify the check command runs scoped automation tests, Cargo checks, and smoke.
 
-        Accepts no parameters and mocks native commands and verification drivers.
-        Returns unit after confirming one invocation of each tracked driver.
-        Raises AssertionError when parity, metadata, or extraction is skipped.
+        Accepts only self (ChangesTests) and mocks ci.run and ci.smoke.
+        Returns None after asserting exact command order and no harness references.
+        Raises AssertionError when any required check is missing, misordered, or invokes verify-settling-in.py.
         """
-        with patch.object(ci, "run"), patch.object(ci, "smoke"), patch.object(
-                ci, "parity") as parity, patch.object(
-                ci, "metadata") as metadata, patch.object(ci, "extract") as extract, patch.object(
+        with patch.object(ci, "run") as run, patch.object(ci, "smoke") as smoke, patch.object(
                 sys, "argv", ["ci.py", "check"]):
             ci.main()
-        parity.assert_called_once_with()
-        metadata.assert_called_once_with()
-        extract.assert_called_once_with()
+        commands = [call.args for call in run.call_args_list]
+        self.assertEqual(len(commands), 4)
+        self.assertEqual(
+            commands[0],
+            (
+                "python3", "-B", "-m", "unittest", "discover",
+                "-s", "extensionalities/scripts/tests", "-p", "test_automation.py", "-v",
+            ),
+        )
+        self.assertEqual(commands[1][:2], ("cargo", "clippy"))
+        self.assertEqual(commands[2][:2], ("cargo", "test"))
+        self.assertEqual(commands[3][:4], ("cargo", "build", "--locked", "--release"))
+        for command in commands:
+            self.assertFalse(
+                any("verify-settling-in.py" in arg for arg in command),
+                command,
+            )
+        smoke.assert_called_once_with()
 
     def test_smoke_distinguishes_metadata_inspection_from_canonical_extraction(self):
         """Verify smoke requires v2 inspect reports and content-bearing extract reports.
@@ -426,30 +439,6 @@ class ChangesTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 1, b"", b"missing")
         with patch.object(ci.subprocess, "run", return_value=result):
             self.assertTrue(ci.needs_checks(Path("."), "base", "head"))
-
-
-class CiNetworkTests(unittest.TestCase):
-    def test_driver_invocations_receive_ci_network_only_inside_ci_runners(self):
-        """Verify parity and metadata pass --ci-network exactly in CI environments.
-
-        Accepts no parameters and mocks the driver subprocess boundary.
-        Returns unit after checking the explicit CI-mode network permission
-        appears in the driver argument vector only when the standard CI
-        environment markers are set.
-        Raises AssertionError when a local run gains network permission or a
-        CI run lacks it.
-        """
-        for command in (ci.parity, ci.metadata):
-            for env, expected in (({"CI": "true"}, True),
-                                  ({"GITHUB_ACTIONS": "true"}, True),
-                                  ({"CI": "false", "GITHUB_ACTIONS": "false"}, False)):
-                with patch.object(ci.subprocess, "run") as run, patch.dict(
-                        os.environ, env):
-                    command()
-                argv = run.call_args.args[0]
-                self.assertEqual("--ci-network" in argv, expected,
-                                 f"{command.__name__} env={env} argv={argv}")
-                self.assertIn("extensionalities/scripts/verify-settling-in.py", argv)
 
 
 if __name__ == "__main__":

@@ -124,7 +124,6 @@ Checks cover:
 - Workflow syntax and expressions, using pinned actionlint.
 - Clippy with warnings denied, plus the full downstream workspace tests and the Python automation tests.
 - Release builds and release smoke checks: v2 inspection, extraction, batch requests, and offline OCR failure behavior.
-- Upstream parity and the v2 metadata and extraction driver cases.
 - Linux x64 and ARM64 on standard GitHub-hosted runners.
 
 Upstream dependency changes also trigger downstream checks.
