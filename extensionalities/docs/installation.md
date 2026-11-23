@@ -31,14 +31,16 @@ BUILD_HOME="$PWD/extensionalities/target/build-home-$(uname -m)"
 mkdir -p "$BUILD_HOME"
 env HOME="$BUILD_HOME" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
   XDG_CACHE_HOME="$XDG_CACHE_HOME" CARGO_TARGET_DIR="$PWD/extensionalities/target" \
-  cargo build --locked --release --manifest-path extensionalities/Cargo.toml --workspace --bins
+  cargo build --locked --release --manifest-path extensionalities/Cargo.toml --bin glassbox
 GLASSBOX="$PWD/extensionalities/target/release/glassbox"
 ```
 
 The recipe captures the real cache paths before changing `HOME`.
 It creates the build `HOME` if needed; it never deletes existing caches.
 The build downloads dependencies, including PDFium.
-The resulting executable is `glassbox`.
+This command builds `glassbox` without building the `litx` compatibility executable.
+Reuse the same target directory for local builds on the same platform.
+See [Local build cleanup](automation.md#local-build-cleanup) for isolated verification runs.
 
 This recipe follows the setup used for the current local ARM64 builds.
 A complete fresh-machine installation, with new network downloads and prerequisite installs, has not been validated yet.

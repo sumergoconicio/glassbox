@@ -9,7 +9,7 @@ It builds on [LiteParse](https://github.com/run-llama/liteparse) and adds a loca
 This directory contains the isolated downstream inspection workspace inside the Glassbox fork.
 
 **Development status:** build from source.
-Recent changes still require independent review.
+The settling-in changes passed independent Wave 4 review on Linux ARM64.
 The [user guides](docs/README.md) cover installation through troubleshooting.
 
 ## Quickstart
@@ -27,7 +27,7 @@ BUILD_HOME="$PWD/extensionalities/target/build-home-$(uname -m)"
 mkdir -p "$BUILD_HOME"
 env HOME="$BUILD_HOME" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
   XDG_CACHE_HOME="$XDG_CACHE_HOME" CARGO_TARGET_DIR="$PWD/extensionalities/target" \
-  cargo build --locked --release --manifest-path extensionalities/Cargo.toml --workspace --bins
+  cargo build --locked --release --manifest-path extensionalities/Cargo.toml --bin glassbox
 GLASSBOX="$PWD/extensionalities/target/release/glassbox"
 "$GLASSBOX" inspect extensionalities/fixtures/hello.txt --format text
 ```
@@ -39,6 +39,7 @@ It contains no body text.
 ### Prerequisites
 
 See [Installation](docs/installation.md) for toolchain, OCR data, platform coverage, and verification.
+See [Local build cleanup](docs/automation.md#local-build-cleanup) for disposable test and build outputs.
 
 ## Usage
 

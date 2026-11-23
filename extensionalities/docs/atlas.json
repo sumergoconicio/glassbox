@@ -50,9 +50,9 @@
       },
       "filename": "README.md",
       "url": "./README.md",
-      "sha256": "6dbb859a0a979571734cde0d403570f1f7beffc5705bf75549aca4ad5ce2e19b",
-      "size": 1169,
-      "body_sha256": "6dbb859a0a979571734cde0d403570f1f7beffc5705bf75549aca4ad5ce2e19b",
+      "sha256": "3faf7e6aab7b2ee1e398fa6e1adad38c729961f6e73fb190649c5c616684bccb",
+      "size": 1188,
+      "body_sha256": "3faf7e6aab7b2ee1e398fa6e1adad38c729961f6e73fb190649c5c616684bccb",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -101,9 +101,9 @@
       },
       "filename": "automation.md",
       "url": "./automation.md",
-      "sha256": "fabac10ef566eb50425d01a18764af62bfbb2f39cd8cedf26e60be479df10bb2",
-      "size": 12492,
-      "body_sha256": "3d0df7fda753ef401bddd584380321704579aa15a36c9cc4d1dc2465f8d21014",
+      "sha256": "3e24d1c212bf97be41d53cb1fcb7a28eab9106e85517907da33cc9f6b438eac3",
+      "size": 13303,
+      "body_sha256": "ddc2ba30110fab0a5ac85253f07ef0515f95ede6bbeadba28621b263e6b5d6ff",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -119,7 +119,7 @@
               "anchor": "automation-and-directory-inventories",
               "title": "Automation and directory inventories",
               "start_line": 8,
-              "end_line": 270,
+              "end_line": 283,
               "parent": null
             },
             {
@@ -165,38 +165,45 @@
               "parent": "automation-and-directory-inventories"
             },
             {
+              "anchor": "local-build-cleanup",
+              "title": "Local build cleanup",
+              "start_line": 146,
+              "end_line": 158,
+              "parent": "automation-and-directory-inventories"
+            },
+            {
               "anchor": "branch-and-merge-policy",
               "title": "Branch and merge policy",
-              "start_line": 146,
-              "end_line": 161,
+              "start_line": 159,
+              "end_line": 174,
               "parent": "automation-and-directory-inventories"
             },
             {
               "anchor": "weekly-upstream-synchronization",
               "title": "Weekly upstream synchronization",
-              "start_line": 162,
-              "end_line": 185,
+              "start_line": 175,
+              "end_line": 198,
               "parent": "automation-and-directory-inventories"
             },
             {
               "anchor": "one-time-activation-checklist",
               "title": "One-time activation checklist",
-              "start_line": 186,
-              "end_line": 218,
+              "start_line": 199,
+              "end_line": 231,
               "parent": "automation-and-directory-inventories"
             },
             {
               "anchor": "drive-glassbox-from-python",
               "title": "Drive Glassbox from Python",
-              "start_line": 219,
-              "end_line": 264,
+              "start_line": 232,
+              "end_line": 277,
               "parent": "automation-and-directory-inventories"
             },
             {
               "anchor": "where-to-go-next",
               "title": "Where to go next",
-              "start_line": 265,
-              "end_line": 270,
+              "start_line": 278,
+              "end_line": 283,
               "parent": "automation-and-directory-inventories"
             }
           ],
@@ -650,9 +657,9 @@
       },
       "filename": "installation.md",
       "url": "./installation.md",
-      "sha256": "da4debcd0a868f5a5dfbf482e664a615c21e2c57ac256c5487c6f80805d46619",
-      "size": 3458,
-      "body_sha256": "da4debcd0a868f5a5dfbf482e664a615c21e2c57ac256c5487c6f80805d46619",
+      "sha256": "7289e8c853e4554dd581d2128b1e25629e7e4a5fd1bc8be4022ec83706538bb4",
+      "size": 3663,
+      "body_sha256": "7289e8c853e4554dd581d2128b1e25629e7e4a5fd1bc8be4022ec83706538bb4",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -668,7 +675,7 @@
               "anchor": "installation",
               "title": "Installation",
               "start_line": 1,
-              "end_line": 85,
+              "end_line": 87,
               "parent": null
             },
             {
@@ -682,42 +689,42 @@
               "anchor": "build",
               "title": "Build",
               "start_line": 16,
-              "end_line": 45,
+              "end_line": 47,
               "parent": "installation"
             },
             {
               "anchor": "offline-builds",
               "title": "Offline builds",
-              "start_line": 46,
-              "end_line": 53,
+              "start_line": 48,
+              "end_line": 55,
               "parent": "installation"
             },
             {
               "anchor": "optional-ffmpeg-linking",
               "title": "Optional FFmpeg linking",
-              "start_line": 54,
-              "end_line": 60,
+              "start_line": 56,
+              "end_line": 62,
               "parent": "installation"
             },
             {
               "anchor": "platform-coverage",
               "title": "Platform coverage",
-              "start_line": 61,
-              "end_line": 68,
+              "start_line": 63,
+              "end_line": 70,
               "parent": "installation"
             },
             {
               "anchor": "verify-the-build",
               "title": "Verify the build",
-              "start_line": 69,
-              "end_line": 80,
+              "start_line": 71,
+              "end_line": 82,
               "parent": "installation"
             },
             {
               "anchor": "distribution",
               "title": "Distribution",
-              "start_line": 81,
-              "end_line": 85,
+              "start_line": 83,
+              "end_line": 87,
               "parent": "installation"
             }
           ],

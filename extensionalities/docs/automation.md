@@ -143,6 +143,19 @@ python3 -B extensionalities/scripts/ci.py workflows
 Workflow validation additionally requires Go 1.24+ and access to public Go modules.
 The workflow checks do not run upstream workflow files.
 
+## Local build cleanup
+
+Use the [local build recipe](installation.md#build) when you only need `glassbox`.
+The full verification workflow still builds `litx` to check compatibility.
+Upstream parity compares Glassbox commands with LiteParse's `lit`.
+
+Parity runs create isolated Cargo build trees. Keep their logs and results separate from the build trees.
+Before starting a run, record the exact disposable paths and get approval to remove them after the run.
+Check for stale paths before a campaign, after a run ends or is cancelled, and when disk space is low.
+Clean approved paths after their jobs exit. For other paths, get approval before removal.
+Keep the current release, shared caches in use, fixtures, and audit evidence.
+See the [agent guide](../AGENTS.md#local-build-cleanup) for the safety checks.
+
 ## Branch and merge policy
 
 Develop and audit changes locally on a feature branch.

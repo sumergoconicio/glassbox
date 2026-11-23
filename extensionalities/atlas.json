@@ -43,9 +43,9 @@
         "structure",
         "adds",
         "workspace",
-        "require",
-        "cloud",
-        "builds"
+        "wave",
+        "passed",
+        "cloud"
       ],
       "domains": [],
       "systems": [],
@@ -54,9 +54,9 @@
       },
       "filename": "README.md",
       "url": "./README.md",
-      "sha256": "e6393509ce26434cd7bca964c26d2cc5b55cf7236985ead7621a54ab6eb51cfd",
-      "size": 4907,
-      "body_sha256": "e6393509ce26434cd7bca964c26d2cc5b55cf7236985ead7621a54ab6eb51cfd",
+      "sha256": "a8b581a1773da8213f158d37992d72607a42fcc0a8c632fa69e656c7d81dc296",
+      "size": 5032,
+      "body_sha256": "a8b581a1773da8213f158d37992d72607a42fcc0a8c632fa69e656c7d81dc296",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -72,126 +72,126 @@
               "anchor": "glassbox",
               "title": "Glassbox",
               "start_line": 1,
-              "end_line": 117,
+              "end_line": 118,
               "parent": null
             },
             {
               "anchor": "quickstart",
               "title": "Quickstart",
               "start_line": 15,
-              "end_line": 42,
+              "end_line": 43,
               "parent": "glassbox"
             },
             {
               "anchor": "prerequisites",
               "title": "Prerequisites",
               "start_line": 39,
-              "end_line": 42,
+              "end_line": 43,
               "parent": "quickstart"
             },
             {
               "anchor": "usage",
               "title": "Usage",
-              "start_line": 43,
-              "end_line": 65,
+              "start_line": 44,
+              "end_line": 66,
               "parent": "glassbox"
             },
             {
               "anchor": "inspect-before-extracting",
               "title": "inspect-before-extracting",
-              "start_line": 59,
-              "end_line": 59,
-              "parent": "usage"
-            },
-            {
-              "anchor": "extract-document-content",
-              "title": "extract-document-content",
               "start_line": 60,
               "end_line": 60,
               "parent": "usage"
             },
             {
-              "anchor": "preview-data",
-              "title": "preview-data",
+              "anchor": "extract-document-content",
+              "title": "extract-document-content",
               "start_line": 61,
               "end_line": 61,
               "parent": "usage"
             },
             {
-              "anchor": "save-markdown-and-json",
-              "title": "save-markdown-and-json",
+              "anchor": "preview-data",
+              "title": "preview-data",
               "start_line": 62,
               "end_line": 62,
               "parent": "usage"
             },
             {
-              "anchor": "process-json-lines",
-              "title": "process-json-lines",
+              "anchor": "save-markdown-and-json",
+              "title": "save-markdown-and-json",
               "start_line": 63,
               "end_line": 63,
               "parent": "usage"
             },
             {
-              "anchor": "read-completeness-and-provenance",
-              "title": "read-completeness-and-provenance",
+              "anchor": "process-json-lines",
+              "title": "process-json-lines",
               "start_line": 64,
               "end_line": 64,
               "parent": "usage"
             },
             {
+              "anchor": "read-completeness-and-provenance",
+              "title": "read-completeness-and-provenance",
+              "start_line": 65,
+              "end_line": 65,
+              "parent": "usage"
+            },
+            {
               "anchor": "format-support-and-limits",
               "title": "Format support and limits",
-              "start_line": 66,
-              "end_line": 100,
+              "start_line": 67,
+              "end_line": 101,
               "parent": "glassbox"
             },
             {
               "anchor": "development-checks",
               "title": "Development checks",
-              "start_line": 73,
-              "end_line": 84,
+              "start_line": 74,
+              "end_line": 85,
               "parent": "format-support-and-limits"
             },
             {
               "anchor": "downstream-continuous-integration",
               "title": "Downstream continuous integration",
-              "start_line": 85,
-              "end_line": 88,
+              "start_line": 86,
+              "end_line": 89,
               "parent": "format-support-and-limits"
             },
             {
               "anchor": "branch-and-merge-policy",
               "title": "Branch and merge policy",
-              "start_line": 89,
-              "end_line": 92,
+              "start_line": 90,
+              "end_line": 93,
               "parent": "format-support-and-limits"
             },
             {
               "anchor": "weekly-upstream-synchronization",
               "title": "Weekly upstream synchronization",
-              "start_line": 93,
-              "end_line": 96,
+              "start_line": 94,
+              "end_line": 97,
               "parent": "format-support-and-limits"
             },
             {
               "anchor": "activation-checklist",
               "title": "Activation checklist",
-              "start_line": 97,
-              "end_line": 100,
+              "start_line": 98,
+              "end_line": 101,
               "parent": "format-support-and-limits"
             },
             {
               "anchor": "docs-and-support",
               "title": "Docs and support",
-              "start_line": 101,
-              "end_line": 111,
+              "start_line": 102,
+              "end_line": 112,
               "parent": "glassbox"
             },
             {
               "anchor": "license-and-attribution",
               "title": "License and attribution",
-              "start_line": 112,
-              "end_line": 117,
+              "start_line": 113,
+              "end_line": 118,
               "parent": "glassbox"
             }
           ],
@@ -206,7 +206,7 @@
       "schema": "chai.docs-atlas/v1",
       "native_index": "target/documentation/settling-in/docs-index.json",
       "native_navigation": "target/documentation/settling-in/index.md",
-      "snapshot": "c0cf202f7fa32fe23bf0ba84f2340ae11aeb0672053eb9801fcfea0fa9bba256",
+      "snapshot": "aee454ade9be0b5bb95b3e846d7ce44fd07b295059c791a077406a01b9924ed1",
       "include": [
         "README.md",
         "docs"

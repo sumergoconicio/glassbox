@@ -10,7 +10,7 @@ The `--help` output of your installed build is authoritative for that build.
 - [Metadata inspection](inspect.md) — metadata-only reports, thumbnails, directory inventories.
 - [Content extraction](extract.md) — native-unit selection, OCR, saved artifacts.
 - [Formats and limits](formats.md) — per-format behavior and safety boundaries.
-- [Automation and directory inventories](automation.md) — batch JSONL, jobs, saved artifacts, CI, upstream sync.
+- [Automation and directory inventories](automation.md) — batch JSONL, saved artifacts, CI, upstream sync, and local build cleanup.
 - [Reports and programmatic use](reports.md) — v2 report schema, exit statuses, provenance fields.
 - [OCR and troubleshooting](ocr-and-troubleshooting.md) — language data, OCR behavior, failure modes.
 

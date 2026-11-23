@@ -30,6 +30,17 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 - Preserve historical reports and their approvals, limitations, verification claims, and receipts. Moving a report does not make its historical checks current or grant audit clearance.
 - Before editing this guide, preserve a dated recoverable original under `dev/instruction-history/` and record its SHA-256. Prior versions: [`20261118-AGENTS.before-prd-routing.md`](dev/instruction-history/20261118-AGENTS.before-prd-routing.md) (`7aec3d6677b48b1ce0e00eea2deb7b3ccd19d5e46fe448f05b0f42f61a89dc56`) and [`20261118-AGENTS.before-downstream-seam.md`](dev/instruction-history/20261118-AGENTS.before-downstream-seam.md) (`8adb95c42350b17cf232029b377d8b1cf7f901c15f04dd603f92f83c0d310e27`).
 
+## Local build cleanup
+
+- Before a build or verification campaign, reuse an appropriate Cargo target where isolation rules permit. For a local Glassbox-only build, use `--bin glassbox`. Keep the `litx` target in source for compatibility checks.
+- For isolated runs, record the exact disposable paths under `target/` or `sandbox/` before starting. Keep logs, results, and audit evidence separate from disposable build trees.
+- Check for stale build trees before a new campaign, after a run ends or is cancelled, and whenever disk pressure warrants it. If removal of the exact paths was approved in advance, clean them automatically when no job uses them and required evidence is safe. Otherwise, list the exact paths and obtain approval before removal. No scheduler is required.
+- Before cleanup, confirm the paths are local, inside this workspace, ignored by Git, and free of active users, symlinked path components, and nested mounts. Preserve current release binaries, shared caches in use, fixtures, and audit evidence. Do not infer that an old or ignored path is disposable.
+- Remove only the approved paths. Verify the retained outputs and report the net change in available disk space.
+
+The guide before build cleanup is preserved in [`20261123-AGENTS.before-build-cleanup.md`](dev/instruction-history/20261123-AGENTS.before-build-cleanup.md).
+Its SHA-256 is `8fe3daf15467ac995a4ea451e9e8cfd5f394da820e81dd49ac899ef653191f0e`.
+
 ## Shared PRD management
 
 The pre-branding guide is preserved in [`20261119-AGENTS.before-glassbox-branding.md`](dev/instruction-history/20261119-AGENTS.before-glassbox-branding.md).
