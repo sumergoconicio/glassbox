@@ -23,9 +23,29 @@ MANIFEST = "extensionalities/Cargo.toml"
 
 
 def relevant(path):
+    """Determine whether a changed repository path requires downstream CI checks.
+
+    Accepts path (str): repository-relative POSIX path reported by Git diff.
+    Returns bool: True when the path affects downstream Rust crates, fixtures,
+    automation scripts, Cargo or toolchain configuration, or Glassbox workflows;
+    False for documentation-only or unrelated files.
+    Raises AttributeError or TypeError if path is not a str.
+    """
     return (
-        path.startswith(("extensionalities/", "crates/", ".cargo/"))
-        or path in {"Cargo.toml", "Cargo.lock"}
+        path.startswith((
+            "extensionalities/crates/",
+            "extensionalities/fixtures/",
+            "extensionalities/scripts/",
+            "extensionalities/.cargo/",
+            "crates/",
+            ".cargo/",
+        ))
+        or path in {
+            "extensionalities/Cargo.toml",
+            "extensionalities/Cargo.lock",
+            "Cargo.toml",
+            "Cargo.lock",
+        }
         or path.startswith("rust-toolchain")
         or path.startswith(".github/workflows/glassbox-")
     )
