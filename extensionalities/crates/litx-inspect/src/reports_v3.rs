@@ -981,12 +981,10 @@ fn parse_pdf_timezone(tz: &[u8]) -> Option<String> {
     ) {
         return Some("Z".to_owned());
     }
-    let (sign, rest) = if let Some(stripped) = tz.strip_prefix(b"+") {
-        ('+', stripped)
-    } else if let Some(stripped) = tz.strip_prefix(b"-") {
-        ('-', stripped)
-    } else {
-        return None;
+    let (sign, rest) = match tz.split_first()? {
+        (b'+', rest) => ('+', rest),
+        (b'-', rest) => ('-', rest),
+        _ => return None,
     };
     let rest = rest.strip_suffix(b"'").unwrap_or(rest);
     let (tz_h, tz_m) = match rest.len() {
@@ -1084,12 +1082,10 @@ fn parse_iso_timezone(tz: &[u8]) -> Option<String> {
     if tz.is_empty() || matches!(tz, b"Z" | b"z") {
         return Some("Z".to_owned());
     }
-    let (sign, rest) = if let Some(stripped) = tz.strip_prefix(b"+") {
-        ('+', stripped)
-    } else if let Some(stripped) = tz.strip_prefix(b"-") {
-        ('-', stripped)
-    } else {
-        return None;
+    let (sign, rest) = match tz.split_first()? {
+        (b'+', rest) => ('+', rest),
+        (b'-', rest) => ('-', rest),
+        _ => return None,
     };
     let (tz_h, tz_m) = match rest.len() {
         2 => (parse_ascii_digits(rest)?, 0),
