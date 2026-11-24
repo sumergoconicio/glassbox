@@ -28,6 +28,7 @@ DOWNLOAD_CHUNK_BYTES = 64 * 1024
 TESSDATA_SHA256: dict[str, str] = {}
 LANG_CODE_RE = re.compile(r"[a-z]{3}(?:_[A-Za-z]+)*")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_VALUE_FLAGS = frozenset({"--receipt", "--tessdata-dir", "--tess-lang", "--tess-sha256"})
 
 
 @dataclass(frozen=True)
@@ -397,6 +398,43 @@ def plan(helper, system):
     return Step(helper, "Install using the system package manager", (command,))
 
 
+def _split_run_args(raw_argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Split CLI arguments at the ``--run`` option and extract the trailing command.
+
+    Walks ``raw_argv`` while skipping values consumed by value-taking flags
+    (``--receipt``, ``--tessdata-dir``, ``--tess-lang``, ``--tess-sha256``),
+    stops scanning if a bare ``--`` appears before ``--run``, and strips at
+    most one leading ``--`` separator immediately after ``--run``.
+
+    Args:
+        raw_argv: Sequence of raw CLI argument strings without the program name.
+
+    Returns:
+        A ``(before, run_command)`` tuple where ``before`` contains tokens
+        preceding ``--run`` and ``run_command`` is the command token list (or
+        ``None`` when ``--run`` was not provided as an option).
+
+    Raises:
+        None.
+    """
+    index = 0
+    while index < len(raw_argv):
+        token = raw_argv[index]
+        if token == "--":
+            break
+        if token in _VALUE_FLAGS:
+            index += 2
+            continue
+        if token == "--run":
+            before = raw_argv[:index]
+            after = raw_argv[index + 1:]
+            if after and after[0] == "--":
+                after = after[1:]
+            return before, after
+        index += 1
+    return raw_argv, None
+
+
 def main(argv=None):
     """Parse CLI options, preview or apply helper installs, or run with saved helpers.
 
@@ -423,12 +461,22 @@ def main(argv=None):
     parser.add_argument("--tess-sha256", action="append", default=[], metavar="CODE=HEX",
                         help="Expected SHA-256 hex digest for a downloaded language pack. Repeat per language")
     parser.add_argument("--run", nargs=argparse.REMAINDER, help="Launch a command with the saved helper environment")
-    args = parser.parse_args(argv)
-    receipt = reject_symlinks(args.receipt)
-    if args.run is not None:
-        if not args.run or args.helpers or args.apply or args.tess_lang or args.tess_sha256:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    before, run_command = _split_run_args(raw_argv)
+    args = parser.parse_args(before)
+    if run_command is not None:
+        if (
+            not run_command
+            or args.helpers
+            or args.apply
+            or args.tess_lang
+            or args.tess_sha256
+            or args.tessdata_dir
+        ):
             parser.error("--run needs a command and cannot be combined with installation")
-        return run_with_helpers(receipt, args.run)
+        receipt = reject_symlinks(args.receipt)
+        return run_with_helpers(receipt, run_command)
+    receipt = reject_symlinks(args.receipt)
     if not (args.helpers or args.tess_lang):
         parser.error("select a helper or pass --tess-lang CODE")
     if any(not LANG_CODE_RE.fullmatch(code) for code in args.tess_lang):
@@ -466,16 +514,24 @@ def main(argv=None):
         fetch_language(tessdata, code, expected_sha256=sha256_overrides.get(code))
     if record:
         settings = read_receipt(receipt) if (receipt.exists() or receipt.is_symlink()) else {}
+        missing_office = False
+        updated = False
         if "libreoffice" in args.helpers:
             office = find_libreoffice(system)
             if office is None:
                 print("LibreOffice was not found after setup.", file=sys.stderr)
-                return 1
-            settings["libreoffice"] = office
-            print(f"LibreOffice executable: {office}")
+                missing_office = True
+            else:
+                settings["libreoffice"] = office
+                updated = True
+                print(f"LibreOffice executable: {office}")
         if languages:
             settings.update(tessdata=str(tessdata), tessdata_revision=TESSDATA_REVISION)
-        atomic_write(receipt, (json.dumps(settings, indent=2) + "\n").encode())
+            updated = True
+        if updated:
+            atomic_write(receipt, (json.dumps(settings, indent=2) + "\n").encode())
+        if missing_office:
+            return 1
     manual = [step.helper for step in steps if step.action.startswith("Manual action required")]
     if manual:
         print(f"Manual setup still required for {', '.join(manual)}.")

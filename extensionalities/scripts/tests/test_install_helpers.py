@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import importlib.util
@@ -686,6 +687,201 @@ class ReceiptValidationAndEnvTests(unittest.TestCase):
             self.assertFalse(captured_envs[1]["PATH"].endswith(os.pathsep))
             self.assertEqual(captured_envs[2]["PATH"], f"{bin_dir}{os.pathsep}/usr/bin")
             self.assertEqual(captured_envs[0]["TESSDATA_PREFIX"], str(tessdata))
+
+
+class RunArgumentAndPartialReceiptTests(unittest.TestCase):
+    """Verify ISS-T5-02-01 ``--run --`` parsing and ISS-T5-02-02 partial receipt persistence."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Load the module under test once for this test case.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            RuntimeError: If loading ``install-helpers.py`` fails.
+        """
+        cls.mod = load_install_helpers()
+
+    def test_run_accepts_double_dash_separator_and_bare_command(self):
+        """Confirm ``--run --`` strips one leading separator and ``--run <cmd>`` stays compatible.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If ``run_with_helpers`` receives the wrong receipt or command tokens.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "helpers.json"
+            calls: list[tuple[Path, list[str]]] = []
+
+            def fake_run(path: Path, command: list[str]) -> int:
+                calls.append((path, list(command)))
+                return 0
+
+            with mock.patch.object(self.mod, "run_with_helpers", side_effect=fake_run):
+                self.assertEqual(self.mod.main(["--run", "--", "echo", "hi"]), 0)
+                self.assertEqual(
+                    self.mod.main(["--receipt", str(receipt), "--run", "--", "echo", "--flag"]),
+                    0,
+                )
+                self.assertEqual(self.mod.main(["--run", "echo", "hi"]), 0)
+                self.assertEqual(self.mod.main(["--run", "--", "--flag"]), 0)
+                self.assertEqual(self.mod.main(["--run", "--", "--", "--flag"]), 0)
+
+            self.assertEqual(calls[0][1], ["echo", "hi"])
+            self.assertEqual(calls[1], (receipt, ["echo", "--flag"]))
+            self.assertEqual(calls[2][1], ["echo", "hi"])
+            self.assertEqual(calls[3][1], ["--flag"])
+            self.assertEqual(calls[4][1], ["--", "--flag"])
+
+    def test_split_run_args_skips_flag_values_and_stops_at_bare_double_dash(self):
+        """Confirm ``_split_run_args`` ignores ``--run`` as a flag value or after a bare ``--``.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If ``_split_run_args`` misclassifies ``--run`` tokens.
+        """
+        before, cmd = self.mod._split_run_args(["--receipt", "--run", "--run", "--", "echo", "ok"])
+        self.assertEqual(before, ["--receipt", "--run"])
+        self.assertEqual(cmd, ["echo", "ok"])
+
+        raw = ["--", "--run", "echo", "hi"]
+        self.assertEqual(self.mod._split_run_args(raw), (raw, None))
+
+    def test_run_rejects_empty_command_and_install_flag_combinations(self):
+        """Confirm empty ``--run --`` and install option combinations exit with status 2.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If invalid ``--run`` invocations do not fail with argparse exit code 2.
+        """
+        invalid_invocations = [
+            ["--run", "--"],
+            ["--run"],
+            ["--tessdata-dir", "/tmp", "--run", "--", "echo", "hi"],
+            ["--apply", "--run", "--", "echo", "hi"],
+            ["libreoffice", "--run", "--", "echo", "hi"],
+            ["--tess-lang", "ara", "--run", "--", "echo", "hi"],
+            ["--tess-sha256", f"ara={'a' * 64}", "--run", "--", "echo", "hi"],
+            ["--", "--run", "echo", "hi"],
+        ]
+        for argv in invalid_invocations:
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.mod.main(argv)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_partial_receipt_persists_tessdata_when_libreoffice_missing_after_setup(self):
+        """Confirm completed tessdata settings persist when co-requested LibreOffice is missing.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If tessdata settings are dropped, existing keys are lost,
+                stderr omits the LibreOffice error, or ``main`` does not return 1.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipt = root / "helpers.json"
+            receipt.write_text(json.dumps({"existing": "keep"}) + "\n", encoding="utf-8")
+            tessdata = root / "tessdata"
+            fetched: list[tuple[Path, str, str | None]] = []
+
+            def fake_fetch(directory: Path, language: str, expected_sha256=None, opener=None):
+                fetched.append((directory, language, expected_sha256))
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / f"{language}.traineddata").write_bytes(b"pack")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "find_libreoffice", return_value=None),
+                mock.patch.object(self.mod, "package_command", return_value=("echo", "install")),
+                mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                mock.patch.object(self.mod, "fetch_language", side_effect=fake_fetch),
+                mock.patch.object(self.mod.sys.stdin, "isatty", return_value=True),
+                mock.patch("builtins.input", return_value="yes"),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = self.mod.main([
+                    "libreoffice",
+                    "--receipt", str(receipt),
+                    "--tessdata-dir", str(tessdata),
+                    "--tess-lang", "ara",
+                    "--tess-sha256", f"eng={'1' * 64}",
+                    "--tess-sha256", f"ara={'2' * 64}",
+                    "--apply",
+                ])
+
+            self.assertEqual(rc, 1)
+            self.assertIn("LibreOffice was not found after setup.", stderr.getvalue())
+            self.assertEqual([lang for _, lang, _ in fetched], ["eng", "ara"])
+            saved = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved,
+                {
+                    "existing": "keep",
+                    "tessdata": str(tessdata),
+                    "tessdata_revision": self.mod.TESSDATA_REVISION,
+                },
+            )
+
+    def test_libreoffice_only_missing_after_setup_writes_no_receipt(self):
+        """Confirm requesting only LibreOffice writes no receipt when it is missing after setup.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If a spurious receipt is created or ``main`` does not return 1.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "helpers.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "find_libreoffice", return_value=None),
+                mock.patch.object(self.mod, "package_command", return_value=("echo", "install")),
+                mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                mock.patch.object(self.mod.sys.stdin, "isatty", return_value=True),
+                mock.patch("builtins.input", return_value="yes"),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = self.mod.main(["libreoffice", "--receipt", str(receipt), "--apply"])
+
+            self.assertEqual(rc, 1)
+            self.assertIn("LibreOffice was not found after setup.", stderr.getvalue())
+            self.assertFalse(receipt.exists())
 
 
 if __name__ == "__main__":
