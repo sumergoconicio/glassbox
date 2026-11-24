@@ -1,12 +1,13 @@
 // Module: glassbox-cli unified executable.
 // File: main.rs.
-// Responsibility: Route upstream parsing, metadata-only inspection, and canonical native-unit extraction.
+// Responsibility: Route upstream parsing, schema v3 metadata-only inspection, and canonical native-unit extraction.
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use glassbox_inspect::hashing::HashPolicy;
 use glassbox_inspect::reports::{
     ExtractOptions, ExtractReport, InspectOptions, MetadataReport, NativeSelection,
     OperationStatus, SessionBudget, ThumbnailOptions,
 };
-use glassbox_inspect::{Inspector, extract, inspect};
+use glassbox_inspect::{Inspector, extract_with_policy, inspect_with_policy};
 use liteparse::LiteParseConfig;
 use serde_json::Value;
 use std::io::{BufRead, Read, Write};
@@ -45,7 +46,7 @@ enum Commands {
     Parse,
     /// Inspect file identity, properties, and native structure without body extraction or OCR.
     Inspect(MetadataArgs),
-    /// Extract all or selected native units through the canonical v2 adapter.
+    /// Extract all or selected native units into schema v3 reports or bodymatter:v1 Markdown.
     Extract(ExtractArgs),
     /// Print the upstream library's default configuration as JSON.
     Defaults,
@@ -65,7 +66,7 @@ struct MetadataArgs {
     /// Read one {"id":...,"path":"..."} JSON request per stdin line.
     #[arg(long, conflicts_with_all = ["pretty", "thumbnail", "format"])]
     batch: bool,
-    /// Save a content-free summary and v2 JSON report per document, without overwriting.
+    /// Save a content-free v3 summary and v3 JSON report per document, without overwriting.
     #[arg(long)]
     output_dir: Option<PathBuf>,
     /// Recurse into same-mount real subdirectories; links and other mounts are skipped.
@@ -87,6 +88,12 @@ struct MetadataArgs {
     format: Format,
     #[arg(long)]
     pretty: bool,
+    /// Stream a full SHA-256 digest even for files above the default sampled-fingerprint threshold.
+    #[arg(long)]
+    full_hash: bool,
+    /// Include reader provenance details in v3 JSON and summary outputs.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -96,7 +103,7 @@ struct ExtractArgs {
     /// Read one {"id":...,"path":"..."} JSON request per stdin line.
     #[arg(long, conflicts_with_all = ["pretty", "thumbnail", "format"])]
     batch: bool,
-    /// Save Markdown content and a v2 JSON report per document, without overwriting.
+    /// Save Markdown content and a v3 JSON report per document, without overwriting.
     #[arg(long)]
     output_dir: Option<PathBuf>,
     /// Maximum simultaneous files from 1 to 32, including recognition inside each file lease.
@@ -139,16 +146,26 @@ struct ExtractArgs {
     probe_ocr: bool,
     #[arg(long)]
     pretty: bool,
+    /// Stream a full SHA-256 digest even for files above the default sampled-fingerprint threshold.
+    #[arg(long)]
+    full_hash: bool,
+    /// Include reader and extraction provenance details in v3 JSON reports.
+    #[arg(long)]
+    verbose: bool,
+    /// Omit `bodymatter:v1` structure comment markers from Markdown stdout and saved `.md` artifacts.
+    #[arg(long)]
+    no_markers: bool,
 }
 
-/// Rejects legacy content controls on inspect before Clap's generic error path.
+/// Finds the first extraction-only content flag passed to `inspect` before `--`.
 ///
-/// Accepts the process argument vector. Returns unit for valid or non-inspect
-/// routes. Legacy content flags print explicit extract migration advice and
-/// terminate with exit 64; no file is opened and no inspection session starts.
-fn reject_inspect_content_flags(args: &[std::ffi::OsString]) {
+/// Accepts the process argument vector. Returns `Some(flag)` when `args[1]` is
+/// `"inspect"` and an extraction-only flag appears before any `"--"` option
+/// terminator; returns `None` for non-inspect routes, valid inspect flags, or
+/// literal paths placed after `"--"`. Performs no I/O and cannot panic.
+fn find_disallowed_inspect_flag(args: &[std::ffi::OsString]) -> Option<String> {
     if args.get(1).is_none_or(|argument| argument != "inspect") {
-        return;
+        return None;
     }
     const FLAGS: &[&str] = &[
         "--identify",
@@ -159,19 +176,37 @@ fn reject_inspect_content_flags(args: &[std::ffi::OsString]) {
         "--no-ocr",
         "--ocr-language",
         "--packet",
+        "--no-markers",
     ];
     for argument in args.iter().skip(2) {
+        if argument == "--" {
+            break;
+        }
         let argument = argument.to_string_lossy();
         if FLAGS
             .iter()
             .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")))
         {
-            eprintln!(
-                "error: `{argument}` belongs to content extraction, not metadata inspection.\n\
-                 Use `glassbox extract PATH {argument}` (or `litx extract ...`) for bounded body/OCR extraction."
-            );
-            std::process::exit(64);
+            return Some(argument.into_owned());
         }
+    }
+    None
+}
+
+/// Rejects extraction-only content controls on inspect before Clap's generic error path.
+///
+/// Accepts the process argument vector. Returns unit for valid or non-inspect
+/// routes and stops scanning at the `--` option terminator so literal file names
+/// after `--` pass through to Clap as positional paths. Extraction-only flags
+/// before `--` print explicit extract migration advice and terminate with exit
+/// 64; no file is opened and no inspection session starts.
+fn reject_inspect_content_flags(args: &[std::ffi::OsString]) {
+    if let Some(argument) = find_disallowed_inspect_flag(args) {
+        eprintln!(
+            "error: `{argument}` belongs to content extraction, not metadata inspection.\n\
+             Use `glassbox extract PATH {argument}` (or `litx extract ...`) for bounded body/OCR extraction."
+        );
+        std::process::exit(64);
     }
 }
 
@@ -221,7 +256,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(directory) = args.output_dir.as_deref() {
                     initialize_output_directory(directory);
                 }
-                let outcome = run_metadata_batch(&options, args.output_dir.as_deref(), args.jobs)?;
+                let outcome = run_metadata_batch(
+                    &options,
+                    args.output_dir.as_deref(),
+                    args.jobs,
+                    args.full_hash,
+                    args.verbose,
+                )?;
                 finish_batch(outcome)?;
             } else {
                 let path = args.path.as_ref().unwrap();
@@ -265,6 +306,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.recursive,
                         args.jobs,
                         args.output_dir.as_deref(),
+                        args.full_hash,
+                        args.verbose,
                         &mut output,
                     )?;
                     finish_inspect(status)?;
@@ -273,11 +316,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("error: --recursive requires a directory inspection path");
                         std::process::exit(64);
                     }
-                    let mut report = inspect(path, &options);
+                    let mut report =
+                        inspect_with_policy(path, &options, hash_policy(args.full_hash));
                     if let Some(directory) = args.output_dir {
-                        output::persist_metadata(&mut report, &directory, 1);
+                        output::persist_metadata(&mut report, &directory, 1, args.verbose);
                     }
-                    print_metadata(&report, args.format, args.pretty)?;
+                    print_metadata(&report, args.format, args.pretty, args.verbose)?;
                     finish_inspect(report.metadata.status)?;
                 }
             }
@@ -291,19 +335,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(64);
                 }
             };
+            let include_markers = !args.no_markers;
             if args.batch {
                 if let Some(directory) = args.output_dir.as_deref() {
                     initialize_output_directory(directory);
                 }
-                let outcome = run_extract_batch(&options, args.output_dir.as_deref(), args.jobs)?;
+                let outcome = run_extract_batch(
+                    &options,
+                    args.output_dir.as_deref(),
+                    args.jobs,
+                    args.full_hash,
+                    args.verbose,
+                    include_markers,
+                )?;
                 finish_batch(outcome)?;
             } else {
-                let mut report = extract(args.path.as_ref().unwrap(), &options);
+                let mut report = extract_with_policy(
+                    args.path.as_ref().unwrap(),
+                    &options,
+                    hash_policy(args.full_hash),
+                );
                 if let Some(directory) = args.output_dir {
-                    output::persist_extract(&mut report, &directory, 1);
+                    output::persist_extract(
+                        &mut report,
+                        &directory,
+                        1,
+                        args.verbose,
+                        include_markers,
+                    );
                 }
-                print_extract(&report, args.format, args.pretty)?;
-                finish_inspect(report.metadata.status)?;
+                print_extract(
+                    &report,
+                    args.format,
+                    args.pretty,
+                    args.verbose,
+                    include_markers,
+                )?;
+                finish_inspect(report.extraction_status())?;
             }
         }
         Commands::Defaults => {
@@ -388,7 +456,7 @@ fn extraction_options(args: &ExtractArgs) -> Result<ExtractOptions, String> {
     };
     if args.packet {
         eprintln!(
-            "warning: --packet is deprecated; v2 content.units carries the extracted payload"
+            "warning: --packet is deprecated; v3 content.units carries the extracted payload"
         );
     }
     Ok(ExtractOptions {
@@ -409,42 +477,72 @@ fn extraction_options(args: &ExtractArgs) -> Result<ExtractOptions, String> {
     })
 }
 
-/// Prints selected content or its canonical v2 JSON report.
+/// Maps the CLI `--full-hash` flag to the library [`HashPolicy`].
 ///
-/// Accepts an extraction report, output format, and JSON pretty flag. Returns
-/// unit after stdout output. Serialization and stdout failures are returned;
-/// text and Markdown include only selected content, never metadata fabrication.
+/// Accepts `full_hash` (`true` selects [`HashPolicy::Full`]; `false` selects
+/// [`HashPolicy::SampledAboveThreshold`]). Returns the corresponding policy.
+/// Performs no I/O and cannot fail.
+fn hash_policy(full_hash: bool) -> HashPolicy {
+    if full_hash {
+        HashPolicy::Full
+    } else {
+        HashPolicy::SampledAboveThreshold
+    }
+}
+
+/// Prints selected content or its canonical schema v3 JSON report.
+///
+/// Accepts an extraction report, output format, JSON pretty flag, `verbose`
+/// provenance flag, and `include_markers` (`true` for `bodymatter:v1` comments,
+/// `false` for `--no-markers`). Returns unit after stdout output. Serialization
+/// and stdout failures are returned; text and Markdown include only selected
+/// content, never metadata fabrication.
 fn print_extract(
     report: &ExtractReport,
     format: Format,
     pretty: bool,
+    verbose: bool,
+    include_markers: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rendered = match format {
-        Format::Markdown => glassbox_inspect::selection::render_markdown(report),
+        Format::Markdown => {
+            glassbox_inspect::selection::render_markdown_with_options(report, include_markers)
+        }
         Format::Text => glassbox_inspect::selection::render_text(report),
-        Format::Json if pretty => serde_json::to_string_pretty(report)?,
-        Format::Json => serde_json::to_string(report)?,
+        Format::Json if pretty => serde_json::to_string_pretty(&report.to_v3(verbose))?,
+        Format::Json => serde_json::to_string(&report.to_v3(verbose))?,
     };
-    writeln!(std::io::stdout().lock(), "{rendered}")?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(rendered.as_bytes())?;
+    if !rendered.is_empty() && !rendered.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
     Ok(())
 }
 
-/// Prints one metadata report in the selected content-free representation.
+/// Prints one metadata report in the selected content-free schema v3 representation.
 ///
-/// Accepts a report, format, and JSON pretty-print flag. Returns unit after
-/// stdout output. JSON serialization and stdout write failures are returned;
-/// text and Markdown both use the metadata-only summary and contain no body.
+/// Accepts a report, format, JSON pretty-print flag, and `verbose` provenance
+/// flag. Returns unit after stdout output. JSON serialization and stdout write
+/// failures are returned; text uses `summary_text` and Markdown uses
+/// `summary_markdown`, both content-free.
 fn print_metadata(
     report: &MetadataReport,
     format: Format,
     pretty: bool,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rendered = match format {
-        Format::Markdown | Format::Text => glassbox_inspect::metadata::summary(report),
-        Format::Json if pretty => serde_json::to_string_pretty(report)?,
-        Format::Json => serde_json::to_string(report)?,
+        Format::Markdown => glassbox_inspect::metadata::summary_markdown(report, verbose),
+        Format::Text => glassbox_inspect::metadata::summary_text(report, verbose),
+        Format::Json if pretty => serde_json::to_string_pretty(&report.to_v3(verbose))?,
+        Format::Json => serde_json::to_string(&report.to_v3(verbose))?,
     };
-    writeln!(std::io::stdout().lock(), "{rendered}")?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(rendered.as_bytes())?;
+    if !rendered.is_empty() && !rendered.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -532,8 +630,9 @@ impl Read for PollStdin {
 }
 /// Reads one JSONL line with a 65536-byte cap and bounded oversized-line drain.
 ///
-/// Accepts a buffered input and reusable byte vector. Returns Ok(true) for one
-/// line and Ok(false) for clean EOF or signal-interrupted input. Other I/O errors
+/// Accepts a buffered input and reusable byte vector. Returns `Ok(true)` for
+/// one line and `Ok(false)` for clean EOF, signal-interrupted input, or a
+/// closed pipe (including while draining an oversized line). Other I/O errors
 /// are returned. At most 65537 bytes plus the existing buffer are retained.
 fn read_capped_line(input: &mut dyn BufRead, line: &mut Vec<u8>) -> std::io::Result<bool> {
     const MAX_LINE: usize = 65_536;
@@ -555,7 +654,18 @@ fn read_capped_line(input: &mut dyn BufRead, line: &mut Vec<u8>) -> std::io::Res
         Err(error) => return Err(error),
     };
     if line.len() > MAX_LINE && line.last() != Some(&b'\n') {
-        input.skip_until(b'\n')?;
+        match input.skip_until(b'\n') {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(read)
 }
@@ -613,16 +723,19 @@ fn produce_jsonl(producer: &mut batch::BatchProducer) -> Result<(), String> {
     }
 }
 
-/// Runs content-free JSONL inspection through the actual shared worker budget.
+/// Runs content-free schema v3 JSONL inspection through the actual shared worker budget.
 ///
-/// Accepts metadata options, optional private artifact directory, and positive
-/// jobs. Returns aggregate status after ordered incremental responses and worker
-/// join. Input/stdout/serialization failures return errors; per-file diagnostics
-/// and invalid lines remain ordered JSONL responses with preserved external IDs.
+/// Accepts metadata options, optional private artifact directory, positive
+/// jobs, `full_hash` override, and `verbose` provenance flag. Returns aggregate
+/// status after ordered incremental responses and worker join.
+/// Input/stdout/serialization failures return errors; per-file diagnostics and
+/// invalid lines remain ordered JSONL responses with preserved external IDs.
 fn run_metadata_batch(
     options: &InspectOptions,
     output_dir: Option<&std::path::Path>,
     jobs: usize,
+    full_hash: bool,
+    verbose: bool,
 ) -> Result<batch::BatchOutcome, Box<dyn std::error::Error>> {
     let output = std::io::stdout();
     let mut output = output.lock();
@@ -630,15 +743,24 @@ fn run_metadata_batch(
         jobs,
         produce_jsonl,
         |budget, _cancellation| {
-            let mut inspector = Inspector::with_shared_budget(budget);
+            let mut inspector = Inspector::with_shared_budget(budget).with_full_hash(full_hash);
             move |request| {
                 let sequence = request.sequence;
                 let mut report = inspector.inspect(&request.path, options);
                 if let Some(directory) = output_dir {
-                    crate::output::persist_metadata(&mut report, directory, sequence as usize);
+                    crate::output::persist_metadata(
+                        &mut report,
+                        directory,
+                        sequence as usize,
+                        verbose,
+                    );
                 }
                 let status = report.metadata.status;
-                batch::BatchCompletion::report(request, status, serde_json::to_value(report))
+                batch::BatchCompletion::report(
+                    request,
+                    status,
+                    serde_json::to_value(report.to_v3(verbose)),
+                )
             }
         },
         &mut output,
@@ -647,16 +769,21 @@ fn run_metadata_batch(
     .map_err(Into::into)
 }
 
-/// Runs canonical native-unit extraction through the actual shared worker budget.
+/// Runs canonical schema v3 native-unit extraction through the actual shared worker budget.
 ///
-/// Accepts extraction options, optional private artifact directory, and positive
-/// jobs. Returns aggregate status after ordered flushed responses and worker join.
-/// Native content remains available on OCR failure; malformed transport and output
-/// failures retain their respective per-item invalid or process operational status.
+/// Accepts extraction options, optional private artifact directory, positive
+/// jobs, `full_hash` override, `verbose` provenance flag, and `include_markers`
+/// (`!no_markers`) for persisted Markdown artifacts. Returns aggregate status
+/// after ordered flushed responses and worker join. Native content remains
+/// available on OCR failure; malformed transport and output failures retain
+/// their respective per-item invalid or process operational status.
 fn run_extract_batch(
     options: &ExtractOptions,
     output_dir: Option<&std::path::Path>,
     jobs: usize,
+    full_hash: bool,
+    verbose: bool,
+    include_markers: bool,
 ) -> Result<batch::BatchOutcome, Box<dyn std::error::Error>> {
     let output = std::io::stdout();
     let mut output = output.lock();
@@ -664,15 +791,25 @@ fn run_extract_batch(
         jobs,
         produce_jsonl,
         |budget, _cancellation| {
-            let mut inspector = Inspector::with_shared_budget(budget);
+            let mut inspector = Inspector::with_shared_budget(budget).with_full_hash(full_hash);
             move |request| {
                 let sequence = request.sequence;
                 let mut report = inspector.extract(&request.path, options);
                 if let Some(directory) = output_dir {
-                    crate::output::persist_extract(&mut report, directory, sequence as usize);
+                    crate::output::persist_extract(
+                        &mut report,
+                        directory,
+                        sequence as usize,
+                        verbose,
+                        include_markers,
+                    );
                 }
-                let status = report.metadata.status;
-                batch::BatchCompletion::report(request, status, serde_json::to_value(report))
+                let status = report.extraction_status();
+                batch::BatchCompletion::report(
+                    request,
+                    status,
+                    serde_json::to_value(report.to_v3(verbose)),
+                )
             }
         },
         &mut output,
@@ -818,5 +955,216 @@ mod tests {
         let error = Cli::try_parse_from(["glassbox", "inspect", "a.pdf", "--ocr-language", "eng"])
             .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// Checks `--full-hash`, `--verbose`, and `--no-markers` parsing boundaries.
+    ///
+    /// Accepts no parameters. Returns unit after checking defaults and explicit
+    /// flags on inspect and extract, plus Clap rejection of `--no-markers` on
+    /// inspect. Any drifted default or missing flag panics.
+    #[test]
+    fn v3_cli_flags_parse_with_expected_defaults_and_boundaries() {
+        let inspect_default = Cli::try_parse_from(["glassbox", "inspect", "a.pdf"]).unwrap();
+        let Commands::Inspect(args) = inspect_default.command else {
+            panic!("inspect route expected")
+        };
+        assert!(!args.full_hash);
+        assert!(!args.verbose);
+
+        let inspect_flags =
+            Cli::try_parse_from(["glassbox", "inspect", "a.pdf", "--full-hash", "--verbose"])
+                .unwrap();
+        let Commands::Inspect(args) = inspect_flags.command else {
+            panic!("inspect route expected")
+        };
+        assert!(args.full_hash);
+        assert!(args.verbose);
+
+        let inspect_no_markers =
+            Cli::try_parse_from(["glassbox", "inspect", "a.pdf", "--no-markers"]).unwrap_err();
+        assert_eq!(
+            inspect_no_markers.kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+
+        let extract_default = Cli::try_parse_from(["glassbox", "extract", "a.pdf"]).unwrap();
+        let Commands::Extract(args) = extract_default.command else {
+            panic!("extract route expected")
+        };
+        assert!(!args.full_hash);
+        assert!(!args.verbose);
+        assert!(!args.no_markers);
+
+        let extract_flags = Cli::try_parse_from([
+            "glassbox",
+            "extract",
+            "a.pdf",
+            "--full-hash",
+            "--verbose",
+            "--no-markers",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::Extract(args) = extract_flags.command else {
+            panic!("extract route expected")
+        };
+        assert!(args.full_hash);
+        assert!(args.verbose);
+        assert!(args.no_markers);
+        assert_eq!(args.format, Format::Json);
+    }
+
+    /// Checks that inspect's flag precheck stops at `--` while still rejecting prior content flags.
+    ///
+    /// Accepts no parameters. Returns unit after checking positional flag-like
+    /// filenames after `--`, pre-terminator rejections, and Clap parsing of
+    /// `glassbox inspect -- --no-markers`. Any missed rejection or blocked
+    /// post-terminator filename panics.
+    #[test]
+    fn inspect_precheck_stops_at_option_terminator_and_still_rejects_prior_flags() {
+        let to_os = |items: &[&str]| -> Vec<std::ffi::OsString> {
+            items.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        assert_eq!(
+            find_disallowed_inspect_flag(&to_os(&["glassbox", "inspect", "--", "--no-markers"])),
+            None
+        );
+        assert_eq!(
+            find_disallowed_inspect_flag(&to_os(&[
+                "glassbox", "inspect", "--pretty", "--", "--no-ocr"
+            ])),
+            None
+        );
+        assert_eq!(
+            find_disallowed_inspect_flag(&to_os(&[
+                "glassbox",
+                "inspect",
+                "--no-markers",
+                "file.txt"
+            ])),
+            Some("--no-markers".to_owned())
+        );
+        assert_eq!(
+            find_disallowed_inspect_flag(&to_os(&[
+                "glassbox",
+                "inspect",
+                "--max-pages=5",
+                "--",
+                "--no-markers"
+            ])),
+            Some("--max-pages=5".to_owned())
+        );
+
+        let parsed = Cli::try_parse_from(["glassbox", "inspect", "--", "--no-markers"]).unwrap();
+        let Commands::Inspect(args) = parsed.command else {
+            panic!("inspect route expected")
+        };
+        assert_eq!(args.path, Some(PathBuf::from("--no-markers")));
+    }
+
+    /// Buffered test reader yielding a prefix before failing with one I/O error.
+    struct FailingDrainReader {
+        prefix: Vec<u8>,
+        offset: usize,
+        error_kind: std::io::ErrorKind,
+    }
+
+    impl Read for FailingDrainReader {
+        /// Reads remaining prefix bytes, then returns the configured I/O error.
+        ///
+        /// Accepts a destination buffer. Returns bytes copied from the prefix,
+        /// or the configured error once the prefix is exhausted.
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset < self.prefix.len() {
+                let remaining = &self.prefix[self.offset..];
+                let count = remaining.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&remaining[..count]);
+                self.offset += count;
+                return Ok(count);
+            }
+            Err(std::io::Error::new(self.error_kind, "injected drain error"))
+        }
+    }
+
+    /// Buffered reader double returning a configured error directly from `skip_until`.
+    struct SkipUntilErrorReader {
+        prefix: Vec<u8>,
+        offset: usize,
+        skip_error: std::io::ErrorKind,
+    }
+
+    impl Read for SkipUntilErrorReader {
+        /// Reads prefix bytes into the caller buffer.
+        ///
+        /// Accepts a destination buffer. Returns bytes copied or zero at prefix
+        /// end; no OS I/O occurs.
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = &self.prefix[self.offset..];
+            let count = remaining.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&remaining[..count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    impl BufRead for SkipUntilErrorReader {
+        /// Exposes unread prefix bytes without performing OS I/O.
+        ///
+        /// Accepts no parameters. Returns the remaining slice of the prefix.
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Ok(&self.prefix[self.offset..])
+        }
+
+        /// Advances the unread prefix offset by `amount` bytes.
+        ///
+        /// Accepts a consumed byte count. Returns unit after advancing safely.
+        fn consume(&mut self, amount: usize) {
+            self.offset = (self.offset + amount).min(self.prefix.len());
+        }
+
+        /// Simulates an error raised while draining an oversized line to `\n`.
+        ///
+        /// Accepts a delimiter byte. Always returns the configured I/O error.
+        fn skip_until(&mut self, _byte: u8) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                self.skip_error,
+                "injected skip_until error",
+            ))
+        }
+    }
+
+    /// Verifies oversized-line draining treats `Interrupted` and `BrokenPipe` as clean stop and propagates other errors.
+    ///
+    /// Accepts no parameters. Returns unit after exercising `read_capped_line`
+    /// with a `>65536`-byte line ending in `BrokenPipe`, `Interrupted`, and
+    /// `PermissionDenied` during `skip_until`. Any unexpected error handling or
+    /// dropped error panics.
+    #[test]
+    fn read_capped_line_handles_interrupted_and_broken_pipe_during_oversized_drain() {
+        let mut line = Vec::new();
+
+        let mut broken_pipe = std::io::BufReader::new(FailingDrainReader {
+            prefix: vec![b'a'; 65_537],
+            offset: 0,
+            error_kind: std::io::ErrorKind::BrokenPipe,
+        });
+        assert!(!read_capped_line(&mut broken_pipe, &mut line).unwrap());
+
+        let mut interrupted = SkipUntilErrorReader {
+            prefix: vec![b'b'; 65_537],
+            offset: 0,
+            skip_error: std::io::ErrorKind::Interrupted,
+        };
+        assert!(!read_capped_line(&mut interrupted, &mut line).unwrap());
+
+        let mut permission_denied = std::io::BufReader::new(FailingDrainReader {
+            prefix: vec![b'c'; 65_537],
+            offset: 0,
+            error_kind: std::io::ErrorKind::PermissionDenied,
+        });
+        let error = read_capped_line(&mut permission_denied, &mut line).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

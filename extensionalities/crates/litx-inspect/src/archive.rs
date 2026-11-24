@@ -51,9 +51,20 @@ pub(crate) fn summarize(report: &mut InspectReport, options: &InspectOptions) {
 }
 
 impl Archive {
+    /// Opens a regular, non-symlinked ZIP file and validates its central directory bounds.
+    ///
+    /// Accepts a source file path and mutable inspection report. Returns an
+    /// [`Archive`] handle after verifying regular-file type, physical byte cap,
+    /// central directory integrity, entry-count/size caps, and duplicate-name
+    /// checks. Non-regular inputs, symlink targets, I/O errors, ZIP parsing
+    /// failures, or safety-cap violations return [`ArchiveError`].
     pub fn open(path: &Path, report: &mut InspectReport) -> Result<Self, ArchiveError> {
-        let mut file = File::open(path)?;
-        if file.metadata()?.len() > MAX_TOTAL_BYTES {
+        let mut file = crate::hashing::open_no_follow(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(ArchiveError::Limit("ZIP input is not a regular file"));
+        }
+        if metadata.len() > MAX_TOTAL_BYTES {
             return Err(ArchiveError::Limit("ZIP physical byte cap exceeded"));
         }
         check_directory(&mut file)?;
@@ -154,19 +165,30 @@ impl Archive {
     }
 }
 
+/// Maximum EOCD + ZIP64 locator tail window read from the end of a ZIP file.
+/// Covers the 22-byte EOCD record, maximum 65,535-byte comment, one tolerated
+/// trailing byte, and 20-byte ZIP64 locator probe.
+const MAX_EOCD_TAIL_BYTES: u64 = 65_578;
+
 /// Validates the bounded EOCD/ZIP64 structure before constructing `ZipArchive`.
 /// Accepts a seekable ZIP file positioned anywhere and restores it to offset
 /// zero on success. Returns `Ok(())` for a supported bounded directory, or an
 /// I/O/decoder/limit error when its structure is invalid, ambiguous, ZIP64,
-/// multi-disk, or outside the configured entry and directory caps.
+/// multi-disk, grew past the bounded tail cap during read, or outside the
+/// configured entry and directory caps.
 fn check_directory(file: &mut File) -> Result<(), ArchiveError> {
     // zip-9.6.1 accepts an EOCD record starting up to 65,558 bytes before EOF
     // (22-byte record + maximum 65,535-byte comment + one tolerated trailing
     // byte) and looks a further 20 bytes earlier for a ZIP64 locator.
-    let tail_len = file.metadata()?.len().min(65_578) as usize;
-    file.seek(SeekFrom::End(-(tail_len as i64)))?;
+    let tail_len = file.metadata()?.len().min(MAX_EOCD_TAIL_BYTES) as usize;
+    let tail_start = file.seek(SeekFrom::End(-(tail_len as i64)))?;
     let mut tail = Vec::with_capacity(tail_len);
-    file.read_to_end(&mut tail)?;
+    (&mut *file)
+        .take(MAX_EOCD_TAIL_BYTES + 1)
+        .read_to_end(&mut tail)?;
+    if tail.len() as u64 > MAX_EOCD_TAIL_BYTES {
+        return Err(ArchiveError::Limit("ZIP directory tail grew during read"));
+    }
     let u16_at = |i: usize| u16::from_le_bytes([tail[i], tail[i + 1]]);
     // Collect every EOCD candidate whose comment terminates at or before end of
     // file, mirroring the `zip` crate's acceptance rule. More than one candidate
@@ -223,7 +245,9 @@ fn check_directory(file: &mut File) -> Result<(), ArchiveError> {
     // The declared central directory must end at or before the EOCD record, so
     // the decoder cannot fall back to a different directory than the one the
     // entry-count and directory-size caps above were checked against.
-    let eocd_offset = file.metadata()?.len() - tail.len() as u64 + i as u64;
+    let eocd_offset = tail_start
+        .checked_add(i as u64)
+        .ok_or(ArchiveError::Limit("ZIP end-of-directory offset overflow"))?;
     let directory_offset =
         u32::from_le_bytes(tail[i + 16..i + 20].try_into().expect("fixed EOCD slice")) as u64;
     if directory_offset + directory_bytes > eocd_offset {

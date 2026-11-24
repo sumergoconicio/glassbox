@@ -1,3 +1,6 @@
+//! Module: glassbox-inspect PalmDB/MOBI ebook reader.
+//! File: mobi.rs.
+//! Responsibility: Parse PalmDB/MOBI headers, decode continuous text streams across record boundaries, and emit selected text-record units.
 use crate::{
     Claim, InspectOptions, InspectReport,
     binary::{Source, be16, be32, slice},
@@ -6,6 +9,18 @@ use crate::{
 use quick_xml::{Reader, events::Event};
 use std::path::Path;
 
+/// Byte span of one decompressed PalmDB text record inside the continuous `text_length`-bounded stream.
+struct TextRecordSpan {
+    record_num: u64,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+/// Inspects a MOBI/AZW/PRC ebook path and records metadata plus extracted text or diagnostics.
+///
+/// Accepts a source file path, destination report, and extraction options.
+/// Returns unit after metadata and text-record extraction; header or I/O
+/// failures are recorded under stage `"mobi"`.
 pub(crate) fn inspect(path: &Path, report: &mut InspectReport, options: &InspectOptions) {
     if let Err(error) = inner(path, report, options) {
         report.error("mobi", error);
@@ -20,10 +35,57 @@ fn claim(report: &mut InspectReport, key: &str, value: impl ToString, source: &'
     });
 }
 
+/// Decodes a single MOBI byte slice according to the declared MOBI text encoding.
+///
+/// Accepts raw bytes and the MOBI header encoding code (`65001` UTF-8 or `1252`
+/// Windows-1252). Returns the decoded UTF-8 string or an error for invalid UTF-8
+/// or unsupported encodings.
 fn decode(bytes: &[u8], encoding: u32) -> xml::Result<String> {
     match encoding {
         65001 => Ok(std::str::from_utf8(bytes)?.into()),
         1252 => Ok(encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned()),
+        _ => Err("unsupported MOBI text encoding".into()),
+    }
+}
+
+/// Decoded UTF-8 text stream paired with per-record `(record_num, decoded_start, decoded_end)` spans.
+type DecodedRecordStream = (String, Vec<(u64, usize, usize)>);
+
+/// Decodes the continuous MOBI byte stream once while mapping each PalmDB record
+/// to its byte span inside the decoded UTF-8 string.
+///
+/// Accepts the `text_length`-truncated continuous byte stream, raw record byte
+/// spans, and MOBI text encoding code (`65001` or `1252`). Returns the decoded
+/// UTF-8 string and per-record `(record_num, decoded_start, decoded_end)` spans.
+/// Multi-byte UTF-8 sequences split across adjacent records decode cleanly as a
+/// single continuous stream; invalid UTF-8 or unsupported encodings return an error.
+fn decode_stream_with_spans(
+    stream: &[u8],
+    raw_spans: &[TextRecordSpan],
+    encoding: u32,
+) -> xml::Result<DecodedRecordStream> {
+    match encoding {
+        65001 => {
+            let decoded = std::str::from_utf8(stream)?.to_owned();
+            let spans = raw_spans
+                .iter()
+                .map(|span| (span.record_num, span.byte_start, span.byte_end))
+                .collect();
+            Ok((decoded, spans))
+        }
+        1252 => {
+            let mut decoded = String::with_capacity(stream.len());
+            let mut spans = Vec::with_capacity(raw_spans.len());
+            for span in raw_spans {
+                let start = decoded.len();
+                let chunk = encoding_rs::WINDOWS_1252
+                    .decode(&stream[span.byte_start..span.byte_end])
+                    .0;
+                decoded.push_str(&chunk);
+                spans.push((span.record_num, start, decoded.len()));
+            }
+            Ok((decoded, spans))
+        }
         _ => Err("unsupported MOBI text encoding".into()),
     }
 }
@@ -186,59 +248,57 @@ fn inner(path: &Path, report: &mut InspectReport, options: &InspectOptions) -> x
         } else {
             0
         };
-        if let Some(selection) = &options.native_selection {
-            let plan = crate::selection::begin(
+        let plan = match &options.native_selection {
+            Some(selection) => Some(crate::selection::begin(
                 report,
                 selection,
                 crate::reports::NativeUnit::MobiTextRecord,
                 text_records as u64,
-            )?;
-            let mut expanded = 0usize;
-            for i in 1..=text_records {
-                if !plan.contains(i as u64) {
+            )?),
+            None => None,
+        };
+        let mut stream = Vec::new();
+        let mut raw_spans = Vec::with_capacity(text_records);
+        for i in 1..=text_records {
+            let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
+            let body = strip_trailing(&bytes, extras)?;
+            let decoded = if compression == 1 {
+                body.to_vec()
+            } else {
+                palmdoc(body)?
+            };
+            if decoded.len() > 65_536 || stream.len().saturating_add(decoded.len()) > 32 << 20 {
+                return Err("MOBI record expansion cap exceeded".into());
+            }
+            let raw_start = stream.len();
+            stream.extend_from_slice(&decoded);
+            raw_spans.push(TextRecordSpan {
+                record_num: i as u64,
+                byte_start: raw_start.min(text_length),
+                byte_end: stream.len().min(text_length),
+            });
+        }
+        if stream.len() < text_length {
+            return Err("truncated MOBI text".into());
+        }
+        stream.truncate(text_length);
+        let (decoded, decoded_spans) = decode_stream_with_spans(&stream, &raw_spans, encoding)?;
+        if let Some(plan) = plan {
+            let record_texts = markup_text_by_record(&decoded, &decoded_spans)?;
+            for ((record_num, _, _), text) in decoded_spans.into_iter().zip(record_texts) {
+                if !plan.contains(record_num) {
                     continue;
                 }
-                let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
-                let body = strip_trailing(&bytes, extras)?;
-                let mut decoded = if compression == 1 {
-                    body.to_vec()
-                } else {
-                    palmdoc(body)?
-                };
-                expanded = expanded.saturating_add(decoded.len());
-                if decoded.len() > 65_536 || expanded > 32 << 20 {
-                    return Err("MOBI record expansion cap exceeded".into());
-                }
-                decoded.truncate(text_length);
-                let text = markup_text(&decode(&decoded, encoding)?)?;
                 report.native_units.push(crate::selection::text_unit(
-                    i as u64,
+                    record_num,
                     crate::reports::NativeUnit::MobiTextRecord,
-                    Some(format!("PalmDB record {i}")),
+                    Some(format!("PalmDB record {record_num}")),
                     text,
                     crate::reports::ContentOrigin::Native,
                 ));
             }
         } else {
-            let mut text = Vec::new();
-            for i in 1..=text_records {
-                let bytes = source.range(offsets[i], (offsets[i + 1] - offsets[i]) as usize)?;
-                let body = strip_trailing(&bytes, extras)?;
-                let decoded = if compression == 1 {
-                    body.to_vec()
-                } else {
-                    palmdoc(body)?
-                };
-                if decoded.len() > 65_536 || text.len() + decoded.len() > 32 << 20 {
-                    return Err("MOBI record expansion cap exceeded".into());
-                }
-                text.extend(decoded);
-            }
-            if text.len() < text_length {
-                return Err("truncated MOBI text".into());
-            }
-            text.truncate(text_length);
-            let text = markup_text(&decode(&text, encoding)?)?;
+            let text = markup_text(&decoded)?;
             report.append_text(&text, options.max_chars);
         }
         claim(
@@ -335,21 +395,100 @@ fn palmdoc(data: &[u8]) -> xml::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn markup_text(value: &str) -> xml::Result<String> {
-    let mut reader = Reader::from_str(value);
+/// Finds the zero-based record slot in `spans` owning UTF-8 byte `offset`.
+///
+/// Accepts non-empty sorted `(record_num, start, end)` spans partitioning the
+/// decoded stream and a byte offset within the stream. Returns the index of
+/// the first record whose `end > offset`, clamping to the last slot at EOF.
+/// Performs no I/O and cannot fail.
+fn record_for_offset(spans: &[(u64, usize, usize)], offset: usize) -> usize {
+    let idx = spans.partition_point(|&(_, _, end)| end <= offset);
+    idx.min(spans.len().saturating_sub(1))
+}
+
+/// Attributes decoded text from an XML text event across the record spans that
+/// own each character's leading byte.
+///
+/// Accepts the event's raw UTF-8 slice, its byte range `[start_pos..end_pos)`
+/// inside the full decoded stream, per-record spans, mutable per-record output
+/// buffers, and XML-normalized text for the single-record fast path. Returns
+/// unit after pushing characters to their owning records while normalizing
+/// `\r\n` and `\r` to `\n`. Performs no I/O and cannot fail.
+fn push_text_range(
+    raw: &str,
+    start_pos: usize,
+    end_pos: usize,
+    spans: &[(u64, usize, usize)],
+    outputs: &mut [String],
+    xml_text: &str,
+) {
+    if outputs.is_empty() || raw.is_empty() || start_pos >= end_pos {
+        return;
+    }
+    let first = record_for_offset(spans, start_pos);
+    if end_pos <= spans[first].2 {
+        outputs[first].push_str(xml_text);
+        return;
+    }
+    let mut chars = raw.char_indices().peekable();
+    while let Some((rel, ch)) = chars.next() {
+        let out_ch = if ch == '\r' {
+            if matches!(chars.peek(), Some(&(_, '\n'))) {
+                chars.next();
+            }
+            '\n'
+        } else {
+            ch
+        };
+        let idx = record_for_offset(spans, start_pos + rel);
+        outputs[idx].push(out_ch);
+    }
+}
+
+/// Parses continuous MOBI HTML markup once while attributing visible text to
+/// each PalmDB text record by source byte offset.
+///
+/// Accepts the continuously decoded MOBI markup string and per-record
+/// `(record_num, decoded_start, decoded_end)` spans. Returns one visible text
+/// string per span in the same order, carrying open-tag, blocked-section
+/// (`head`, `title`, `style`, `script`), entity, and newline state across
+/// record boundaries. Leading UTF-8 BOMs are stripped explicitly before lexer
+/// construction so `buffer_position()` stays aligned with `spans`. Malformed
+/// character references or unrecoverable XML lexer failures return an error.
+fn markup_text_by_record(decoded: &str, spans: &[(u64, usize, usize)]) -> xml::Result<Vec<String>> {
+    let mut outputs = vec![String::new(); spans.len()];
+    if spans.is_empty() {
+        return Ok(outputs);
+    }
+    let bom_len = decoded.len() - decoded.trim_start_matches('\u{feff}').len();
+    let reader_slice = &decoded[bom_len..];
+    let mut reader = Reader::from_str(reader_slice);
     reader.config_mut().check_end_names = false;
-    let mut out = String::new();
+    reader.config_mut().allow_unmatched_ends = true;
     let mut blocked = None;
     let version = quick_xml::XmlVersion::default();
     loop {
-        match reader.read_event()? {
+        let start_pos = bom_len + reader.buffer_position() as usize;
+        let event = reader.read_event()?;
+        let end_pos = bom_len + reader.buffer_position() as usize;
+        match event {
             Event::Start(e) => {
                 let name = e.name().as_ref().to_ascii_lowercase();
-                if blocked.is_none() && matches!(name.as_str(), "head" | "style" | "script") {
+                if blocked.is_none()
+                    && matches!(name.as_str(), "head" | "title" | "style" | "script")
+                {
                     blocked = Some(name.clone());
                 }
                 if blocked.is_none() && name == "br" {
-                    out.push('\n');
+                    let idx = record_for_offset(spans, start_pos);
+                    outputs[idx].push('\n');
+                }
+            }
+            Event::Empty(e) if blocked.is_none() => {
+                let name = e.name().as_ref().to_ascii_lowercase();
+                if name == "br" {
+                    let idx = record_for_offset(spans, start_pos);
+                    outputs[idx].push('\n');
                 }
             }
             Event::End(e) => {
@@ -358,18 +497,43 @@ fn markup_text(value: &str) -> xml::Result<String> {
                     blocked = None;
                 }
                 if blocked.is_none()
-                    && matches!(name.as_str(), "p" | "div" | "h1" | "h2" | "li")
-                    && !out.ends_with('\n')
+                    && matches!(
+                        name.as_str(),
+                        "p" | "div"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "li"
+                            | "tr"
+                            | "blockquote"
+                    )
                 {
-                    out.push('\n');
+                    let idx = record_for_offset(spans, start_pos);
+                    if !outputs[idx].is_empty() && !outputs[idx].ends_with('\n') {
+                        outputs[idx].push('\n');
+                    }
                 }
             }
-            Event::Text(e) if blocked.is_none() => out.push_str(&e.xml_content(version)),
+            Event::Text(e) if blocked.is_none() => {
+                let xml_text = e.xml_content(version);
+                push_text_range(
+                    e.as_ref(),
+                    start_pos,
+                    end_pos,
+                    spans,
+                    &mut outputs,
+                    &xml_text,
+                );
+            }
             Event::GeneralRef(e) if blocked.is_none() => {
+                let idx = record_for_offset(spans, start_pos);
                 if let Some(c) = e.resolve_char_ref()? {
-                    out.push(c);
+                    outputs[idx].push(c);
                 } else {
-                    out.push_str(match e.xml_content(version).as_ref() {
+                    outputs[idx].push_str(match e.xml_content(version).as_ref() {
                         "amp" => "&",
                         "lt" => "<",
                         "gt" => ">",
@@ -384,5 +548,19 @@ fn markup_text(value: &str) -> xml::Result<String> {
             _ => {}
         }
     }
-    Ok(out)
+    Ok(outputs)
+}
+
+/// Extracts visible text from a single continuous MOBI markup stream.
+///
+/// Accepts decoded MOBI HTML markup. Returns visible plain text with
+/// `<head>`/`<title>`/`<style>`/`<script>` omitted, HTML entities resolved, and
+/// block breaks preserved. Returns an error on invalid character references or
+/// unrecoverable XML lexer failures.
+fn markup_text(value: &str) -> xml::Result<String> {
+    let spans = [(1_u64, 0_usize, value.len())];
+    Ok(markup_text_by_record(value, &spans)?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
 }

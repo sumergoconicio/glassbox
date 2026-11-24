@@ -14,8 +14,9 @@ const SHARED_OCR_STAGING_BYTES: usize = 128 << 20;
 const SHARED_OCR_STAGING_BYTES: usize = 1 << 20;
 mod archive;
 mod binary;
+pub mod bodymatter;
 mod comics;
-mod detect;
+pub mod detect;
 mod djvu;
 mod epub;
 pub mod hashing;
@@ -32,6 +33,7 @@ mod pdf;
 mod profile;
 mod rar;
 pub mod reports;
+pub mod reports_v3;
 pub mod selection;
 mod spreadsheet;
 mod tables;
@@ -161,9 +163,15 @@ impl SharedWorkBudget {
     /// Stops new file/recognition admission and wakes every waiting file worker.
     ///
     /// Accepts no parameters. Returns unit after marking the shared session
-    /// cancelled. Active native work owns its lease until ordinary completion;
+    /// cancelled while holding the budget mutex so waiting threads cannot miss
+    /// the wakeup. Active native work owns its lease until ordinary completion;
     /// no unsafe asynchronous FFI interruption is attempted.
     pub fn cancel(&self) {
+        let _state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.inner.cancelled.store(true, Ordering::Release);
         self.inner.available.notify_all();
     }
@@ -481,6 +489,10 @@ pub struct Column {
 
 #[derive(Debug, Serialize)]
 pub struct Sheet {
+    #[serde(skip)]
+    pub(crate) first_row: Option<Vec<String>>,
+    #[serde(skip)]
+    pub(crate) first_row_truncated: bool,
     pub preview_rows: Vec<Vec<String>>,
     pub preview_truncated: bool,
     pub headers_preview: Vec<Option<String>>,
@@ -532,6 +544,8 @@ pub struct InspectReport {
     pub errors: Vec<StageError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packet: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub(crate) native_headers: Vec<String>,
     #[serde(skip)]
     pub(crate) native_units: Vec<reports::ContentUnit>,
     #[serde(skip)]
@@ -588,6 +602,7 @@ impl Default for InspectReport {
             thumbnail: None,
             errors: vec![],
             packet: None,
+            native_headers: Vec::new(),
             native_units: Vec::new(),
             native_unit: reports::NativeUnit::Unknown,
             native_available: reports::QualifiedCount::default(),
@@ -671,12 +686,26 @@ impl InspectReport {
 
 /// Inspects identity and structure without body extraction or OCR.
 ///
-/// Accepts a source path and v2 metadata-only options. Returns a schema-v2
-/// [`reports::MetadataReport`]. Input, hashing, structural, and artifact
-/// failures are qualified inside the report rather than returned as Rust errors.
+/// Accepts a source path and metadata-only options. Returns a
+/// [`reports::MetadataReport`] using [`hashing::HashPolicy::SampledAboveThreshold`].
+/// Input, hashing, structural, and artifact failures are qualified inside the
+/// report rather than returned as Rust errors.
 pub fn inspect(path: &Path, options: &reports::InspectOptions) -> reports::MetadataReport {
+    inspect_with_policy(path, options, hashing::HashPolicy::SampledAboveThreshold)
+}
+
+/// Inspects identity and structure with an explicit [`hashing::HashPolicy`].
+///
+/// Accepts a source path, metadata-only options, and a hash policy controlling
+/// full SHA-256 versus sampled fingerprinting. Returns a [`reports::MetadataReport`].
+/// Budget, input, hashing, structural, and artifact failures are qualified in diagnostics.
+pub fn inspect_with_policy(
+    path: &Path,
+    options: &reports::InspectOptions,
+    policy: hashing::HashPolicy,
+) -> reports::MetadataReport {
     match Inspector::with_budget(&options.budget) {
-        Ok(mut inspector) => inspector.inspect(path, options),
+        Ok(inspector) => inspector.with_hash_policy(policy).inspect(path, options),
         Err(error) => finalize_public_inspection(unadmitted_metadata(path, &error)),
     }
 }
@@ -724,14 +753,29 @@ fn finalize_public_inspection(mut report: reports::MetadataReport) -> reports::M
     report
 }
 
-/// Extracts exactly the requested native units into a canonical v2 report.
+/// Extracts exactly the requested native units into a canonical report.
 ///
-/// Accepts a source path and v2 extraction controls. Returns separate metadata,
-/// selected content, provenance, and coverage. Input, parser, selection, safety,
-/// and local OCR failures are qualified in report diagnostics; no error is hidden.
+/// Accepts a source path and extraction controls. Returns separate metadata,
+/// selected content, provenance, and coverage using
+/// [`hashing::HashPolicy::SampledAboveThreshold`]. Input, parser, selection,
+/// safety, and local OCR failures are qualified in report diagnostics.
 pub fn extract(path: &Path, options: &reports::ExtractOptions) -> reports::ExtractReport {
+    extract_with_policy(path, options, hashing::HashPolicy::SampledAboveThreshold)
+}
+
+/// Extracts requested native units using an explicit [`hashing::HashPolicy`].
+///
+/// Accepts a source path, extraction controls, and a hash policy controlling
+/// full SHA-256 versus sampled fingerprinting for the embedded metadata block.
+/// Returns a canonical [`reports::ExtractReport`]; all operational failures remain
+/// qualified in report diagnostics.
+pub fn extract_with_policy(
+    path: &Path,
+    options: &reports::ExtractOptions,
+    policy: hashing::HashPolicy,
+) -> reports::ExtractReport {
     match Inspector::with_budget(&options.budget) {
-        Ok(mut inspector) => inspector.extract(path, options),
+        Ok(inspector) => inspector.with_hash_policy(policy).extract(path, options),
         Err(error) => unadmitted_extract(path, options, &error),
     }
 }
@@ -751,16 +795,19 @@ pub fn extract_transitional(path: &Path, options: &InspectOptions) -> InspectRep
 /// that lease and never creates a second nested worker pool or cross-request model.
 pub struct Inspector {
     ocr: images::OcrSession,
+    hash_policy: hashing::HashPolicy,
 }
 
 impl Default for Inspector {
     /// Creates a sequential inspector with no loaded OCR model.
     ///
-    /// Accepts no parameters. Returns an inspector owning one file/OCR slot.
-    /// No filesystem, PDFium, Tesseract, thread, or allocation-heavy work runs.
+    /// Accepts no parameters. Returns an inspector owning one file/OCR slot and
+    /// using [`hashing::HashPolicy::SampledAboveThreshold`]. No filesystem,
+    /// PDFium, Tesseract, thread, or allocation-heavy work runs.
     fn default() -> Self {
         Self {
             ocr: images::OcrSession::default(),
+            hash_policy: hashing::HashPolicy::SampledAboveThreshold,
         }
     }
 }
@@ -817,17 +864,50 @@ impl Inspector {
     /// Creates one worker session attached to the batch's actual shared budget.
     ///
     /// Accepts a clone of the owned budget. Returns an inspector whose lazy OCR
-    /// model and active file lease stay within this worker/session. No model loads.
+    /// model and active file lease stay within this worker/session, defaulting to
+    /// [`hashing::HashPolicy::SampledAboveThreshold`]. No model loads.
     pub fn with_shared_budget(budget: SharedWorkBudget) -> Self {
         Self {
             ocr: images::OcrSession::with_budget(budget),
+            hash_policy: hashing::HashPolicy::SampledAboveThreshold,
         }
+    }
+
+    /// Configures whether this inspector streams full SHA-256 digests above the default size threshold.
+    ///
+    /// Accepts `full_hash` (`true` selects [`hashing::HashPolicy::Full`]; `false`
+    /// selects [`hashing::HashPolicy::SampledAboveThreshold`]). Returns `self`
+    /// for builder chaining without performing I/O or loading models.
+    pub fn with_full_hash(mut self, full_hash: bool) -> Self {
+        self.hash_policy = if full_hash {
+            hashing::HashPolicy::Full
+        } else {
+            hashing::HashPolicy::SampledAboveThreshold
+        };
+        self
+    }
+
+    /// Configures an explicit [`hashing::HashPolicy`] on this inspector session.
+    ///
+    /// Accepts a hash policy. Returns `self` for builder chaining without
+    /// performing I/O or changing the shared work budget.
+    pub fn with_hash_policy(mut self, policy: hashing::HashPolicy) -> Self {
+        self.hash_policy = policy;
+        self
+    }
+
+    /// Returns the active [`hashing::HashPolicy`] configured on this inspector.
+    ///
+    /// Accepts `&self`. Returns the current hash policy. Performs no I/O.
+    pub fn hash_policy(&self) -> hashing::HashPolicy {
+        self.hash_policy
     }
 
     /// Inspects one file under the shared lease without body extraction or OCR.
     ///
-    /// Accepts a source path and v2 metadata options. Returns a typed v2 report;
-    /// cancellation, input, hashing, and structural failures remain diagnostics.
+    /// Accepts a source path and metadata options. Returns a typed metadata report
+    /// honoring this inspector's configured [`hashing::HashPolicy`]; cancellation,
+    /// input, hashing, and structural failures remain diagnostics.
     pub fn inspect(
         &mut self,
         path: &Path,
@@ -839,15 +919,20 @@ impl Inspector {
                 "operation cancelled before file admission",
             ));
         }
-        let report = metadata::inspect(path, options);
+        let report = if self.hash_policy == hashing::HashPolicy::SampledAboveThreshold {
+            metadata::inspect(path, options)
+        } else {
+            metadata::inspect_with_policy(path, options, self.hash_policy)
+        };
         self.ocr.end_file();
         finalize_public_inspection(report)
     }
 
     /// Extracts native units through the canonical reader and owned OCR session.
     ///
-    /// Accepts a source path and v2 extraction controls. Returns a typed report
-    /// with source-order units and honest omissions. Rejected inputs (bad
+    /// Accepts a source path and extraction controls. Returns a typed report
+    /// with source-order units, honest omissions, and metadata hashed under this
+    /// inspector's configured [`hashing::HashPolicy`]. Rejected inputs (bad
     /// paths, link components, unopenable or non-regular sources) fail at the
     /// metadata stage and never reach the native readers. Cancellation, reader,
     /// model, safety, and input failures remain diagnostics instead of Rust
@@ -860,13 +945,15 @@ impl Inspector {
         if !self.ocr.begin_file() {
             return unadmitted_extract(path, options, "operation cancelled before file admission");
         }
-        let metadata = metadata::inspect(
+        let (mut metadata, expected_observation) = metadata::inspect_with_policy_and_observation(
             path,
             &reports::InspectOptions {
                 thumbnail: options.thumbnail.clone(),
                 ..reports::InspectOptions::default()
             },
+            self.hash_policy,
         );
+        let validated_path = metadata.metadata.identity.path.clone();
         // A rejected input (bad path, link component, unopenable or
         // non-regular source) already failed the metadata stage; it must not
         // reach the native readers, whose own path opens follow links.
@@ -876,7 +963,7 @@ impl Inspector {
         });
         let mut legacy = if input_rejected {
             let mut rejected = InspectReport {
-                source_path: path.to_path_buf(),
+                source_path: validated_path.clone(),
                 ..InspectReport::default()
             };
             rejected.error("input", "input was rejected before native extraction");
@@ -893,8 +980,14 @@ impl Inspector {
                 ocr_language: options.ocr.language.clone(),
                 ..InspectOptions::default()
             };
-            inspect_with_session(path, &legacy_options, &mut self.ocr)
+            inspect_with_session(&validated_path, &legacy_options, &mut self.ocr)
         };
+        if !input_rejected
+            && let Some(ref expected) = expected_observation
+            && !hashing::verify_identity(&validated_path, expected)
+        {
+            metadata::record_source_changed_during_read(&mut metadata.metadata);
+        }
         self.ocr.end_file();
         if metadata.metadata.extraction_support == reports::SupportStatus::IdentificationOnly {
             legacy.errors.clear();
@@ -943,7 +1036,7 @@ fn inspect_with_session(
         parquet: None,
         json: None,
         xml: None,
-        source_path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        source_path: path.to_path_buf(),
         artifacts: vec![],
         markdown: Markdown::default(),
         pdf: None,
@@ -972,6 +1065,7 @@ fn inspect_with_session(
         thumbnail: None,
         errors: vec![],
         packet: None,
+        native_headers: Vec::new(),
         native_units: Vec::new(),
         native_unit: reports::NativeUnit::Unknown,
         native_available: reports::QualifiedCount::default(),
@@ -980,14 +1074,20 @@ fn inspect_with_session(
     // opens the path; symbolic links and non-regular inputs are rejected with
     // the same precedence as the v2 hashing stage, so no reader can follow a
     // rejected link or block on a FIFO behind this gate.
-    match crate::hashing::validate_regular_file(path) {
+    let validated_path = match crate::hashing::validate_regular_file(path) {
         Ok((absolute, bytes)) => {
             report.counts.bytes = bytes;
-            report.source_path = absolute;
+            report.source_path = absolute.clone();
+            Some(absolute)
         }
-        Err(error) => report.error("input", error),
-    }
-    if report.errors.is_empty() {
+        Err(error) => {
+            report.error("input", error);
+            None
+        }
+    };
+    if let Some(path) = validated_path.as_deref()
+        && report.errors.is_empty()
+    {
         if let Err(error) = detect::detect(path, &mut report) {
             report.error("detection", error);
         } else if report.format.detected_mime.as_deref().is_some_and(|mime| {
@@ -1078,9 +1178,18 @@ fn inspect_with_session(
         {
             pdf::inspect(path, &mut report, options, ocr);
         } else if report.format.bucket == "Images" {
-            images::inspect(path, &mut report, options, ocr);
+            let mime = report.format.detected_mime.as_deref().unwrap_or("");
+            if metadata::is_supported_raster_format(
+                mime,
+                &report.format.extension,
+                &report.format.basis,
+            ) {
+                images::inspect(path, &mut report, options, ocr);
+            } else if options.native_selection.is_some() {
+                selection::unsupported(&mut report);
+            }
         } else if report.format.detected_mime.as_deref() == Some("application/vnd.apache.parquet")
-            || extension == "parquet"
+            || (report.format.basis == "extension" && extension == "parquet")
         {
             parquet::inspect(path, &mut report, options);
         } else if report.format.basis == "extension" && matches!(extension.as_str(), "csv" | "tsv")

@@ -99,9 +99,11 @@ fn ocr_language_spellings_reach_local_model_checks_offline() {
         let output = run(BINARIES[0], &arguments, Some(&tessdata));
         assert_eq!(output.status.code(), Some(2), "{label}: {output:?}");
         let report = json(&output);
-        assert_eq!(report["metadata"]["status"], "partial", "{label}");
+        assert_eq!(report["schema_version"], 3, "{label}");
+        assert_eq!(report["status"], "partial", "{label}");
+        assert_eq!(report["metadata"]["status"], "complete", "{label}");
         assert!(
-            report["metadata"]["diagnostics"]
+            report["diagnostics"]
                 .as_array()
                 .expect("diagnostics array")
                 .iter()
@@ -110,7 +112,7 @@ fn ocr_language_spellings_reach_local_model_checks_offline() {
                         .as_str()
                         .is_some_and(|message| message.contains(expected_model))),
             "{label}: {}",
-            report["metadata"]["diagnostics"]
+            report["diagnostics"]
         );
         let unit = &report["content"]["units"][0];
         assert_eq!(unit["provenance"][0]["origin"], "native", "{label}");
@@ -151,9 +153,11 @@ fn invalid_ocr_language_fails_closed_without_losing_content() {
     );
     assert_eq!(output.status.code(), Some(2));
     let report = json(&output);
-    assert_eq!(report["metadata"]["status"], "partial");
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "partial");
+    assert_eq!(report["metadata"]["status"], "complete");
     assert!(
-        report["metadata"]["diagnostics"]
+        report["diagnostics"]
             .as_array()
             .expect("diagnostics array")
             .iter()
@@ -162,7 +166,7 @@ fn invalid_ocr_language_fails_closed_without_losing_content() {
                     .as_str()
                     .is_some_and(|message| message.contains("invalid local OCR language"))),
         "{}",
-        report["metadata"]["diagnostics"]
+        report["diagnostics"]
     );
     let unit = &report["content"]["units"][0];
     assert_eq!(unit["provenance"][0]["origin"], "native");
@@ -191,6 +195,7 @@ fn ocr_language_leaves_non_ocr_extraction_untouched() {
     );
     assert_eq!(enabled.status.code(), Some(0));
     let enabled = json(&enabled);
+    assert_eq!(enabled["status"], "complete");
     assert_eq!(enabled["metadata"]["status"], "complete");
     let disabled = run(
         BINARIES[0],
@@ -205,6 +210,7 @@ fn ocr_language_leaves_non_ocr_extraction_untouched() {
     );
     assert_eq!(disabled.status.code(), Some(0));
     let disabled = json(&disabled);
+    assert_eq!(disabled["status"], "complete");
     assert_eq!(disabled["metadata"]["status"], "complete");
     assert!(disabled["content"]["units"][0]["provenance"][0]["ocr"].is_null());
 }
@@ -242,15 +248,18 @@ fn english_alias_ocr_uses_local_model_and_reports_canonical_language() {
     );
     assert_eq!(extracted.status.code(), Some(0), "{extracted:?}");
     let report = json(&extracted);
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "complete");
     assert_eq!(report["metadata"]["status"], "complete");
     assert!(
-        !report["metadata"]["diagnostics"]
-            .as_array()
-            .expect("diagnostics array")
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "probe_ocr"),
+        report
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .is_none_or(|items| !items
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "probe_ocr")),
         "{}",
-        report["metadata"]["diagnostics"]
+        report["diagnostics"]
     );
     let unit = &report["content"]["units"][0];
     assert_eq!(unit["provenance"][0]["origin"], "ocr");

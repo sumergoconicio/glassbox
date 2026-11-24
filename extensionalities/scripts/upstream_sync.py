@@ -24,13 +24,17 @@ REPOSITORY = "sumergoconicio/glassbox"
 GATE = "Glassbox downstream gate"
 WORKFLOW = "Glassbox downstream CI"
 PROTECTED = ("extensionalities", ".github/workflows")
-PROTECTED_FILES = (".github/README.md",)
+PROTECTED_FILES = (".github/README.md", ".cargo/config.toml")
 IGNORE = b"/extensionalities/dev/"
 COAUTHOR = "Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>"
 
 
 class SyncError(RuntimeError):
-    pass
+    """Error raised when upstream sync planning, verification, or publication stops."""
+
+
+class NotFoundError(SyncError):
+    """GitHub API 404 Not Found error raised when a probed resource does not exist."""
 
 
 def git(root, *args, data=None, env=None):
@@ -81,7 +85,7 @@ def plan(root, base, upstream):
     Returns dict: resolved commit SHAs, resulting tree SHA, upstream tree SHA,
     GitHub tree overlay entries, and a boolean changed flag.
     Raises SyncError or subprocess.TimeoutExpired if refs are invalid, protected
-    paths have wrong Git object types or modes, upstream .github or .gitignore
+    paths have wrong Git object types or modes, upstream .cargo, .github or .gitignore
     shapes are unsafe, .gitignore is not UTF-8, or protected overlays drift.
     """
     base = oid(root, base + "^{commit}")
@@ -103,8 +107,9 @@ def plan(root, base, upstream):
         mode = entry[0]
         overlays.append({"path": path, "mode": mode.decode(), "type": "blob", "sha": blob})
     incoming = tree_entries(root, upstream)
-    if b".github" in incoming:
-        raise SyncError("Upstream .github is not a directory")
+    for directory in (".github", ".cargo"):
+        if directory.encode() in incoming:
+            raise SyncError(f"Upstream {directory} is not a directory")
     ignore = incoming.get(b".gitignore", b"100644 blob").split()
     if ignore[0] not in (b"100644", b"100755"):
         raise SyncError("Upstream .gitignore must be a regular file")
@@ -121,11 +126,12 @@ def plan(root, base, upstream):
     selected[b".gitignore"] = ignore[0] + b" blob " + blob
     scratch = root / "extensionalities/target"
     scratch.mkdir(parents=True, exist_ok=True)
-    index = Path(tempfile.mkdtemp(prefix="sync-plan-", dir=scratch)) / "index"
-    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
     records = b"".join(m + b"\t" + p + b"\0" for p, m in sorted(selected.items()))
-    git(root, "update-index", "-z", "--index-info", data=records, env=env)
-    tree = git(root, "write-tree", env=env).decode().strip()
+    with tempfile.TemporaryDirectory(prefix="sync-plan-", dir=scratch) as tmpdir:
+        index = Path(tmpdir) / "index"
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        git(root, "update-index", "-z", "--index-info", data=records, env=env)
+        tree = git(root, "write-tree", env=env).decode().strip()
     for overlay in overlays:
         if oid(root, f"{tree}:{overlay['path']}") != overlay["sha"]:
             raise SyncError("Protected overlay changed during planning")
@@ -141,7 +147,36 @@ def plan(root, base, upstream):
     }
 
 
+def _is_not_found(result):
+    """Report whether a failed `gh api` subprocess result represents HTTP 404 Not Found.
+
+    Accepts result (subprocess.CompletedProcess): failed `gh api` process output.
+    Returns bool: True only when stderr or JSON stdout explicitly signals HTTP 404.
+    Never raises on malformed stdout.
+    """
+    stderr = result.stderr or ""
+    if "HTTP 404" in stderr:
+        return True
+    stdout = (result.stdout or "").strip()
+    if stdout:
+        try:
+            body = json.loads(stdout)
+        except json.JSONDecodeError:
+            return False
+        if isinstance(body, dict) and str(body.get("status", "")) == "404":
+            return True
+    return False
+
+
 def api(repository, path="", payload=None, method="GET", paginate=False):
+    """Execute one GitHub REST API call via `gh api` with a 60-second timeout.
+
+    Accepts repository (str), path (str), payload (dict | None), method (str), and
+    paginate (bool).
+    Returns parsed JSON response body (dict or list).
+    Raises NotFoundError on HTTP 404, SyncError on any other non-zero exit code,
+    subprocess.TimeoutExpired on timeout, or json.JSONDecodeError on invalid JSON.
+    """
     args = ["gh", "api", f"repos/{repository}/{path}".rstrip("/"),
             "--method", method]
     if paginate:
@@ -153,8 +188,66 @@ def api(repository, path="", payload=None, method="GET", paginate=False):
         capture_output=True, text=True, timeout=60,
     )
     if result.returncode:
+        if _is_not_found(result):
+            raise NotFoundError(f"GitHub resource not found ({method} {path})")
         raise SyncError(f"GitHub request failed ({method} {path}); no retry attempted")
     return json.loads(result.stdout)
+
+
+def find_existing_ref(repository, branch):
+    """Probe GitHub for an exact `refs/heads/{branch}` reference without creating anything.
+
+    Accepts repository (str): `owner/repo` slug, and branch (str): branch name without
+    the `refs/heads/` prefix.
+    Returns dict | None: exact matching GitHub ref payload when present, or None when the
+    ref returns HTTP 404 or only prefix-matched sibling refs exist.
+    Raises SyncError on non-404 API failures or unexpected non-ref response shapes.
+    """
+    expected_ref = f"refs/heads/{branch}"
+    try:
+        response = api(repository, f"git/ref/heads/{branch}")
+    except NotFoundError:
+        return None
+    if isinstance(response, list):
+        for item in response:
+            if isinstance(item, dict) and item.get("ref") == expected_ref:
+                return item
+        return None
+    if isinstance(response, dict) and response.get("ref") == expected_ref:
+        return response
+    raise SyncError(f"Unexpected GitHub ref response for {expected_ref}")
+
+
+def verify_existing_branch_commit(repository, ref_obj, candidate):
+    """Verify an existing upstream-sync branch matches the planned tree and parent SHAs.
+
+    Accepts repository (str): `owner/repo` slug, ref_obj (dict): GitHub ref payload for
+    `refs/heads/{branch}`, and candidate (dict): verified planning result from `plan()`.
+    Returns str: verified 40-character commit SHA to reuse when creating the missing PR.
+    Raises SyncError if the ref object is not a valid commit SHA or its commit's tree SHA
+    or ordered parents differ from `candidate["tree"]` and `[candidate["base"], candidate["upstream"]]`.
+    """
+    obj = ref_obj.get("object")
+    if not isinstance(obj, dict) or obj.get("type") != "commit":
+        raise SyncError("Existing upstream-sync branch does not match verified tree/parents")
+    existing_sha = obj.get("sha")
+    if not isinstance(existing_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", existing_sha):
+        raise SyncError("Existing upstream-sync branch does not match verified tree/parents")
+    existing_commit = api(repository, f"git/commits/{existing_sha}")
+    if not isinstance(existing_commit, dict):
+        raise SyncError("Existing upstream-sync branch does not match verified tree/parents")
+    tree_obj = existing_commit.get("tree")
+    tree_sha = tree_obj.get("sha") if isinstance(tree_obj, dict) else None
+    parents = existing_commit.get("parents")
+    parent_shas = (
+        [p.get("sha") for p in parents if isinstance(p, dict)]
+        if isinstance(parents, list)
+        else []
+    )
+    expected_parents = [candidate["base"], candidate["upstream"]]
+    if tree_sha != candidate["tree"] or parent_shas != expected_parents:
+        raise SyncError("Existing upstream-sync branch does not match verified tree/parents")
+    return existing_sha
 
 
 def require_protection(settings):
@@ -235,6 +328,15 @@ def merge_when_green(repository, number, branch, head, base, wait_seconds=2400):
 
 
 def automate(root, base, upstream):
+    """Publish a verified upstream-sync PR and merge it when all checks and guards pass.
+
+    Accepts root (Path): repository root, base (str): base commit ref on main, and
+    upstream (str): upstream commit ref to mirror.
+    Returns None after creating (or recovering after partial branch publication) and
+    merging the sync PR, or exiting early when no upstream-owned files changed.
+    Raises SyncError if environment guards, branch protection, open-PR locks, tree/ref
+    verification, PR creation, or check/merge gates fail.
+    """
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise SyncError("Live automation is restricted to Glassbox GitHub Actions")
     if not os.environ.get("GH_TOKEN"):
@@ -257,19 +359,24 @@ def automate(root, base, upstream):
         return
     # Confirm the fork network can resolve the upstream parent before any write.
     api(repository, f"git/commits/{candidate['upstream']}")
-    tree = api(repository, "git/trees", {
-        "base_tree": candidate["upstream_tree"], "tree": candidate["overlays"],
-    }, method="POST")
-    if tree["sha"] != candidate["tree"]:
-        raise SyncError("GitHub tree differs from the verified local tree")
-    commit = api(repository, "git/commits", {
-        "message": f"chore: sync upstream LiteParse {candidate['upstream'][:12]}\n\n{COAUTHOR}",
-        "tree": tree["sha"], "parents": [candidate["base"], candidate["upstream"]],
-    }, method="POST")
     branch = f"automation/upstream-sync/{candidate['upstream'][:12]}-{candidate['base'][:12]}"
-    api(repository, "git/refs", {
-        "ref": f"refs/heads/{branch}", "sha": commit["sha"],
-    }, method="POST")
+    existing_ref = find_existing_ref(repository, branch)
+    if existing_ref is not None:
+        head_sha = verify_existing_branch_commit(repository, existing_ref, candidate)
+    else:
+        tree = api(repository, "git/trees", {
+            "base_tree": candidate["upstream_tree"], "tree": candidate["overlays"],
+        }, method="POST")
+        if tree["sha"] != candidate["tree"]:
+            raise SyncError("GitHub tree differs from the verified local tree")
+        commit = api(repository, "git/commits", {
+            "message": f"chore: sync upstream LiteParse {candidate['upstream'][:12]}\n\n{COAUTHOR}",
+            "tree": tree["sha"], "parents": [candidate["base"], candidate["upstream"]],
+        }, method="POST")
+        api(repository, "git/refs", {
+            "ref": f"refs/heads/{branch}", "sha": commit["sha"],
+        }, method="POST")
+        head_sha = commit["sha"]
     pr = api(repository, "pulls", {
         "title": f"Sync upstream LiteParse {candidate['upstream'][:12]}",
         "base": "main", "head": branch,
@@ -282,7 +389,7 @@ def automate(root, base, upstream):
         ),
     }, method="POST")
     print(f"Created {pr['html_url']}", flush=True)
-    merge_when_green(repository, pr["number"], branch, commit["sha"], candidate["base"])
+    merge_when_green(repository, pr["number"], branch, head_sha, candidate["base"])
     print(f"Merged {pr['html_url']}")
 
 

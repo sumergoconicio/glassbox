@@ -48,8 +48,9 @@ pub(crate) fn inspect(path: &Path, report: &mut InspectReport, options: &Inspect
         let text = match std::str::from_utf8(&bytes) {
             Ok(text) => text,
             // The bounded window can split a multi-byte character at its end;
-            // back off to the last complete boundary and disclose the cut.
-            Err(error) if capped && bytes.len().saturating_sub(error.valid_up_to()) <= 4 => {
+            // only an incomplete trailing sequence backs off to the last
+            // complete boundary so genuinely invalid bytes fail honestly.
+            Err(error) if capped && error.error_len().is_none() => {
                 std::str::from_utf8(&bytes[..error.valid_up_to()])?
             }
             Err(error) => return Err(error.into()),
@@ -76,24 +77,25 @@ pub(crate) fn inspect(path: &Path, report: &mut InspectReport, options: &Inspect
             }
             let mut emitted: u64 = 0;
             for (index, line) in text.lines().enumerate() {
+                let number = index as u64 + 1;
+                if !plan.contains(number) {
+                    continue;
+                }
                 if emitted >= TEXT_UNIT_CAP {
-                    // The unit cap bounds allocation; withheld selected units
-                    // are disclosed as truncated coverage, never dropped
-                    // silently.
+                    // The unit cap bounds allocation; only a withheld selected
+                    // unit discloses truncated coverage, never an unselected
+                    // line after a satisfiable selection has already finished.
                     report.text.truncated = true;
                     break;
                 }
-                let number = index as u64 + 1;
-                if plan.contains(number) {
-                    report.native_units.push(crate::selection::text_unit(
-                        number,
-                        NativeUnit::LogicalLine,
-                        None,
-                        line.to_string(),
-                        ContentOrigin::Native,
-                    ));
-                    emitted += 1;
-                }
+                report.native_units.push(crate::selection::text_unit(
+                    number,
+                    NativeUnit::LogicalLine,
+                    None,
+                    line.to_string(),
+                    ContentOrigin::Native,
+                ));
+                emitted += 1;
             }
         } else {
             report.append_text(text, options.max_chars);
@@ -274,6 +276,28 @@ mod tests {
         );
     }
 
+    /// Proves requesting exactly `TEXT_UNIT_CAP` lines from a file with
+    /// `TEXT_UNIT_CAP + 1` lines completes without false truncation.
+    ///
+    /// Accepts no parameters. Returns unit after selecting `FirstN { count: TEXT_UNIT_CAP }`.
+    /// Setting `report.text.truncated` on an unselected trailing line panics.
+    #[test]
+    fn first_n_equal_to_unit_cap_does_not_false_trigger_truncation() {
+        let directory = workdir("exact-cap-first-n");
+        let path = directory.join("exact-cap.txt");
+        let total_lines = TEXT_UNIT_CAP + 1;
+        std::fs::write(&path, "\n".repeat(total_lines as usize)).unwrap();
+        let (options, mut report) = selected(NativeSelection::FirstN {
+            count: TEXT_UNIT_CAP,
+        });
+        inspect(&path, &mut report, &options);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.native_available.value, Some(total_lines));
+        assert_eq!(report.native_available.completeness, Completeness::Exact);
+        assert_eq!(report.native_units.len(), TEXT_UNIT_CAP as usize);
+        assert!(!report.text.truncated);
+    }
+
     /// Proves genuinely invalid UTF-8 still fails truthfully when uncapped.
     ///
     /// Accepts no parameters. Returns unit after reading a small invalid file.
@@ -283,6 +307,26 @@ mod tests {
         let directory = workdir("invalid");
         let path = directory.join("invalid.txt");
         std::fs::write(&path, b"valid\n\xFFinvalid\n").unwrap();
+        let (options, mut report) = selected(NativeSelection::All);
+        inspect(&path, &mut report, &options);
+        assert!(!report.errors.is_empty());
+        assert!(report.native_units.is_empty());
+        assert!(report.errors.iter().any(|error| error.stage == "text"));
+    }
+
+    /// Proves genuinely invalid UTF-8 within the last 4 bytes of a capped
+    /// window fails truthfully instead of backing off silently.
+    ///
+    /// Accepts no parameters. Returns unit after reading a capped file whose
+    /// trailing window bytes contain `0xFF`. Passing silently or omitting the
+    /// `"text"` error panics.
+    #[test]
+    fn invalid_utf8_in_final_four_bytes_of_capped_window_fails_truthfully() {
+        let directory = workdir("capped-invalid-tail");
+        let path = directory.join("invalid-tail.txt");
+        let mut bytes = "a\n".repeat(2047).into_bytes();
+        bytes.extend_from_slice(b"\xFFab");
+        std::fs::write(&path, bytes).unwrap();
         let (options, mut report) = selected(NativeSelection::All);
         inspect(&path, &mut report, &options);
         assert!(!report.errors.is_empty());

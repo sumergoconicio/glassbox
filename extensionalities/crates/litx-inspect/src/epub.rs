@@ -1,3 +1,6 @@
+//! Module: glassbox-inspect EPUB package reader.
+//! File: epub.rs.
+//! Responsibility: Parse EPUB container/OPF metadata, resolve spine XHTML parts, and extract readable text with block/table whitespace boundaries.
 use crate::{
     Claim, InspectOptions, InspectReport,
     archive::Archive,
@@ -10,6 +13,11 @@ const CONTAINER: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
 const OPF: &str = "http://www.idpf.org/2007/opf";
 const DC: &str = "http://purl.org/dc/elements/1.1/";
 
+/// Inspects an EPUB archive if `META-INF/container.xml` is present.
+///
+/// Accepts an open ZIP archive, destination report, and extraction options.
+/// Returns unit after populating metadata and selected spine text; container
+/// or OPF failures are recorded under stage `"epub"`.
 pub(crate) fn inspect(archive: &mut Archive, report: &mut InspectReport, options: &InspectOptions) {
     if !archive.names.iter().any(|n| n == "META-INF/container.xml") {
         return;
@@ -197,12 +205,26 @@ fn inner(
     Ok(())
 }
 
+/// Resolves an EPUB relative href against `base` after stripping fragments and percent-decoding.
+///
+/// Accepts the base package part path and raw href string. Returns the safe
+/// archive-internal path or an error when decoding fails or the path escapes
+/// the package root.
 fn resolve(base: &str, target: &str) -> xml::Result<String> {
     let target = target.split('#').next().unwrap_or("");
     let decoded = percent_encoding::percent_decode_str(target).decode_utf8()?;
     office::resolve_part(base, &decoded)
 }
 
+/// Appends visible XHTML text from `node` to `out`, preserving readable
+/// boundary whitespace across block elements and table cells.
+///
+/// Accepts a parsed XHTML element node and mutable destination string. Returns
+/// unit after appending visible descendant text while skipping `head`,
+/// `script`, and `style` subtrees. Emits a trailing `\n` after block elements
+/// (when `out` is non-empty and does not already end with `\n`) and `\t` after
+/// `td`/`th` cells (when `out` is non-empty and does not already end with
+/// `\n`, `\t`, or `' '`). Performs no I/O and cannot fail.
 fn visible(node: &Node, out: &mut String) {
     if matches!(node.name.as_str(), "head" | "script" | "style") {
         return;
@@ -215,9 +237,40 @@ fn visible(node: &Node, out: &mut String) {
     }
     if matches!(
         node.name.as_str(),
-        "p" | "div" | "br" | "li" | "h1" | "h2" | "h3" | "section"
-    ) && !out.ends_with('\n')
+        "p" | "div"
+            | "br"
+            | "li"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "blockquote"
+            | "pre"
+            | "tr"
+            | "dt"
+            | "dd"
+            | "figure"
+            | "figcaption"
+            | "hr"
+    ) && !out.is_empty()
+        && !out.ends_with('\n')
     {
+        if node.name == "tr" && out.ends_with('\t') {
+            out.pop();
+        }
         out.push('\n');
+    } else if matches!(node.name.as_str(), "td" | "th")
+        && !out.is_empty()
+        && !out.ends_with(['\n', '\t', ' '])
+    {
+        out.push('\t');
     }
 }

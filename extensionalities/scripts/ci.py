@@ -85,16 +85,18 @@ def workflows():
 
 
 def smoke():
-    """Exercise release inspect/extract behavior, metadata batching, and offline OCR.
+    """Exercise release inspect/extract behavior, bodymatter markers, batching, and offline OCR.
 
     Accepts no parameters and resolves release binaries through CARGO_TARGET_DIR.
-    Returns unit after asserting v2 inspection and canonical native-unit extraction.
+    Returns unit after asserting schema v3 inspection, canonical native-unit extraction,
+    and bodymatter:v1 Markdown markers.
     Raises subprocess errors or AssertionError for contract, alias, or exit failures.
     """
-    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "extensionalities/target"))
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or (ROOT / "extensionalities/target"))
     if not target.is_absolute():
         target = ROOT / target
     fixture = ROOT / "extensionalities/fixtures/hello.txt"
+    pdf_fixture = ROOT / "extensionalities/fixtures/native.pdf"
     reports = []
     for name in ("glassbox", "litx"):
         executable = target / "release" / name
@@ -104,14 +106,20 @@ def smoke():
             )
             report = json.loads(output)
             if command == "inspect":
-                assert report["schema_version"] == 2 and report["kind"] == "inspect"
-                assert report["metadata"]["status"] == "complete"
-                assert not report["metadata"]["diagnostics"], report["metadata"]
+                assert report["schema_version"] == 3 and report["kind"] == "inspect"
+                assert report["status"] == "complete"
+                for block in ("file", "format", "description", "structure", "readiness"):
+                    assert block in report, report
+                assert "diagnostics" not in report, report
+                assert "provenance" not in report, report
                 assert "text" not in report and "errors" not in report
             else:
-                assert report["schema_version"] == 2 and report["kind"] == "extract"
+                assert report["schema_version"] == 3 and report["kind"] == "extract"
+                assert report["status"] == "complete"
+                assert report["metadata"]["schema_version"] == 3
+                assert report["metadata"]["kind"] == "inspect"
                 assert report["metadata"]["status"] == "complete"
-                assert not report["metadata"]["diagnostics"], report["metadata"]
+                assert "diagnostics" not in report, report
                 content = "\n".join(
                     unit.get("text") or "" for unit in report["content"]["units"]
                 )
@@ -125,26 +133,38 @@ def smoke():
         )
         response = json.loads(output)
         assert response["id"] == "smoke"
-        assert response["report"]["schema_version"] == 2
+        assert response["report"]["schema_version"] == 3
+        assert response["report"]["kind"] == "inspect"
+        assert response["report"]["status"] == "complete"
         assert "text" not in response["report"]
     assert reports[0] == reports[2] and reports[1] == reports[3]
+    markdown_output = subprocess.check_output(
+        [str(target / "release/glassbox"), "extract", "--no-ocr",
+         "--format", "markdown", str(pdf_fixture)],
+        cwd=ROOT,
+        timeout=30,
+    ).decode()
+    assert '<!-- bodymatter:v1 <page number="1"' in markdown_output, markdown_output
+    assert "# Glassbox extraction" not in markdown_output, markdown_output
+    target.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix="ci-ocr-", dir=ROOT / "extensionalities/target"
+        prefix="ci-ocr-", dir=target
     ) as directory:
         # An explicitly missing model must never cause a runtime download.
         env = {**os.environ, "TESSDATA_PREFIX": str(Path(directory) / "missing")}
         completed = subprocess.run(
             [str(target / "release/glassbox"), "extract", "--identify",
-             str(ROOT / "extensionalities/fixtures/native.pdf")],
+             str(pdf_fixture)],
             cwd=ROOT, env=env, timeout=30, capture_output=True, check=False,
         )
         assert completed.returncode == 2, completed.stderr
         report = json.loads(completed.stdout)
-        assert report["kind"] == "extract" and report["completeness"] == "partial"
+        assert report["schema_version"] == 3 and report["kind"] == "extract"
+        assert report["status"] == "partial" and report["completeness"] == "partial"
         assert any(item["code"] == "pdf_ocr"
-                   for item in report["metadata"]["diagnostics"])
+                   for item in report["diagnostics"])
         assert "Native PDF evidence" in report["content"]["units"][0]["text"]
-    print("PASS: metadata inspection, canonical extraction, batching, and offline OCR")
+    print("PASS: metadata inspection, canonical extraction, bodymatter markers, batching, and offline OCR")
 
 
 def main():
@@ -179,8 +199,12 @@ def main():
     elif args.command == "workflows":
         workflows()
     elif args.command == "check":
-        run("python3", "-B", "-m", "unittest", "discover",
-            "-s", "extensionalities/scripts/tests", "-p", "test_automation.py", "-v")
+        run(
+            "python3", "-B", "-m", "unittest",
+            "extensionalities/scripts/tests/test_automation.py",
+            "extensionalities/scripts/tests/test_inspect_extract_outputs_driver.py",
+            "-v",
+        )
         run("cargo", "clippy", "--locked", "--manifest-path", MANIFEST,
             "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings")
         run("cargo", "test", "--locked", "--manifest-path", MANIFEST, "--workspace")

@@ -1,6 +1,6 @@
-// Module: glassbox-cli safe serial directory inventory.
-// File: inventory.rs.
-// Responsibility: Produce deterministic bounded JSONL for local files without links or mount crossing.
+//! Module: glassbox-cli safe serial directory inventory.
+//! File: inventory.rs.
+//! Responsibility: Produce deterministic bounded schema v3 JSONL for local files without links or mount crossing.
 
 use glassbox_inspect::Inspector;
 use glassbox_inspect::reports::{
@@ -29,6 +29,14 @@ const O_NONBLOCK: i32 = 0x800;
 // O_PATH is 010000000 octal on every Linux port in scope (asm-generic value).
 #[cfg(target_os = "linux")]
 const O_PATH: i32 = 0x200000;
+
+/// Maximum directory recursion depth below the inventory root.
+///
+/// Limits simultaneously open non-tail ancestor descriptors and recursion stack
+/// frames so deep directory trees emit a deterministic diagnostic instead of
+/// risking `EMFILE` or stack overflow.
+#[cfg(target_os = "linux")]
+const MAX_DIRECTORY_DEPTH: usize = 256;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -470,6 +478,7 @@ impl<'a> Inventory<'a> {
         }
         report.metadata.identity.consistency = ConsistencyStatus::SourceChanged;
         report.metadata.digest.digest = None;
+        report.metadata.digest.fingerprint = None;
         report.metadata.digest.consistency = ConsistencyStatus::SourceChanged;
         report.metadata.digest.source_identity = ConsistencyStatus::SourceChanged;
         report.metadata.diagnostics.push(Diagnostic {
@@ -487,10 +496,18 @@ impl<'a> Inventory<'a> {
 
     /// Admits one regular file for inspection under the shared file/OCR budget.
     ///
-    /// Accepts a path and opaque identity from the still-open anchored handle.
-    /// Returns true after bounded admission and false after cancellation. Invalid
-    /// Unicode paths produce a failed diagnostic; no contents are read by traversal.
-    fn file(&mut self, path: &Path, expected: Option<&str>) -> Result<bool, String> {
+    /// Accepts a path, opaque identity from the still-open anchored handle, and
+    /// an optional opened file handle that stays pinned across queueing,
+    /// inspection, and identity verification to prevent inode-number reuse.
+    /// Returns true after bounded admission and false after cancellation.
+    /// Invalid Unicode paths produce a failed diagnostic; no contents are read
+    /// by traversal.
+    fn file(
+        &mut self,
+        path: &Path,
+        expected: Option<&str>,
+        pinned_file: Option<std::fs::File>,
+    ) -> Result<bool, String> {
         if path.to_str().is_none() {
             return self.error(
                 path,
@@ -500,10 +517,11 @@ impl<'a> Inventory<'a> {
             );
         }
         self.sequence += 1;
-        self.producer.request(
+        self.producer.request_with_file(
             Value::from(self.sequence),
             path.to_path_buf(),
             expected.map(str::to_owned),
+            pinned_file,
         )
     }
 
@@ -546,16 +564,27 @@ impl<'a> Inventory<'a> {
 
     /// Visits one sorted directory level with bounded production and opt-in recursion.
     ///
-    /// Accepts an absolute reporting path and anchored no-follow directory handle.
-    /// Returns true after all entries or false when cancellation stops admission.
-    /// Enumeration and per-entry metadata are read through the anchored handle,
-    /// never through the path, so every entry resolves against the same inode
-    /// the traversal opened. Read/open failures become ordered records and later
-    /// entries continue; names alone are sorted and file bytes/reports are never
-    /// accumulated by the traversal.
+    /// Accepts an absolute reporting path, an owned anchored no-follow
+    /// directory handle, and the current recursion depth from the root (0 at
+    /// root). Returns true after all entries or false when cancellation stops
+    /// admission. Enumeration and per-entry metadata are read through the
+    /// anchored handle, never through the path, so every entry resolves against
+    /// the same inode the traversal opened. When recursing into the final
+    /// sorted entry of a directory, the parent handle is dropped before descent
+    /// so linear chains retain O(1) directory descriptors; subdirectories beyond
+    /// `MAX_DIRECTORY_DEPTH` emit an ordered `directory_depth_exceeded` partial
+    /// diagnostic instead of recursing. Read/open failures become ordered
+    /// records and later entries continue; names alone are sorted and file
+    /// bytes/reports are never accumulated by the traversal.
     #[cfg(target_os = "linux")]
-    fn directory(&mut self, path: &Path, handle: &std::fs::File) -> Result<bool, String> {
-        let mut names = match anchored_names(handle) {
+    fn directory(
+        &mut self,
+        path: &Path,
+        handle: std::fs::File,
+        depth: usize,
+    ) -> Result<bool, String> {
+        let mut handle = Some(handle);
+        let mut names = match anchored_names(handle.as_ref().expect("directory handle is open")) {
             Ok(names) => names,
             Err(error) => {
                 return self.error(
@@ -567,9 +596,13 @@ impl<'a> Inventory<'a> {
             }
         };
         names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        for name in names {
+        let total = names.len();
+        for (index, name) in names.into_iter().enumerate() {
             let child = path.join(&name);
-            let metadata = match open_entry_metadata(handle, &name) {
+            let metadata = match open_entry_metadata(
+                handle.as_ref().expect("directory handle is open"),
+                &name,
+            ) {
                 Ok(metadata) => metadata,
                 // ELOOP is Linux's link rejection; the O_PATH metadata open
                 // already yields symlink handles, so this only guards unusual
@@ -618,9 +651,30 @@ impl<'a> Inventory<'a> {
                 if !same_mount {
                     continue;
                 }
-                match open_entry(handle, &name, true) {
+                if depth >= MAX_DIRECTORY_DEPTH {
+                    let detail = format!(
+                        "directory recursion depth exceeds maximum of {MAX_DIRECTORY_DEPTH}; subtree skipped"
+                    );
+                    if !self.error(
+                        &child,
+                        "directory_depth_exceeded",
+                        detail,
+                        OperationStatus::Partial,
+                    )? {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                match open_entry(
+                    handle.as_ref().expect("directory handle is open"),
+                    &name,
+                    true,
+                ) {
                     Ok((child_handle, _)) => {
-                        if !self.directory(&child, &child_handle)? {
+                        if index + 1 == total {
+                            drop(handle.take());
+                        }
+                        if !self.directory(&child, child_handle, depth + 1)? {
                             return Ok(false);
                         }
                     }
@@ -646,8 +700,12 @@ impl<'a> Inventory<'a> {
             if !same_mount {
                 continue;
             }
-            match open_entry(handle, &name, false) {
-                Ok((_file, opened)) => {
+            match open_entry(
+                handle.as_ref().expect("directory handle is open"),
+                &name,
+                false,
+            ) {
+                Ok((file, opened)) => {
                     #[cfg(unix)]
                     let expected = {
                         use std::os::unix::fs::MetadataExt;
@@ -655,7 +713,7 @@ impl<'a> Inventory<'a> {
                     };
                     #[cfg(not(unix))]
                     let expected = None;
-                    if !self.file(&child, expected.as_deref())? {
+                    if !self.file(&child, expected.as_deref(), Some(file))? {
                         return Ok(false);
                     }
                 }
@@ -750,7 +808,7 @@ fn produce(
         Some(_) => match open_directory(&inventory.root) {
             Ok(handle) => {
                 let root = inventory.root.clone();
-                inventory.directory(&root, &handle)?;
+                inventory.directory(&root, handle, 0)?;
             }
             Err(error) => {
                 let root = inventory.root.clone();
@@ -769,32 +827,41 @@ fn produce(
 /// Runs deterministic ordered inventory with bounded shared file/OCR workers.
 ///
 /// Accepts root, recursion flag, positive jobs, optional external artifact
-/// directory, and JSONL writer. Returns aggregate status after all responses
-/// flush and workers join. Output/input transport errors are returned directly.
+/// directory, `full_hash` override, `verbose` provenance flag, and JSONL
+/// writer. Returns aggregate status after all schema v3 responses flush and
+/// workers join. Output/input transport errors are returned directly.
 #[cfg(target_os = "linux")]
 pub(crate) fn run<W: Write>(
     root: &Path,
     recursive: bool,
     jobs: usize,
     output_dir: Option<&Path>,
+    full_hash: bool,
+    verbose: bool,
     mut output: W,
 ) -> std::io::Result<OperationStatus> {
     crate::batch::run(
         jobs,
         move |producer| produce(root, recursive, producer),
         |budget, _cancellation| {
-            let mut inspector = Inspector::with_shared_budget(budget);
+            let mut inspector = Inspector::with_shared_budget(budget).with_full_hash(full_hash);
             let options = InspectOptions::default();
-            move |request| {
+            move |mut request| {
                 let sequence = request.sequence as usize;
                 let expected = request.expected.clone();
+                let pinned = request.pinned_file.take();
                 let mut report = inspector.inspect(&request.path, &options);
                 Inventory::check_identity(&mut report, expected.as_deref());
+                drop(pinned);
                 if let Some(directory) = output_dir {
-                    crate::output::persist_metadata(&mut report, directory, sequence);
+                    crate::output::persist_metadata(&mut report, directory, sequence, verbose);
                 }
                 let status = report.metadata.status;
-                crate::batch::BatchCompletion::report(request, status, serde_json::to_value(report))
+                crate::batch::BatchCompletion::report(
+                    request,
+                    status,
+                    serde_json::to_value(report.to_v3(verbose)),
+                )
             }
         },
         &mut output,
@@ -805,15 +872,18 @@ pub(crate) fn run<W: Write>(
 
 /// Reports unsupported directory inventory without touching the host filesystem.
 ///
-/// Accepts root, recursion flag, jobs, artifact directory, and output writer.
-/// Returns an I/O unsupported error; no paths, mounts, network endpoints, or
-/// output files are accessed on non-Linux hosts.
+/// Accepts root, recursion flag, jobs, artifact directory, `full_hash`
+/// override, `verbose` flag, and output writer. Returns an I/O unsupported
+/// error; no paths, mounts, network endpoints, or output files are accessed on
+/// non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn run<W: Write>(
     _root: &Path,
     _recursive: bool,
     _jobs: usize,
     _output_dir: Option<&Path>,
+    _full_hash: bool,
+    _verbose: bool,
     _output: W,
 ) -> std::io::Result<OperationStatus> {
     Err(std::io::Error::new(
@@ -1041,5 +1111,147 @@ mod tests {
             "closedir must close the duplicated descriptor after success"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Checks tail recursion drops parent directory handles while pinning regular files.
+    ///
+    /// Accepts no parameters. Returns unit after traversing a single-child
+    /// directory chain through `produce` and inspecting `/proc/self/fd` inside
+    /// the worker. Retained parent directory descriptors or an unpinned regular
+    /// file fail the assertions; the scratch tree is removed afterward.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tail_recursion_drops_parent_directory_fds_and_pins_regular_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let base = root.join(format!("tail-fd-{}-{stamp}", std::process::id()));
+        let sub_a = base.join("a");
+        let sub_b = sub_a.join("b");
+        let sub_c = sub_b.join("c");
+        std::fs::create_dir_all(&sub_c).expect("nested chain created");
+        let leaf = sub_c.join("leaf.txt");
+        std::fs::write(&leaf, b"pinned leaf").expect("leaf file created");
+
+        let canonical_base = std::fs::canonicalize(&base).expect("base canonicalized");
+        let canonical_a = std::fs::canonicalize(&sub_a).expect("sub_a canonicalized");
+        let canonical_b = std::fs::canonicalize(&sub_b).expect("sub_b canonicalized");
+        let canonical_leaf = std::fs::canonicalize(&leaf).expect("leaf canonicalized");
+
+        let mut output = Vec::new();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_worker = std::sync::Arc::clone(&observed);
+        let outcome = crate::batch::run(
+            1,
+            move |producer| produce(&canonical_base, true, producer),
+            |_budget, _cancellation| {
+                let observed_worker = std::sync::Arc::clone(&observed_worker);
+                let canonical_a = canonical_a.clone();
+                let canonical_b = canonical_b.clone();
+                let canonical_leaf = canonical_leaf.clone();
+                let base_check = std::fs::canonicalize(&base).expect("base canonicalized");
+                move |mut request| {
+                    observed_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(request.path, canonical_leaf);
+                    assert_eq!(
+                        count_descriptors_for(&base_check),
+                        0,
+                        "root directory FD must be dropped before tail recursion"
+                    );
+                    assert_eq!(
+                        count_descriptors_for(&canonical_a),
+                        0,
+                        "intermediate directory FD must be dropped before tail recursion"
+                    );
+                    assert_eq!(
+                        count_descriptors_for(&canonical_b),
+                        0,
+                        "parent directory FD must be dropped before tail recursion"
+                    );
+                    assert!(
+                        request.pinned_file.is_some(),
+                        "regular-file handle must stay pinned on BatchRequest"
+                    );
+                    assert!(
+                        count_descriptors_for(&canonical_leaf) >= 1,
+                        "pinned regular file must remain open in /proc/self/fd during worker execution"
+                    );
+                    drop(request.pinned_file.take());
+                    assert_eq!(
+                        count_descriptors_for(&canonical_leaf),
+                        0,
+                        "dropping the pinned handle must release the descriptor"
+                    );
+                    crate::batch::BatchCompletion::report(
+                        request,
+                        OperationStatus::Complete,
+                        Ok(serde_json::json!({"ok": true})),
+                    )
+                }
+            },
+            &mut output,
+        )
+        .expect("tail-recursive inventory batch succeeds");
+        assert_eq!(outcome.status, OperationStatus::Complete);
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Checks recursion enforces `MAX_DIRECTORY_DEPTH` with ordered partial diagnostics.
+    ///
+    /// Accepts no parameters. Returns unit after running `inventory::run` over
+    /// a chain of `MAX_DIRECTORY_DEPTH` nested directories containing sibling
+    /// files and one deeper subdirectory. Missing leaf files, traversed depth
+    /// beyond the cap, wrong ordering, or wrong error code fail the assertions;
+    /// the scratch tree is removed afterward.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recursion_enforces_max_directory_depth_in_sorted_order() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let base = root.join(format!("depth-limit-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("base directory created");
+        let base = std::fs::canonicalize(&base).expect("base directory canonicalized");
+        let mut deepest = base.clone();
+        for _ in 0..MAX_DIRECTORY_DEPTH {
+            deepest.push("d");
+        }
+        let too_deep = deepest.join("m_too_deep");
+        std::fs::create_dir_all(&too_deep).expect("deep chain created");
+        let at_limit = deepest.join("a_at_limit.txt");
+        let after_limit = deepest.join("z_after.txt");
+        let skipped_leaf = too_deep.join("never_visited.txt");
+        std::fs::write(&at_limit, b"at limit").expect("leaf at limit created");
+        std::fs::write(&after_limit, b"after limit").expect("sibling file created");
+        std::fs::write(&skipped_leaf, b"too deep").expect("deep leaf created");
+
+        let mut output = Vec::new();
+        let status = run(&base, true, 2, None, false, false, &mut output)
+            .expect("inventory run completes without transport error");
+        assert_eq!(status, OperationStatus::Partial);
+
+        let lines: Vec<Value> = String::from_utf8(output)
+            .expect("valid UTF-8 JSONL")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+            .collect();
+        assert_eq!(lines.len(), 3, "expected 2 files + 1 depth diagnostic");
+        assert_eq!(lines[0]["sequence"], 1);
+        assert_eq!(lines[0]["status"], "complete");
+        assert_eq!(lines[0]["path"], at_limit.to_str().unwrap());
+        assert_eq!(lines[1]["sequence"], 2);
+        assert_eq!(lines[1]["status"], "partial");
+        assert_eq!(lines[1]["path"], too_deep.to_str().unwrap());
+        assert_eq!(lines[1]["error"]["code"], "directory_depth_exceeded");
+        assert_eq!(lines[2]["sequence"], 3);
+        assert_eq!(lines[2]["status"], "complete");
+        assert_eq!(lines[2]["path"], after_limit.to_str().unwrap());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

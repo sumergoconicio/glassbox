@@ -264,21 +264,36 @@ pub(crate) fn inspect(
                 crate::reports::NativeUnit::DocumentBlock,
                 blocks.len() as u64,
             )?;
+            let mut table_ordinal: u64 = 0;
             for (index, block) in blocks.into_iter().enumerate() {
                 let number = index as u64 + 1;
+                let is_table = block.is(TABLE, "table");
+                let marker_index = if is_table {
+                    table_ordinal += 1;
+                    Some(table_ordinal)
+                } else {
+                    None
+                };
                 if plan.contains(number) {
-                    let text = if block.is(TABLE, "table") {
+                    let text = if is_table {
                         odf_table_text(block, &mut expansion, options.max_chars)?
                     } else {
                         expansion.text(block)?
                     };
-                    report.native_units.push(crate::selection::text_unit(
+                    let unit_kind = if is_table {
+                        crate::reports::NativeUnit::Table
+                    } else {
+                        crate::reports::NativeUnit::DocumentBlock
+                    };
+                    let mut unit = crate::selection::text_unit(
                         number,
-                        crate::reports::NativeUnit::DocumentBlock,
+                        unit_kind,
                         Some(format!("content.xml#body/{number}")),
                         text,
                         crate::reports::ContentOrigin::Native,
-                    ));
+                    );
+                    unit.marker_index = marker_index;
+                    report.native_units.push(unit);
                 }
             }
         } else {
@@ -505,6 +520,7 @@ fn spreadsheet(
     let sheet_capped = selection_plan.is_none() && tables.len() > sheet_limit;
     let mut budget = Budget::default();
     let mut work = WorkBudget::default();
+    let mut remaining_preview_cells = crate::markdown::MAX_WORKBOOK_PREVIEW_CELLS;
     let mut expanded_bytes = 0usize;
     let mut work_capped = false;
     let mut attempted_sheets = 0usize;
@@ -533,12 +549,15 @@ fn spreadsheet(
                 let (mut row_prefix, mut row_chars) = (String::new(), 0usize);
                 let mut preview_chars = 0usize;
                 let mut last_text_col = 0usize;
+                let previewing = markdown.can_buffer_row();
+                let mut row_cells: Vec<(usize, String)> = Vec::new();
                 let mut append = |value: &str, repeats: usize| {
                     let chars = value.chars().count();
                     accumulate(&mut row_chars, chars, repeats);
-                    for _ in 0..repeats
-                        .min(options.max_chars.saturating_sub(preview_chars) / chars.max(1) + 1)
-                    {
+                    for _ in 0..repeats.min(
+                        (options.max_chars.saturating_sub(preview_chars) / chars.max(1))
+                            .saturating_add(1),
+                    ) {
                         let take = chars.min(options.max_chars.saturating_sub(preview_chars));
                         row_prefix.extend(value.chars().take(take));
                         preview_chars += take;
@@ -630,6 +649,9 @@ fn spreadsheet(
                                 repeat_rows,
                                 &mut budget,
                             )?;
+                            if previewing && column <= crate::markdown::MAX_PREVIEW_COLS {
+                                row_cells.push((column, value.clone()));
+                            }
                             if column > 1 {
                                 append("\t", column - last_text_col.max(1));
                             }
@@ -660,13 +682,9 @@ fn spreadsheet(
                 }
                 if last_text_col > 0 {
                     append("\n", 1);
-                    markdown.push(
-                        row_prefix
-                            .trim_end_matches('\n')
-                            .split('\t')
-                            .enumerate()
-                            .map(|(i, value)| (i + 1, value.to_string()))
-                            .collect(),
+                    markdown.push_bounded_row(
+                        row_number,
+                        &row_cells,
                         repeat_rows,
                         options.max_chars,
                     );
@@ -694,36 +712,15 @@ fn spreadsheet(
                 options,
             );
             let mut sheet = grid.finish();
-            markdown.write(&mut sheet, report, options);
+            let row_numbers =
+                markdown.write(&mut sheet, report, options, &mut remaining_preview_cells);
             if selection_plan.is_some() {
-                let rows = sheet
-                    .preview_rows
-                    .iter()
-                    .enumerate()
-                    .map(|(row_index, row)| crate::reports::ContentRow {
-                        row_index: row_index as u64 + 1,
-                        values: row.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let text = sheet
-                    .preview_rows
-                    .iter()
-                    .map(|row| row.join("\t"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut unit = crate::selection::dataset_unit(
-                    index as u64 + 1,
-                    crate::reports::NativeUnit::Worksheet,
-                    Some(format!("content.xml#sheet/{}", sheet.name)),
-                    text,
-                    rows,
-                );
-                unit.completeness = if sheet.preview_truncated {
-                    crate::reports::Completeness::Partial
-                } else {
-                    crate::reports::Completeness::Exact
-                };
-                report.native_units.push(unit);
+                report.native_units.push(crate::selection::worksheet_unit(
+                    index,
+                    format!("content.xml#sheet/{}", sheet.name),
+                    &mut sheet,
+                    row_numbers,
+                ));
             }
             report.sheets.push(sheet);
             Ok(())

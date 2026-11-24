@@ -109,6 +109,49 @@ fn extension_routed_non_parquet_bytes_also_defer_without_decoding() {
     assert_eq!(report.format.extension, "parquet");
 }
 
+/// Verifies byte-confirmed HTML and ELF payloads disguised with a `.parquet`
+/// extension bypass `parquet::inspect` in transitional extraction and retain
+/// their byte-confirmed bucket and mismatch flag.
+///
+/// Accepts no parameters. Panics if either spoofed payload emits a `"parquet"`
+/// stage diagnostic, clears `disagreement`, or loses its byte-confirmed bucket.
+#[test]
+fn spoofed_html_and_elf_parquet_bypass_parquet_inspect() {
+    let directory = workdir("spoofed");
+
+    let html_path = directory.join("spoof_html.parquet");
+    std::fs::write(&html_path, b"<!doctype html><html><body>hi</body></html>").unwrap();
+    let html_report = inspect(&html_path, &InspectOptions::default());
+    assert_eq!(html_report.format.bucket, "Web");
+    assert_eq!(html_report.format.basis, "bytes");
+    assert!(html_report.format.disagreement);
+    assert!(
+        !html_report.errors.iter().any(|e| e.stage == "parquet"),
+        "spoofed HTML must not enter parquet::inspect: {:?}",
+        html_report.errors
+    );
+
+    let mut elf = vec![0u8; 64];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    let elf_path = directory.join("spoof_elf.parquet");
+    std::fs::write(&elf_path, &elf).unwrap();
+    let elf_report = inspect(&elf_path, &InspectOptions::default());
+    assert_eq!(elf_report.format.bucket, "Applications");
+    assert_eq!(elf_report.format.basis, "bytes");
+    assert!(elf_report.format.disagreement);
+    assert!(
+        !elf_report.errors.iter().any(|e| e.stage == "parquet"),
+        "spoofed ELF must not enter parquet::inspect: {:?}",
+        elf_report.errors
+    );
+}
+
 /// A genuinely valid file with real data rows from the locked writer must also
 /// receive the deferral: the row backend stays unregistered even when the
 /// `parquet-preview` feature (kept as compatibility reference) is enabled.

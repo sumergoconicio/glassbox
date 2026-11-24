@@ -1,6 +1,6 @@
-// Module: glassbox-cli bounded batch execution.
-// File: batch.rs.
-// Responsibility: Share file/OCR slots, preserve request order, apply backpressure, and join cancellation.
+//! Module: glassbox-cli bounded batch execution.
+//! File: batch.rs.
+//! Responsibility: Share file/OCR slots, preserve request order, apply backpressure, and join cancellation.
 
 use glassbox_inspect::SharedWorkBudget;
 use glassbox_inspect::reports::OperationStatus;
@@ -77,6 +77,8 @@ pub(crate) struct BatchRequest {
     pub(crate) path: PathBuf,
     /// Optional anchored `dev:ino` identity captured during directory enumeration.
     pub(crate) expected: Option<String>,
+    /// Optional opened regular-file handle pinned until inspection and identity check finish.
+    pub(crate) pinned_file: Option<std::fs::File>,
 }
 
 /// One completed or immediately rejected request ready for ordered serialization.
@@ -88,7 +90,7 @@ pub(crate) struct BatchCompletion {
 }
 
 impl BatchCompletion {
-    /// Wraps one canonical v2 report while retaining its external identity.
+    /// Wraps one canonical schema v3 report while retaining its external identity.
     ///
     /// Accepts the sequenced request, aggregate item status, and serializable
     /// report value. Returns a completion with no invocation/cancellation error.
@@ -270,11 +272,29 @@ impl BatchProducer {
         path: PathBuf,
         expected: Option<String>,
     ) -> Result<bool, String> {
+        self.request_with_file(id, path, expected, None)
+    }
+
+    /// Admits one path request with an optional pinned file handle under backpressure.
+    ///
+    /// Accepts external ID, path, optional anchored `dev:ino` identity, and an
+    /// optional opened regular-file handle kept alive until inspection and
+    /// identity verification finish. Returns true after bounded queue
+    /// admission, false after cancellation, or an error if the worker queue
+    /// disconnected unexpectedly. Backpressure bounds retained handles by jobs.
+    pub(crate) fn request_with_file(
+        &mut self,
+        id: Value,
+        path: PathBuf,
+        expected: Option<String>,
+        pinned_file: Option<std::fs::File>,
+    ) -> Result<bool, String> {
         self.submit(PendingWork::Process(BatchRequest {
             sequence: 0,
             id,
             path,
             expected,
+            pinned_file,
         }))
     }
 
@@ -679,5 +699,82 @@ mod tests {
         assert_eq!(combine_status(Unsupported, Complete), Partial);
         assert_eq!(combine_status(Partial, Unsupported), Partial);
         assert_eq!(combine_status(Complete, Complete), Complete);
+    }
+
+    /// Verifies `request_with_file` delivers an opened file handle to the worker.
+    ///
+    /// Accepts no parameters. Returns unit after submitting one pinned scratch
+    /// file and one unpinned request through `batch::run`. A missing handle,
+    /// changed inode, or non-complete status fails the assertion; the scratch
+    /// directory is removed on completion.
+    #[test]
+    fn request_with_file_pins_handle_until_worker_consumes_request() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!("batch-pinned-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory created");
+        let file_path = directory.join("pinned.txt");
+        std::fs::write(&file_path, b"pinned-body").expect("scratch file created");
+        let handle = std::fs::File::open(&file_path).expect("scratch file opened");
+        #[cfg(unix)]
+        let expected_id = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = handle.metadata().expect("metadata read");
+            format!("{:x}:{:x}", meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let expected_id = String::new();
+
+        let mut out = Vec::new();
+        let path_for_producer = file_path.clone();
+        let expected_for_worker = expected_id.clone();
+        let outcome = run(
+            1,
+            move |producer| {
+                assert!(producer.request_with_file(
+                    Value::from("pinned"),
+                    path_for_producer.clone(),
+                    Some(expected_id),
+                    Some(handle),
+                )?);
+                assert!(producer.request(Value::from("plain"), path_for_producer, None)?);
+                Ok(())
+            },
+            |_budget, _cancellation| {
+                let expected_for_worker = expected_for_worker.clone();
+                move |mut request| {
+                    if request.id == "pinned" {
+                        let pinned = request
+                            .pinned_file
+                            .take()
+                            .expect("pinned file handle must reach the worker");
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            let meta = pinned.metadata().expect("pinned metadata readable");
+                            assert_eq!(
+                                format!("{:x}:{:x}", meta.dev(), meta.ino()),
+                                expected_for_worker
+                            );
+                        }
+                        drop(pinned);
+                    } else {
+                        assert!(request.pinned_file.is_none());
+                    }
+                    BatchCompletion::report(
+                        request,
+                        OperationStatus::Complete,
+                        Ok(serde_json::json!({"ok": true})),
+                    )
+                }
+            },
+            &mut out,
+        )
+        .expect("batch run succeeds");
+        assert_eq!(outcome.status, OperationStatus::Complete);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

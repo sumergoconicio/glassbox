@@ -2,11 +2,12 @@
 //! File: selection.rs.
 //! Responsibility: Parse selectors, plan source-order native units, and assemble honest v2 extraction reports.
 
+use crate::bodymatter::{BodymatterMarker, format_marker, render_gfm_table, sanitize_body};
 use crate::reports::{
     Completeness, ContentOrigin, ContentRow, ContentUnit, Diagnostic, DiagnosticSeverity,
     DiagnosticStage, ExtractReport, ExtractedContent, ExtractionProvenance, FactSource,
     MetadataReport, NativeRange, NativeSelection, NativeUnit, OmissionStatus, OperationStatus,
-    QualifiedCount, SelectionReport,
+    QualifiedCount, SchemaKind, SelectionReport,
 };
 use crate::{InspectReport, reports::ExtractOptions};
 
@@ -273,6 +274,8 @@ pub(crate) fn text_unit(
         unit_index,
         unit,
         source_part,
+        label: None,
+        marker_index: None,
         text: Some(text),
         rows: Vec::new(),
         provenance: vec![ExtractionProvenance {
@@ -309,6 +312,49 @@ pub(crate) fn dataset_unit(
     unit.provenance[0].stage = "bounded-dataset-preview".into();
     unit.rows = rows;
     unit.completeness = Completeness::Partial;
+    unit
+}
+
+/// Assembles one worksheet native unit from a bounded sheet preview.
+///
+/// Accepts the zero-based worksheet index, package source part identifier,
+/// mutable sheet summary whose owned `first_row` is consumed, and one-based
+/// source row numbers aligned to the retained preview rows. Returns a
+/// `ContentUnit` carrying tab-delimited text, structured `ContentRow` values,
+/// and `Completeness::Partial` when either the header or preview rows were
+/// truncated (otherwise `Completeness::Exact`). Cannot fail; shorter row
+/// number lists truncate zipped rows without panicking.
+pub(crate) fn worksheet_unit(
+    index: usize,
+    source_part: String,
+    sheet: &mut crate::Sheet,
+    row_numbers: Vec<u64>,
+) -> ContentUnit {
+    let first_row = sheet.first_row.take();
+    let text = first_row
+        .iter()
+        .chain(sheet.preview_rows.iter())
+        .map(|row| row.join("\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rows = first_row
+        .into_iter()
+        .chain(sheet.preview_rows.iter().cloned())
+        .zip(row_numbers)
+        .map(|(values, row_index)| ContentRow { row_index, values })
+        .collect::<Vec<_>>();
+    let mut unit = dataset_unit(
+        index as u64 + 1,
+        NativeUnit::Worksheet,
+        Some(source_part),
+        text,
+        rows,
+    );
+    unit.completeness = if sheet.preview_truncated || sheet.first_row_truncated {
+        Completeness::Partial
+    } else {
+        Completeness::Exact
+    };
     unit
 }
 
@@ -368,22 +414,20 @@ fn truncate_tokens(value: &mut String, cap: usize) -> bool {
     true
 }
 
-/// Applies shared character/token controls to v2 units and reports omissions.
+/// Applies shared character/token controls to v2 headers and units and reports omissions.
 ///
-/// Accepts mutable units, character cap, and optional token cap. Returns true
-/// when any retained representation was clipped. The text and rows
-/// projections of a dataset unit render one logical payload in parallel, so
-/// they draw from two independent aggregate budgets that both start at the
-/// configured caps and never charge each other: the structured rows always
-/// consume the rows budget value-by-value, so truncated dataset rows retain
-/// their data instead of being wiped, while every unit's text consumes the
-/// text budget across units. A row-bearing unit keeps its text whole exactly
-/// when it fits the remaining text budget; otherwise the redundant rendering
-/// is withheld beside complete rows instead of being shown clipped.
-/// Text-only units keep a prefix of the remaining text budget. Every unit
-/// reports its own truth: only a unit that was actually clipped or withheld
-/// is marked partial.
+/// Accepts mutable tabular headers, mutable units, character cap, and optional
+/// token cap. Returns true when any retained representation was clipped. Tabular
+/// headers (when present) and structured rows consume one shared rows budget
+/// value-by-value so header text obeys the same limits as cell values, while
+/// every unit's text consumes an independent text budget across units. A
+/// row-bearing unit keeps its text whole exactly when it fits the remaining text
+/// budget; otherwise the redundant rendering is withheld beside complete rows
+/// instead of being shown clipped. Text-only units keep a prefix of the
+/// remaining text budget. Every unit reports its own truth: only a unit that
+/// was actually clipped or withheld is marked partial.
 fn apply_content_limits(
+    headers: &mut [String],
     units: &mut [ContentUnit],
     max_chars: usize,
     max_tokens: Option<usize>,
@@ -394,6 +438,15 @@ fn apply_content_limits(
     let mut rows_tokens = max_tokens;
     let mut text_chars = max_chars;
     let mut text_tokens = max_tokens;
+    for header in headers.iter_mut() {
+        let mut header_truncated = truncate_chars(header, rows_chars);
+        rows_chars = rows_chars.saturating_sub(header.chars().count());
+        if let Some(remaining) = &mut rows_tokens {
+            header_truncated |= truncate_tokens(header, *remaining);
+            *remaining = remaining.saturating_sub(header.split_whitespace().count());
+        }
+        truncated |= header_truncated;
+    }
     for unit in units {
         let mut unit_truncated = false;
         if unit.rows.is_empty() {
@@ -512,20 +565,23 @@ pub(crate) fn dataset_fallback(report: &mut InspectReport, requested: &NativeSel
 ///
 /// Accepts v2 metadata, the transitional reader result, and extraction options.
 /// Returns selected source-order content, exact returned indices, requested and
-/// omitted coverage, provenance, and operation status. Selection-only omissions
-/// retain partial source coverage while a fully emitted request completes; parser,
-/// OCR, safety, and missing-selected-unit losses produce partial reports. Reader
-/// or input failures classify as failures with the same precedence as the
-/// metadata stage; the unsupported boundary is reserved for identification-only
-/// formats and genuinely unsupported operations, never for a broken read, so a
-/// failed identification-only document reports failure rather than unsupported.
+/// omitted coverage, provenance, extraction-stage diagnostics, and extraction
+/// operation status while preserving `metadata` as the independent standalone
+/// inspection result. Selection-only omissions retain partial source coverage
+/// while a fully emitted request completes; parser, OCR, safety, and
+/// missing-selected-unit losses produce partial reports. Reader or input
+/// failures classify as failures with the same precedence as the metadata
+/// stage; the unsupported boundary is reserved for identification-only formats
+/// and genuinely unsupported operations, never for a broken read, so a failed
+/// identification-only document reports failure rather than unsupported.
 pub(crate) fn assemble(
-    mut metadata: MetadataReport,
+    metadata: MetadataReport,
     mut legacy: InspectReport,
     options: &ExtractOptions,
 ) -> ExtractReport {
+    let mut diagnostics = Vec::new();
     for error in &legacy.errors {
-        metadata.metadata.diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic {
             stage: diagnostic_stage(error.stage),
             severity: DiagnosticSeverity::Error,
             code: error.stage.into(),
@@ -556,17 +612,27 @@ pub(crate) fn assemble(
                 ));
             }
             Ok(_) => {}
-            Err(message) => legacy.error("selection", message),
+            Err(message) => {
+                legacy.error("selection", message.clone());
+                diagnostics.push(Diagnostic {
+                    stage: DiagnosticStage::Selection,
+                    severity: DiagnosticSeverity::Error,
+                    code: "selection".into(),
+                    message,
+                    unit_index: None,
+                });
+            }
         }
     }
     legacy.native_units.sort_by_key(|unit| unit.unit_index);
     let safety_truncated = apply_content_limits(
+        &mut legacy.native_headers,
         &mut legacy.native_units,
         options.max_chars,
         options.max_tokens,
     );
     if safety_truncated {
-        metadata.metadata.diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic {
             stage: DiagnosticStage::Extraction,
             severity: DiagnosticSeverity::Warning,
             code: "content_limit".into(),
@@ -663,18 +729,19 @@ pub(crate) fn assemble(
         // `Unsupported`, on their paths.
         status = OperationStatus::Unsupported;
     }
-    metadata.metadata.status = status;
-    metadata.metadata.completeness = completeness;
     let provenance = legacy
         .native_units
         .iter()
         .flat_map(|unit| unit.provenance.clone())
         .collect();
     ExtractReport {
-        schema_version: crate::reports::REPORT_SCHEMA_VERSION,
+        schema_version: crate::reports::LEGACY_REPORT_SCHEMA_VERSION,
         kind: crate::reports::ReportKind::Extract,
+        status,
+        diagnostics,
         metadata: metadata.metadata,
         content: ExtractedContent {
+            headers: legacy.native_headers,
             units: legacy.native_units,
         },
         provenance,
@@ -713,50 +780,189 @@ pub fn render_text(report: &ExtractReport) -> String {
     out
 }
 
-/// Renders one canonical v2 report as Markdown with explicit coverage and units.
+/// Renders one extraction report as Markdown with `bodymatter:v1` structure markers.
 ///
-/// Accepts an extraction report. Returns a metadata coverage header followed by
-/// native-unit headings, escaped text, and bounded dataset rows. No source file
-/// is read and no output artifact is written.
+/// Accepts an [`ExtractReport`]. Returns blank-line-delimited Markdown with
+/// forward-scoped `<!-- bodymatter:v1 <.../> -->` markers enabled, GFM pipe
+/// tables for row-bearing units (suppressing duplicate TSV `unit.text`),
+/// neutralized HTML comments, minimal line-leading block escaping, and zero
+/// synthetic preamble or unit headings. No source file is read and no output
+/// artifact is written; this function cannot fail.
 pub fn render_markdown(report: &ExtractReport) -> String {
-    let mut out = String::from("# Glassbox extraction\n\n");
-    out.push_str(&coverage_text(report));
-    for unit in &report.content.units {
-        out.push_str(&format!(
-            "\n## Unit {} ({:?})\n\n",
-            unit.unit_index, unit.unit
-        ));
-        if let Some(part) = &unit.source_part {
-            out.push_str(&format!("Source part: `{}`\n\n", part.replace('`', "'")));
+    render_markdown_with_options(report, true)
+}
+
+/// Renders one extraction report as Markdown with configurable `bodymatter:v1` markers.
+///
+/// Accepts an [`ExtractReport`] and `include_markers` (`true` to include
+/// `bodymatter:v1` structure comments, `false` to omit all marker lines while
+/// keeping identical content blocks and GFM pipe tables). Returns blank-line-
+/// delimited Markdown ending with a single trailing newline when non-empty, or
+/// an empty string when no markers or content blocks are produced. Performs no
+/// I/O and cannot fail.
+pub fn render_markdown_with_options(report: &ExtractReport, include_markers: bool) -> String {
+    let worksheet_names: Vec<&str> = report
+        .metadata
+        .schema_identifiers
+        .iter()
+        .filter(|identifier| identifier.kind == SchemaKind::Worksheet)
+        .map(|identifier| identifier.name.as_str())
+        .collect();
+
+    let mut blocks: Vec<String> = Vec::new();
+    let mut table_counter: u64 = 0;
+    let mut page_break_counter: u64 = 0;
+    let mut dataset_sheet_counter: u64 = 0;
+
+    let units = &report.content.units;
+    let mut index = 0usize;
+    while index < units.len() {
+        if units[index].unit == NativeUnit::DatasetRow && !units[index].rows.is_empty() {
+            dataset_sheet_counter += 1;
+            if include_markers {
+                blocks.push(format_marker(&BodymatterMarker::Sheet {
+                    number: dataset_sheet_counter,
+                    name: None,
+                }));
+            }
+            let mut combined_rows: Vec<ContentRow> = Vec::new();
+            if !report.content.headers.is_empty() {
+                combined_rows.push(ContentRow {
+                    row_index: 0,
+                    values: report.content.headers.clone(),
+                });
+            }
+            while index < units.len()
+                && units[index].unit == NativeUnit::DatasetRow
+                && !units[index].rows.is_empty()
+            {
+                combined_rows.extend(units[index].rows.iter().cloned());
+                index += 1;
+            }
+            let table = render_gfm_table(&combined_rows);
+            if !table.is_empty() {
+                blocks.push(table);
+            }
+            continue;
         }
-        if let Some(text) = &unit.text
-            && !text.is_empty()
-        {
-            out.push_str(&crate::markdown::escape(text));
-            out.push_str("\n\n");
+
+        let unit = &units[index];
+        index += 1;
+
+        let marker = match unit.unit {
+            NativeUnit::PhysicalPage => Some(BodymatterMarker::Page {
+                number: unit.unit_index,
+                label: unit
+                    .label
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty()),
+                origin: page_origin(&unit.provenance),
+                partial: unit.completeness == Completeness::Partial,
+            }),
+            NativeUnit::Worksheet => Some(BodymatterMarker::Sheet {
+                number: unit.unit_index,
+                name: worksheet_name(&worksheet_names, unit),
+            }),
+            NativeUnit::DatasetPreview => Some(BodymatterMarker::Sheet {
+                number: unit.unit_index,
+                name: None,
+            }),
+            NativeUnit::Slide => Some(BodymatterMarker::Slide {
+                number: unit.unit_index,
+            }),
+            NativeUnit::Table => {
+                let number = unit.marker_index.unwrap_or_else(|| {
+                    table_counter += 1;
+                    table_counter
+                });
+                Some(BodymatterMarker::Table { number })
+            }
+            NativeUnit::SpineItem => Some(BodymatterMarker::Chapter {
+                number: unit.unit_index,
+                href: unit
+                    .source_part
+                    .as_deref()
+                    .filter(|value| !value.is_empty()),
+            }),
+            NativeUnit::PageBreak => {
+                let number = unit.marker_index.unwrap_or_else(|| {
+                    page_break_counter += 1;
+                    page_break_counter
+                });
+                Some(BodymatterMarker::PageBreak { number })
+            }
+            _ => None,
+        };
+
+        if include_markers && let Some(marker) = marker {
+            blocks.push(format_marker(&marker));
         }
-        for row in &unit.rows {
-            out.push_str("| ");
-            out.push_str(
-                &row.values
-                    .iter()
-                    .map(|value| {
-                        crate::markdown::escape(value)
-                            .replace('|', "\\|")
-                            .replace(['\n', '\r', '\t'], "<br>")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-            );
-            out.push_str(" |\n");
+
+        if !unit.rows.is_empty() {
+            let table = render_gfm_table(&unit.rows);
+            if !table.is_empty() {
+                blocks.push(table);
+            }
+        } else if let Some(text) = &unit.text {
+            let sanitized = sanitize_body(text);
+            let trimmed = sanitized.trim_end_matches(['\r', '\n']);
+            if !trimmed.trim().is_empty() {
+                blocks.push(trimmed.to_owned());
+            }
         }
     }
-    if report.completeness != Completeness::Exact {
-        out.push_str(
-            "\n> Partial output: selection, safety limit, unsupported boundary, or extraction diagnostic applies. See the JSON report.\n",
-        );
+
+    if blocks.is_empty() {
+        String::new()
+    } else {
+        let mut out = blocks.join("\n\n");
+        out.push('\n');
+        out
     }
-    out
+}
+
+/// Derives the `bodymatter:v1` page `origin` attribute from unit provenance records.
+///
+/// Accepts a slice of [`ExtractionProvenance`] entries attached to a PDF page unit.
+/// Returns `"mixed"` when any provenance is [`ContentOrigin::Mixed`] or when both
+/// native and OCR origins are present, `"ocr"` when only OCR provenance is present,
+/// and `"native"` otherwise. Performs no I/O and cannot fail.
+fn page_origin(provenance: &[ExtractionProvenance]) -> &'static str {
+    let mut has_native = false;
+    let mut has_ocr = false;
+    for item in provenance {
+        match item.origin {
+            ContentOrigin::Mixed => return "mixed",
+            ContentOrigin::Ocr => has_ocr = true,
+            ContentOrigin::Native => has_native = true,
+            ContentOrigin::DerivedPreview => {}
+        }
+    }
+    match (has_native, has_ocr) {
+        (true, true) => "mixed",
+        (false, true) => "ocr",
+        _ => "native",
+    }
+}
+
+/// Resolves the optional worksheet display name for a [`NativeUnit::Worksheet`] unit.
+///
+/// Accepts the ordered worksheet names collected from report schema identifiers
+/// and the target [`ContentUnit`]. Returns the matching one-based worksheet name
+/// from schema identifiers when present, or falls back to `unit.source_part`
+/// (stripping any `content.xml#sheet/` prefix) when no worksheet schema
+/// identifiers exist. Empty names return `None`. Performs no I/O and cannot fail.
+fn worksheet_name<'a>(worksheet_names: &[&'a str], unit: &'a ContentUnit) -> Option<&'a str> {
+    if !worksheet_names.is_empty() {
+        let index = usize::try_from(unit.unit_index.checked_sub(1)?).ok()?;
+        return worksheet_names
+            .get(index)
+            .copied()
+            .filter(|name| !name.is_empty());
+    }
+    let part = unit.source_part.as_deref()?;
+    let stripped = part.strip_prefix("content.xml#sheet/").unwrap_or(part);
+    (!stripped.is_empty()).then_some(stripped)
 }
 
 /// Formats requested/available/returned coverage for text and Markdown outputs.
@@ -919,7 +1125,7 @@ mod tests {
         // The text budget (4 chars) covers the first two renderings and
         // withholds the third; the rows budget is independent and never
         // charged by text, so every structured value retains its data.
-        let truncated = apply_content_limits(&mut units, 4, None);
+        let truncated = apply_content_limits(&mut [], &mut units, 4, None);
         assert!(truncated);
         assert_eq!(units[0].text.as_deref(), Some("aa"));
         assert_eq!(units[1].text.as_deref(), Some("bb"));
@@ -955,7 +1161,7 @@ mod tests {
             }],
         );
         let mut units = vec![first, second];
-        let truncated = apply_content_limits(&mut units, 1 << 30, Some(3));
+        let truncated = apply_content_limits(&mut [], &mut units, 1 << 30, Some(3));
         assert!(truncated);
         // The first rendering fits the remaining word budget and is kept
         // whole; the second would clip, so its text is withheld while its
@@ -985,7 +1191,7 @@ mod tests {
             ContentOrigin::Native,
         );
         let mut units = vec![first, second];
-        assert!(apply_content_limits(&mut units, 2, None));
+        assert!(apply_content_limits(&mut [], &mut units, 2, None));
         assert_eq!(units[0].text.as_deref(), Some("ab"));
         assert_eq!(units[1].text.as_deref(), Some(""));
         assert_eq!(units[0].completeness, Completeness::Partial);
@@ -1001,20 +1207,24 @@ mod tests {
         legacy.error("csv", "CSV preview exceeds 1 MiB read cap");
         let report = assemble(metadata, legacy, &crate::reports::ExtractOptions::default());
         assert!(report.content.units.is_empty());
+        assert_eq!(report.status, OperationStatus::Failed);
         assert_eq!(report.metadata.status, OperationStatus::Failed);
         assert_eq!(report.selection.omitted, OmissionStatus::PartialFailure);
         assert_eq!(report.completeness, Completeness::Partial);
     }
 
-    /// Checks the identification-only boundary still classifies as unsupported.
+    /// Checks the identification-only boundary still classifies as unsupported
+    /// without mutating the nested standalone inspection status.
     #[test]
     fn identification_only_boundary_stays_unsupported() {
         let mut metadata = MetadataReport::default();
+        metadata.metadata.status = OperationStatus::Complete;
         metadata.metadata.extraction_support = crate::reports::SupportStatus::IdentificationOnly;
         let legacy = crate::InspectReport::default();
         let report = assemble(metadata, legacy, &crate::reports::ExtractOptions::default());
         assert_eq!(report.selection.omitted, OmissionStatus::Unsupported);
-        assert_eq!(report.metadata.status, OperationStatus::Unsupported);
+        assert_eq!(report.status, OperationStatus::Unsupported);
+        assert_eq!(report.metadata.status, OperationStatus::Complete);
     }
 
     /// Checks a failed identification-only document keeps its failure status.
@@ -1032,15 +1242,18 @@ mod tests {
         let report = assemble(metadata, legacy, &crate::reports::ExtractOptions::default());
         assert!(report.content.units.is_empty());
         assert_eq!(report.selection.omitted, OmissionStatus::PartialFailure);
+        assert_eq!(report.status, OperationStatus::Failed);
         assert_eq!(report.metadata.status, OperationStatus::Failed);
         assert_eq!(report.completeness, Completeness::Partial);
     }
 
-    /// Checks an unsupported metadata stage cannot overwrite a selection failure.
+    /// Checks an unsupported metadata stage cannot overwrite a selection failure
+    /// while preserving the nested metadata status independently.
     ///
     /// Accepts no parameters. Returns unit after assembling a report whose
     /// metadata stage reported `Unsupported` while the legacy reader failed
-    /// during selection. A failure status relabeled to unsupported panics.
+    /// during selection. A failure status relabeled to unsupported or a mutated
+    /// nested metadata status panics.
     #[test]
     fn unsupported_metadata_stage_cannot_overwrite_selection_failure() {
         // COND-06 follow-up: the final metadata-`Unsupported` override is
@@ -1054,7 +1267,137 @@ mod tests {
         let report = assemble(metadata, legacy, &crate::reports::ExtractOptions::default());
         assert!(report.content.units.is_empty());
         assert_eq!(report.selection.omitted, OmissionStatus::PartialFailure);
-        assert_eq!(report.metadata.status, OperationStatus::Failed);
-        assert_eq!(report.metadata.completeness, Completeness::Unavailable);
+        assert_eq!(report.status, OperationStatus::Failed);
+        assert_eq!(report.completeness, Completeness::Unavailable);
+        assert_eq!(report.metadata.status, OperationStatus::Unsupported);
+        assert!(report.metadata.diagnostics.is_empty());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "selection")
+        );
+    }
+
+    /// Checks `render_markdown` emits bodymatter:v1 page markers with labels,
+    /// origins, and partial flags while omitting synthetic headings and preamble.
+    #[test]
+    fn render_markdown_emits_bodymatter_page_markers_and_no_preamble() {
+        let mut page1 = text_unit(
+            1,
+            NativeUnit::PhysicalPage,
+            Some("page 1".into()),
+            "Quarterly results improved.\n".into(),
+            ContentOrigin::Native,
+        );
+        page1.label = Some("iv".into());
+        let mut page2 = text_unit(
+            2,
+            NativeUnit::PhysicalPage,
+            Some("page 2".into()),
+            "Appendix A".into(),
+            ContentOrigin::Ocr,
+        );
+        page2.completeness = Completeness::Partial;
+        let page3 = text_unit(
+            3,
+            NativeUnit::PhysicalPage,
+            Some("page 3".into()),
+            "Mixed text".into(),
+            ContentOrigin::Mixed,
+        );
+        let report = ExtractReport {
+            content: ExtractedContent {
+                headers: Vec::new(),
+                units: vec![page1, page2, page3],
+            },
+            ..ExtractReport::default()
+        };
+
+        let with_markers = render_markdown(&report);
+        assert!(!with_markers.contains("# Glassbox extraction"));
+        assert!(!with_markers.contains("## Unit"));
+        assert!(!with_markers.contains("> Partial output:"));
+        assert_eq!(
+            with_markers,
+            concat!(
+                "<!-- bodymatter:v1 <page number=\"1\" label=\"iv\" origin=\"native\"/> -->\n\n",
+                "Quarterly results improved.\n\n",
+                "<!-- bodymatter:v1 <page number=\"2\" origin=\"ocr\" completeness=\"partial\"/> -->\n\n",
+                "Appendix A\n\n",
+                "<!-- bodymatter:v1 <page number=\"3\" origin=\"mixed\"/> -->\n\n",
+                "Mixed text\n",
+            )
+        );
+
+        let without_markers = render_markdown_with_options(&report, false);
+        assert!(!without_markers.contains("bodymatter:v1"));
+        assert_eq!(
+            without_markers,
+            "Quarterly results improved.\n\nAppendix A\n\nMixed text\n"
+        );
+    }
+
+    /// Checks `render_markdown` groups row-bearing `DatasetRow` units under one
+    /// unnamed `<sheet number="1"/>` GFM table using budgeted content headers
+    /// while leaving rowless JSON/XML fallback previews marker-free.
+    #[test]
+    fn render_markdown_handles_tabular_grouping_and_independent_counters() {
+        let mut tabular = ExtractReport::default();
+        tabular.content.headers = vec!["k".into(), "v".into()];
+        tabular.content.units = vec![
+            dataset_unit(
+                1,
+                NativeUnit::DatasetRow,
+                Some("row 1".into()),
+                "a\t1".into(),
+                vec![ContentRow {
+                    row_index: 1,
+                    values: vec!["a".into(), "1".into()],
+                }],
+            ),
+            dataset_unit(
+                2,
+                NativeUnit::DatasetRow,
+                Some("row 2".into()),
+                "b\t2".into(),
+                vec![ContentRow {
+                    row_index: 2,
+                    values: vec!["b".into(), "2".into()],
+                }],
+            ),
+        ];
+        let rendered = render_markdown(&tabular);
+        assert_eq!(
+            rendered,
+            concat!(
+                "<!-- bodymatter:v1 <sheet number=\"1\"/> -->\n\n",
+                "| k | v |\n",
+                "| --- | --- |\n",
+                "| a | 1 |\n",
+                "| b | 2 |\n",
+            )
+        );
+        assert!(!rendered.contains("a\t1"));
+        assert_eq!(
+            render_markdown_with_options(&tabular, false),
+            "| k | v |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n"
+        );
+
+        let fallback = ExtractReport {
+            content: ExtractedContent {
+                headers: Vec::new(),
+                units: vec![dataset_unit(
+                    1,
+                    NativeUnit::DatasetRow,
+                    Some("dataset/profile preview".into()),
+                    "{\"ok\":true}".into(),
+                    Vec::new(),
+                )],
+            },
+            ..ExtractReport::default()
+        };
+        assert_eq!(render_markdown(&fallback), "{\"ok\":true}\n");
+        assert_eq!(render_markdown(&ExtractReport::default()), "");
     }
 }

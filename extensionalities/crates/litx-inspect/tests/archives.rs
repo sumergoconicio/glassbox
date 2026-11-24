@@ -642,8 +642,14 @@ fn generic_zip_and_cbz_support_agrees_with_extraction() {
             &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
         );
         assert_eq!(
-            extracted.metadata.status,
+            extracted.status,
             glassbox_inspect::reports::OperationStatus::Unsupported,
+            "{:?}",
+            path
+        );
+        assert_eq!(
+            extracted.metadata.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
             "{:?}",
             path
         );
@@ -677,6 +683,11 @@ fn epub_and_office_packages_keep_supported_extraction() {
         let extracted = glassbox_inspect::extract(
             &path,
             &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
+        );
+        assert_eq!(
+            extracted.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
+            "{name}: {extracted:#?}"
         );
         assert_eq!(
             extracted.metadata.status,

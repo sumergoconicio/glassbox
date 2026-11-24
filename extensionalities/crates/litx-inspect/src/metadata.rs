@@ -116,21 +116,20 @@ pub(crate) fn mark_partial(metadata: &mut DocumentMetadata) {
 
 /// Sets the concrete format identity after package or header confirmation.
 ///
-/// Accepts metadata plus extension, MIME, display name, bucket, and detector.
-/// Returns unit. Extension disagreement is recomputed from the observed name.
+/// Accepts metadata plus canonical confirmed extension, MIME, display name,
+/// bucket, and detector. Returns unit while preserving the literal normalized
+/// filename suffix in `metadata.format.extension` and recomputing extension
+/// mismatch against the confirmed format family.
 fn identify(
     metadata: &mut DocumentMetadata,
-    extension: &str,
+    canonical_extension: &str,
     mime: &str,
     name: &str,
     bucket: &str,
     detector: &str,
 ) {
-    let disagreement = !metadata.format.extension.is_empty()
-        && metadata.format.extension != extension
-        && !(extension == "mobi"
-            && matches!(metadata.format.extension.as_str(), "azw" | "azw3" | "prc"));
-    metadata.format.extension = extension.to_owned();
+    let (_, disagreement) =
+        crate::detect::format_type(None, Some(canonical_extension), &metadata.format.extension);
     metadata.format.detected_mime = Some(mime.to_owned());
     metadata.format.detected_name = Some(name.to_owned());
     metadata.format.bucket = bucket.to_owned();
@@ -142,15 +141,25 @@ fn identify(
 /// Copies identification produced by a header-only legacy structural reader.
 ///
 /// Accepts destination and source format records. Returns unit after copying
-/// labels only. No document content or errors are involved.
+/// detected labels while preserving the literal normalized filename suffix in
+/// `metadata.format.extension` and recomputing extension mismatch from the
+/// reader-confirmed format bucket against the literal suffix. Performs no I/O
+/// and cannot fail.
 fn copy_format(metadata: &mut DocumentMetadata, format: &crate::Format) {
+    let literal_extension = metadata.format.extension.clone();
+    let detected_type = crate::detect::bucket_to_format_type(&format.bucket);
+    let literal_type = crate::detect::format_type_for_extension(&literal_extension);
+    let disagreement = format.basis == "bytes"
+        && !literal_extension.is_empty()
+        && literal_type != "other"
+        && literal_type != detected_type;
     metadata.format = FormatIdentity {
-        extension: format.extension.clone(),
+        extension: literal_extension,
         detected_mime: format.detected_mime.clone(),
         detected_name: format.detected_name.clone(),
         bucket: format.bucket.clone(),
         basis: format.basis.clone(),
-        disagreement: format.disagreement,
+        disagreement,
         detector: format.detector.clone(),
     };
 }
@@ -241,25 +250,109 @@ pub(crate) fn thumbnail_result(metadata: &mut DocumentMetadata, result: ReaderRe
     }
 }
 
-/// Inspects one file through the canonical content-free metadata path.
+/// Withholds digest and fingerprint and marks metadata partial when the source
+/// file changes or is replaced between hashing and subsequent reads.
 ///
-/// Accepts a source path and metadata-only options. Returns a v2 report with
-/// streamed identity, structure, properties, native signals, diagnostics, and
-/// explicitly requested artifacts. Missing/invalid files, parser failures,
-/// structural caps, and source mutation are qualified; no body reader or OCR
-/// engine is invoked by this dispatch.
+/// Accepts mutable [`DocumentMetadata`]. Returns unit after clearing `digest`
+/// and `fingerprint`, marking consistency `SourceChanged`, appending a single
+/// `source_changed_during_read` warning diagnostic, and downgrading status to
+/// `Partial` (unless already `Failed`). Performs no I/O and cannot fail.
+pub(crate) fn record_source_changed_during_read(metadata: &mut DocumentMetadata) {
+    metadata.digest.digest = None;
+    metadata.digest.fingerprint = None;
+    metadata.digest.consistency = ConsistencyStatus::SourceChanged;
+    metadata.digest.source_identity = ConsistencyStatus::SourceChanged;
+    metadata.identity.consistency = ConsistencyStatus::SourceChanged;
+    if !metadata
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "source_changed_during_read")
+    {
+        add_diagnostic(
+            metadata,
+            DiagnosticStage::Hashing,
+            DiagnosticSeverity::Warning,
+            "source_changed_during_read",
+            "source file changed between hashing and reading; digest and fingerprint withheld",
+            None,
+        );
+    }
+    mark_partial(metadata);
+}
+
+/// Inspects one file through the canonical content-free metadata path using the default hash policy.
+///
+/// Accepts a source path and metadata-only options. Returns a metadata report
+/// with streamed identity (full SHA-256 up to threshold, sampled fingerprint
+/// above it), structure, properties, native signals, diagnostics, and explicitly
+/// requested artifacts. Missing/invalid files, parser failures, structural caps,
+/// and source mutation are qualified; no body reader or OCR engine is invoked.
 pub(crate) fn inspect(path: &Path, options: &InspectOptions) -> MetadataReport {
+    inspect_with_policy(
+        path,
+        options,
+        crate::hashing::HashPolicy::SampledAboveThreshold,
+    )
+}
+
+/// Inspects one file through the canonical content-free metadata path with an explicit [`crate::hashing::HashPolicy`].
+///
+/// Accepts a source path, metadata-only options, and a hash policy controlling
+/// full SHA-256 versus sampled fingerprinting. Returns a metadata report with
+/// identity, structure, embedded properties, diagnostics, and optional artifacts.
+/// Input, hashing, detection, and structural failures are recorded as diagnostics;
+/// no body reader or OCR engine is invoked.
+pub(crate) fn inspect_with_policy(
+    path: &Path,
+    options: &InspectOptions,
+    policy: crate::hashing::HashPolicy,
+) -> MetadataReport {
+    inspect_with_policy_and_observation(path, options, policy).0
+}
+
+/// Inspects one file through the canonical content-free metadata path and
+/// returns both the metadata report and the initial opened-handle identity
+/// observation for downstream read-binding checks.
+///
+/// Accepts a source path, metadata-only options, and an explicit [`crate::hashing::HashPolicy`].
+/// Binds detection and structural readers to the validated symlink-free path
+/// returned by hashing, and re-verifies source identity after metadata dispatch
+/// so concurrent replacement withholds digest/fingerprint with
+/// `source_changed_during_read`. Returns `(MetadataReport, Option<Observation>)`.
+pub(crate) fn inspect_with_policy_and_observation(
+    path: &Path,
+    options: &InspectOptions,
+    policy: crate::hashing::HashPolicy,
+) -> (MetadataReport, Option<crate::hashing::IdentityObservation>) {
+    inspect_with_policy_and_hook(path, options, policy, || {})
+}
+
+/// Runs metadata-only inspection with a post-dispatch hook for deterministic
+/// concurrent-replacement testing.
+///
+/// Accepts a source path, metadata options, hash policy, and a closure executed
+/// immediately after structural dispatch and before the post-read identity
+/// recheck. Production callers pass a no-op closure. Returns the metadata
+/// report and initial identity observation.
+fn inspect_with_policy_and_hook(
+    path: &Path,
+    options: &InspectOptions,
+    policy: crate::hashing::HashPolicy,
+    before_recheck: impl FnOnce(),
+) -> (MetadataReport, Option<crate::hashing::IdentityObservation>) {
     let mut report = MetadataReport::default();
-    let hashed = crate::hashing::hash_file(path);
+    let hashed = crate::hashing::hash_file_with_policy(path, policy);
+    let validated_path = hashed.identity.path.clone();
+    let expected_observation = hashed.observation;
     report.metadata.identity = hashed.identity;
     report.metadata.digest = hashed.digest;
     report.metadata.diagnostics.extend(hashed.diagnostics);
     if !hashed.input_valid {
         report.metadata.status = OperationStatus::Failed;
-        return report;
+        return (report, None);
     }
-    let extension = crate::detect::extension(path);
-    match crate::detect::identify(path, &extension) {
+    let extension = crate::detect::extension(&validated_path);
+    match crate::detect::identify(&validated_path, &extension) {
         Ok(format) => report.metadata.format = format,
         Err(error) => {
             add_diagnostic(
@@ -271,14 +364,64 @@ pub(crate) fn inspect(path: &Path, options: &InspectOptions) -> MetadataReport {
                 None,
             );
             report.metadata.status = OperationStatus::Failed;
-            return report;
+            return (report, expected_observation);
         }
     }
-    if let Err(error) = dispatch(path, options, &mut report.metadata) {
+    if let Err(error) = dispatch(&validated_path, options, &mut report.metadata) {
         reader_error(&mut report.metadata, error);
     }
+    before_recheck();
+    if let Some(ref expected) = expected_observation
+        && !crate::hashing::verify_identity(&validated_path, expected)
+    {
+        record_source_changed_during_read(&mut report.metadata);
+    }
     finalize(&mut report.metadata);
-    report
+    (report, expected_observation)
+}
+
+/// Reports whether the compiled raster header/pixel reader supports decoding `mime` or `extension`.
+///
+/// Accepts the detected MIME type (empty when absent), literal normalized
+/// filename suffix, and detection basis (`"bytes"` or `"extension"`). Returns
+/// `true` only when the compiled `image` crate enables reading for the resolved
+/// raster format. Extension fallback runs only when `basis == "extension"` and
+/// `mime` is absent or generic (`application/octet-stream` / `text/plain`), so
+/// a byte-confirmed unsupported raster (such as a PSD named `.png`) never enters
+/// the decoder. Formats classified as `"images"` without a compiled decoder
+/// (such as PSD, HEIC, or AVIF without an AVIF decoder feature) return `false`.
+/// Performs no I/O and cannot fail.
+pub(crate) fn is_supported_raster_format(mime: &str, extension: &str, basis: &str) -> bool {
+    let from_mime = if mime.is_empty() {
+        None
+    } else {
+        image::ImageFormat::from_mime_type(mime).or(match mime {
+            "image/x-bmp" | "image/x-ms-bmp" => Some(image::ImageFormat::Bmp),
+            "image/x-icon" | "image/vnd.microsoft.icon" => Some(image::ImageFormat::Ico),
+            "image/x-portable-bitmap"
+            | "image/x-portable-graymap"
+            | "image/x-portable-pixmap"
+            | "image/x-portable-anymap" => Some(image::ImageFormat::Pnm),
+            "image/x-tga" | "image/x-targa" => Some(image::ImageFormat::Tga),
+            "image/vnd.ms-dds" | "image/vnd-ms.dds" => Some(image::ImageFormat::Dds),
+            "image/x-exr" => Some(image::ImageFormat::OpenExr),
+            "image/vnd.radiance" => Some(image::ImageFormat::Hdr),
+            "image/x-farbfeld" => Some(image::ImageFormat::Farbfeld),
+            "image/qoi" => Some(image::ImageFormat::Qoi),
+            _ => None,
+        })
+    };
+    if let Some(format) = from_mime {
+        return format.reading_enabled();
+    }
+    if basis == "extension"
+        && (mime.is_empty() || matches!(mime, "application/octet-stream" | "text/plain"))
+        && !extension.is_empty()
+        && let Some(format) = image::ImageFormat::from_extension(extension)
+    {
+        return format.reading_enabled();
+    }
+    false
 }
 
 /// Dispatches to one dedicated structural metadata reader.
@@ -356,8 +499,25 @@ fn dispatch(
     {
         crate::pdf::metadata(path, metadata, options.thumbnail.as_ref())
     } else if metadata.format.bucket == "Images" {
-        inspect_image(path, options, metadata)
-    } else if mime == "application/vnd.apache.parquet" || extension == "parquet" {
+        if is_supported_raster_format(mime, &extension, &metadata.format.basis) {
+            inspect_image(path, options, metadata)
+        } else {
+            metadata.extraction_support = SupportStatus::Unsupported;
+            metadata.status = OperationStatus::Unsupported;
+            metadata.completeness = Completeness::Unavailable;
+            add_diagnostic(
+                metadata,
+                DiagnosticStage::Metadata,
+                DiagnosticSeverity::Info,
+                "unsupported_image_format",
+                "image format identification is available; raster decoder is unsupported",
+                None,
+            );
+            Ok(())
+        }
+    } else if mime == "application/vnd.apache.parquet"
+        || (metadata.format.basis == "extension" && extension == "parquet")
+    {
         metadata.extraction_support = SupportStatus::IdentificationOnly;
         metadata.status = OperationStatus::Unsupported;
         metadata.completeness = Completeness::Exact;
@@ -511,6 +671,17 @@ fn inspect_archive(
     if inspect_cbz(&mut archive, options, metadata)? {
         return Ok(());
     }
+    // Every specialized ZIP package reader (Office/ODF, EPUB, iWork, CBZ)
+    // declined this archive, so byte inspection confirms it is a generic ZIP
+    // archive rather than the family implied by any misleading container suffix.
+    identify(
+        metadata,
+        "zip",
+        "application/zip",
+        "ZIP",
+        "Archives",
+        "zip-directory",
+    );
     // COND-07: a generic ZIP listing identifies entries but the reader produces
     // no native content units, so the support fact must agree with actual
     // extraction: identification only, exactly like the documented "no content
@@ -1047,9 +1218,13 @@ fn inspect_epub(
 
 /// Reports iWork archive and derived-preview presence without preview extraction.
 ///
-/// Accepts archive, options, and metadata. Returns `true` for Pages, Numbers,
-/// or Keynote and `false` otherwise. Preview text/PDF content is never parsed;
-/// only an explicitly requested image/PDF thumbnail is decoded or rendered.
+/// Accepts archive, options, and metadata. Returns `Ok(true)` for Pages,
+/// Numbers, or Keynote packages containing a structural iWork marker, `Ok(false)`
+/// for other extensions or generic ZIP archives lacking iWork markers (so
+/// `inspect_archive` falls through to generic ZIP identification), or a reader
+/// error if reading an explicitly requested thumbnail fails. Preview text/PDF
+/// content is never parsed; only an explicitly requested image/PDF thumbnail is
+/// decoded or rendered.
 fn inspect_iwork(
     archive: &mut crate::archive::Archive,
     options: &InspectOptions,
@@ -1057,6 +1232,9 @@ fn inspect_iwork(
 ) -> ReaderResult<bool> {
     let extension = metadata.format.extension.clone();
     if !matches!(extension.as_str(), "pages" | "numbers" | "key") {
+        return Ok(false);
+    }
+    if !crate::iwork::has_iwork_marker(&archive.names) {
         return Ok(false);
     }
     let (name, bucket) = match extension.as_str() {
@@ -1143,11 +1321,15 @@ fn inspect_iwork(
 
 /// Counts CBZ image entries and optionally decodes the first cover.
 ///
-/// Accepts archive, options, and metadata. Returns `true` for CBZ and `false`
-/// otherwise. Image headers and pixels are untouched unless a thumbnail was
-/// explicitly requested; no OCR or page text extraction occurs. The report
-/// classifies extraction support as identification-only because entry names
-/// carry the page facts and extraction produces no content units.
+/// Accepts archive, options, and metadata. Returns `Ok(true)` for `.cbz`
+/// archives containing at least one non-macOS image entry, `Ok(false)` for
+/// other extensions or generic ZIP archives lacking image entries (so
+/// `inspect_archive` falls through to generic ZIP identification), or a reader
+/// error if reading an explicitly requested cover thumbnail fails. Image
+/// headers and pixels are untouched unless a thumbnail was explicitly
+/// requested; no OCR or page text extraction occurs. The report classifies
+/// extraction support as identification-only because entry names carry the page
+/// facts and extraction produces no content units.
 fn inspect_cbz(
     archive: &mut crate::archive::Archive,
     options: &InspectOptions,
@@ -1167,6 +1349,9 @@ fn inspect_cbz(
         })
         .cloned()
         .collect();
+    if pages.is_empty() {
+        return Ok(false);
+    }
     identify(
         metadata,
         "cbz",
@@ -1499,11 +1684,16 @@ fn inspect_image(
 /// Streams CSV/TSV headers and row counts without retaining row values.
 ///
 /// Accepts path and metadata. Returns unit after schema names and an exact or
-/// partial dataset-row count. The established 1 MiB reader cap is preserved;
-/// cap coverage is disclosed and full-file hashing remains independent.
+/// partial dataset-row count. Opens the input with no-follow semantics and
+/// rejects non-regular files before reading. The established 1 MiB reader cap
+/// is preserved; cap coverage is disclosed and full-file hashing remains
+/// independent.
 fn inspect_csv(path: &Path, metadata: &mut DocumentMetadata) -> ReaderResult<()> {
     const MAX_BYTES: u64 = 1 << 20;
-    let file = std::fs::File::open(path)?;
+    let file = crate::hashing::open_no_follow(path)?;
+    if !file.metadata()?.is_file() {
+        return Err("CSV input is not a regular file".into());
+    }
     let delimiter = if metadata.format.extension == "tsv" {
         b'\t'
     } else {
@@ -1636,6 +1826,11 @@ fn inspect_xml(path: &Path, metadata: &mut DocumentMetadata) -> ReaderResult<()>
         Completeness::Exact,
     );
     let (paths, truncated) = crate::xml_profile::schema_paths(&profile);
+    for (index, uri) in profile.namespaces.iter().enumerate() {
+        metadata
+            .xml_namespaces
+            .insert(format!("ns{index}"), uri.clone());
+    }
     for name in paths {
         add_schema(
             metadata,
@@ -1691,143 +1886,615 @@ fn inspect_text(path: &Path, metadata: &mut DocumentMetadata) -> ReaderResult<()
     Ok(())
 }
 
-/// Renders a metadata-only Markdown or text summary.
+/// Renders a default (non-verbose) v3 Markdown inspection summary.
 ///
-/// Accepts a v2 metadata report. Returns identity, digest, qualified counts,
-/// schema names, sourced properties, native signals, diagnostics, and artifact
-/// paths. It contains no body, row values, formulas, OCR text, or content
-/// Markdown and performs no I/O.
+/// Accepts a metadata report. Returns a content-free Markdown summary reflecting
+/// schema v3 fields (`Schema: 3`, `format.type`, full SHA-256 or sampled
+/// fingerprint, readiness, and non-empty structure/description/diagnostic sections).
+/// Performs no I/O and cannot fail.
 pub fn summary(report: &MetadataReport) -> String {
-    let metadata = &report.metadata;
-    let mut out = String::from("# Glassbox metadata inspection\n\n");
+    summary_markdown(report, false)
+}
+
+/// Formats an [`OperationStatus`] as its lowercase schema v3 status string.
+///
+/// Accepts an operational status enum value. Returns the matching lowercase
+/// token. Performs no I/O and cannot fail.
+fn status_label(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Complete => "complete",
+        OperationStatus::Partial => "partial",
+        OperationStatus::Unsupported => "unsupported",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Unknown => "unknown",
+    }
+}
+
+/// Formats the v3 format summary line value (`type`, optional MIME, optional extension, optional mismatch).
+///
+/// Accepts a v3 format block. Returns a concise human-readable format string.
+/// Performs no I/O and cannot fail.
+fn format_summary_value(format: &crate::reports_v3::FormatBlockV3) -> String {
+    let mut parts = Vec::new();
+    if let Some(mime) = &format.mime {
+        parts.push(mime.clone());
+    }
+    if let Some(ext) = &format.extension {
+        parts.push(format!(".{ext}"));
+    }
+    let mut value = if parts.is_empty() {
+        format.format_type.clone()
+    } else {
+        format!("{} ({})", format.format_type, parts.join(", "))
+    };
+    if format.extension_mismatch == Some(true) {
+        value.push_str(" [extension mismatch]");
+    }
+    value
+}
+
+/// Output format for v3 inspection summaries rendered by [`render_summary`].
+#[derive(Clone, Copy)]
+enum SummaryStyle {
+    /// Markdown heading (`# Glassbox inspection`), `## Section` headers, and `- ` bullets.
+    Markdown,
+    /// Plain-text top-level `Key: value` lines, `Section:` headers, and two-space indented items.
+    Text,
+}
+
+impl SummaryStyle {
+    /// Returns the document header written before top-level summary fields.
+    ///
+    /// Accepts `self`. Returns `"# Glassbox inspection\n\n"` for Markdown or
+    /// `""` for plain text. Performs no I/O and cannot fail.
+    fn header(self) -> &'static str {
+        match self {
+            Self::Markdown => "# Glassbox inspection\n\n",
+            Self::Text => "",
+        }
+    }
+
+    /// Returns the line prefix used for top-level summary entries.
+    ///
+    /// Accepts `self`. Returns `"- "` for Markdown or `""` for plain text.
+    /// Performs no I/O and cannot fail.
+    fn top_prefix(self) -> &'static str {
+        match self {
+            Self::Markdown => "- ",
+            Self::Text => "",
+        }
+    }
+
+    /// Returns the line prefix used for entries inside named sections.
+    ///
+    /// Accepts `self`. Returns `"- "` for Markdown or `"  "` for plain text.
+    /// Performs no I/O and cannot fail.
+    fn item_prefix(self) -> &'static str {
+        match self {
+            Self::Markdown => "- ",
+            Self::Text => "  ",
+        }
+    }
+
+    /// Appends a formatted section heading to `out`.
+    ///
+    /// Accepts `self`, destination buffer `out`, and section `title`. Returns
+    /// unit after appending `\n## {title}\n\n` for Markdown or `\n{title}:\n`
+    /// for plain text. Performs no I/O and cannot fail.
+    fn push_section(self, out: &mut String, title: &str) {
+        match self {
+            Self::Markdown => out.push_str(&format!("\n## {title}\n\n")),
+            Self::Text => out.push_str(&format!("\n{title}:\n")),
+        }
+    }
+}
+
+/// Renders a v3 inspection summary in the requested [`SummaryStyle`].
+///
+/// Accepts a metadata report, `verbose` flag (`true` adds a provenance section
+/// when reader provenance exists), and output [`SummaryStyle`]. Returns a
+/// content-free summary with empty sections omitted. Performs no I/O and cannot
+/// fail.
+fn render_summary(report: &MetadataReport, verbose: bool, style: SummaryStyle) -> String {
+    let v3 = crate::reports_v3::inspect_to_v3(report, verbose);
+    let top = style.top_prefix();
+    let item = style.item_prefix();
+    let mut out = String::from(style.header());
+    out.push_str(&format!("{top}Schema: {}\n", v3.schema_version));
+    out.push_str(&format!("{top}Status: {}\n", status_label(v3.status)));
+    out.push_str(&format!("{top}Source: {}\n", v3.file.path));
     out.push_str(&format!(
-        "- Schema: {} {:?}\n",
-        report.schema_version, report.kind
+        "{top}Format: {}\n",
+        format_summary_value(&v3.format)
     ));
-    out.push_str(&format!("- Source: {}\n", metadata.identity.path.display()));
     out.push_str(&format!(
-        "- Format: {} ({})\n",
-        metadata
-            .format
-            .detected_name
-            .as_deref()
-            .unwrap_or("unknown"),
-        metadata
-            .format
-            .detected_mime
-            .as_deref()
-            .unwrap_or("unknown")
-    ));
-    out.push_str(&format!(
-        "- Bytes: {}\n",
-        metadata
-            .identity
-            .byte_size
+        "{top}Bytes: {}\n",
+        v3.file
+            .bytes
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unavailable".to_owned())
     ));
-    out.push_str(&format!(
-        "- SHA-256: {}\n",
-        metadata.digest.digest.as_deref().unwrap_or("unavailable")
-    ));
-    out.push_str(&format!(
-        "- Status: {:?}; completeness: {:?}\n",
-        metadata.status, metadata.completeness
-    ));
-    out.push_str(&format!(
-        "- Text layer: {:?}; OCR recommendation: {:?}\n",
-        metadata.text_layer, metadata.ocr_recommended
-    ));
-    out.push_str(&format!(
-        "- Encryption: {:?}; extraction support: {:?}\n\n",
-        metadata.encryption, metadata.extraction_support
-    ));
-    out.push_str("## Counts\n\n");
-    for count in &metadata.counts {
-        out.push_str(&format!(
-            "- {:?}: {} ({:?}, {:?}, {:?})\n",
-            count.unit,
-            count
-                .value
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unavailable".to_owned()),
-            count.source,
-            count.completeness,
-            count.unit
-        ));
+    if let Some(sha256) = &v3.file.sha256 {
+        out.push_str(&format!("{top}SHA-256: {sha256}\n"));
+    } else if let Some(fp) = &v3.file.fingerprint {
+        out.push_str(&format!("{top}Fingerprint ({}): {}\n", fp.scheme, fp.value));
+    } else {
+        out.push_str(&format!("{top}SHA-256: unavailable\n"));
     }
-    out.push_str("\n## Schema identifiers\n\n");
-    for identifier in &metadata.schema_identifiers {
-        out.push_str(&format!(
-            "- {:?}: {} ({:?})\n",
-            identifier.kind, identifier.name, identifier.source
-        ));
-    }
-    out.push_str("\n## Embedded metadata\n\n");
-    for property in &metadata.embedded_metadata {
-        out.push_str(&format!(
-            "- {:?}: {} ({:?})\n",
-            property.field, property.value, property.source
-        ));
-    }
-    out.push_str("\n## Native page signals\n\n");
-    for page in &metadata.native_page_signals {
-        out.push_str(&format!(
-            "- Page {}: text={:?}, OCR={:?}, coverage={:?}\n",
-            page.page_index + 1,
-            page.text_layer,
-            page.ocr_recommended,
-            page.coverage
-        ));
-        for count in &page.object_counts {
+    out.push_str(&format!(
+        "{top}Readiness: extractable={}; encrypted={}; text_layer={}; ocr={}\n",
+        v3.readiness.extractable, v3.readiness.encrypted, v3.readiness.text_layer, v3.readiness.ocr
+    ));
+
+    if !v3.description.is_empty() {
+        style.push_section(&mut out, "Description");
+        if let Some(title) = &v3.description.title {
+            out.push_str(&format!("{item}Title: {title}\n"));
+        }
+        if !v3.description.authors.is_empty() {
             out.push_str(&format!(
-                "  - {:?}: {} ({:?})\n",
-                count.unit,
-                count
-                    .value
+                "{item}Authors: {}\n",
+                v3.description.authors.join(", ")
+            ));
+        }
+        if let Some(subject) = &v3.description.subject {
+            out.push_str(&format!("{item}Subject: {subject}\n"));
+        }
+        if !v3.description.keywords.is_empty() {
+            out.push_str(&format!(
+                "{item}Keywords: {}\n",
+                v3.description.keywords.join(", ")
+            ));
+        }
+        if let Some(language) = &v3.description.language {
+            out.push_str(&format!("{item}Language: {language}\n"));
+        }
+        if let Some(created_at) = &v3.description.created_at {
+            out.push_str(&format!("{item}Created: {created_at}\n"));
+        }
+        if let Some(modified_at) = &v3.description.modified_at {
+            out.push_str(&format!("{item}Modified: {modified_at}\n"));
+        }
+        if let Some(software) = &v3.description.software {
+            if let Some(application) = &software.application {
+                out.push_str(&format!("{item}Application: {application}\n"));
+            }
+            if let Some(creator_tool) = &software.creator_tool {
+                out.push_str(&format!("{item}Creator tool: {creator_tool}\n"));
+            }
+            if let Some(producer) = &software.producer {
+                out.push_str(&format!("{item}Producer: {producer}\n"));
+            }
+        }
+    }
+
+    if !v3.structure.counts.is_empty() {
+        style.push_section(&mut out, "Counts");
+        for (key, value) in &v3.structure.counts {
+            out.push_str(&format!("{item}{key}: {value}\n"));
+        }
+    }
+
+    if let Some(names) = &v3.structure.names {
+        style.push_section(&mut out, "Structure names");
+        for (label, list) in [
+            ("Sheets", &names.sheets),
+            ("Columns", &names.columns),
+            ("Entries", &names.entries),
+            ("XML paths", &names.xml_paths),
+            ("JSON pointers", &names.json_pointers),
+            ("Documents", &names.documents),
+            ("Embedded", &names.embedded),
+        ] {
+            if !list.is_empty() {
+                out.push_str(&format!("{item}{label}: {}\n", list.join(", ")));
+            }
+        }
+    }
+
+    if let Some(pdf) = &v3.structure.pdf {
+        style.push_section(&mut out, "PDF geometry");
+        if let Some(pages) = pdf.pages {
+            out.push_str(&format!("{item}Pages: {pages}\n"));
+        }
+        if let (Some(w), Some(h)) = (pdf.width_points, pdf.height_points) {
+            let uniformity = match pdf.uniform_page_size {
+                Some(true) => " (uniform)",
+                Some(false) => " (varying)",
+                None => "",
+            };
+            out.push_str(&format!(
+                "{item}Page size: {w:.2} x {h:.2} pt{uniformity}\n"
+            ));
+        }
+        if let Some(rev) = pdf.security_handler_revision {
+            out.push_str(&format!("{item}Security revision: {rev}\n"));
+        }
+        if let Some(perms) = pdf.permissions {
+            out.push_str(&format!("{item}Permissions: 0x{perms:x}\n"));
+        }
+    }
+
+    if let Some(image) = &v3.structure.image {
+        style.push_section(&mut out, "Image geometry");
+        out.push_str(&format!(
+            "{item}{} x {} decoded pixels; no DPI is inferred\n",
+            image.width_pixels, image.height_pixels
+        ));
+    }
+
+    if !v3.diagnostics.is_empty() {
+        style.push_section(&mut out, "Diagnostics");
+        for diagnostic in &v3.diagnostics {
+            out.push_str(&format!(
+                "{item}{:?} {:?} {}: {}\n",
+                diagnostic.stage, diagnostic.severity, diagnostic.code, diagnostic.message
+            ));
+        }
+    }
+
+    if !v3.artifacts.is_empty() {
+        style.push_section(&mut out, "Artifacts");
+        for artifact in &v3.artifacts {
+            out.push_str(&format!(
+                "{item}{:?}: {} ({}x{})\n",
+                artifact.kind,
+                artifact.path.display(),
+                artifact
+                    .width
                     .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unavailable".to_owned()),
-                count.completeness
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                artifact
+                    .height
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
             ));
         }
-        for uncertainty in &page.uncertainties {
+    }
+
+    if verbose
+        && let Some(provenance) = &v3.provenance
+        && !provenance.is_empty()
+    {
+        style.push_section(&mut out, "Provenance");
+        for entry in provenance {
             out.push_str(&format!(
-                "  - Uncertainty {}: {}\n",
-                uncertainty.code, uncertainty.message
+                "{item}{}: {} ({:?})\n",
+                entry.reader, entry.stage, entry.source
             ));
         }
     }
-    if let Some(raster) = &metadata.raster {
-        // COND-09: decoded pixel geometry appears in its own section with
-        // pixel units named explicitly; no DPI is ever inferred.
-        out.push_str("\n## Raster geometry\n\n");
-        out.push_str(&format!(
-            "- {} x {} decoded pixels; no DPI is inferred\n",
-            raster.width_pixels, raster.height_pixels
-        ));
-    }
-    out.push_str("\n## Diagnostics\n\n");
-    for diagnostic in &metadata.diagnostics {
-        out.push_str(&format!(
-            "- {:?} {:?} {}: {}\n",
-            diagnostic.stage, diagnostic.severity, diagnostic.code, diagnostic.message
-        ));
-    }
-    out.push_str("\n## Artifacts\n\n");
-    for artifact in &metadata.artifacts {
-        out.push_str(&format!(
-            "- {:?}: {} ({}x{})\n",
-            artifact.kind,
-            artifact.path.display(),
-            artifact
-                .width
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned()),
-            artifact
-                .height
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
-        ));
-    }
+
     out
+}
+
+/// Renders a v3 inspection summary in Markdown format.
+///
+/// Accepts a metadata report and `verbose` flag (`true` adds a `Provenance`
+/// section when reader provenance exists). Returns a content-free Markdown
+/// summary with empty sections omitted. Performs no I/O and cannot fail.
+pub fn summary_markdown(report: &MetadataReport, verbose: bool) -> String {
+    render_summary(report, verbose, SummaryStyle::Markdown)
+}
+
+/// Renders a v3 inspection summary in plain text format.
+///
+/// Accepts a metadata report and `verbose` flag (`true` adds a `Provenance:`
+/// section when reader provenance exists). Returns a content-free plain-text
+/// summary with empty sections omitted. Performs no I/O and cannot fail.
+pub fn summary_text(report: &MetadataReport, verbose: bool) -> String {
+    render_summary(report, verbose, SummaryStyle::Text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proves metadata inspection withholds digest/fingerprint, marks status
+    /// partial, and emits `source_changed_during_read` when the source file is
+    /// atomically replaced between hashing and the post-read identity check (GB-AUD-15).
+    ///
+    /// Accepts no parameters. Returns unit after simulating atomic file
+    /// replacement at the post-dispatch hook. Unexpected retained digests or
+    /// missing diagnostics panic.
+    #[test]
+    fn metadata_inspection_withholds_digest_when_source_replaced_during_read() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tests")
+            .join(format!(
+                "metadata-identity-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("doc.txt");
+        let replacement = dir.join("replacement.txt");
+        std::fs::write(&target, b"line one\nline two\n").unwrap();
+        std::fs::write(&replacement, b"replaced payload\n").unwrap();
+
+        let (report, obs) = inspect_with_policy_and_hook(
+            &target,
+            &InspectOptions::default(),
+            crate::hashing::HashPolicy::Full,
+            || {
+                std::fs::rename(&replacement, &target).unwrap();
+            },
+        );
+        assert!(obs.is_some());
+        assert_eq!(report.metadata.status, OperationStatus::Partial);
+        assert!(report.metadata.digest.digest.is_none());
+        assert!(report.metadata.digest.fingerprint.is_none());
+        assert_eq!(
+            report.metadata.digest.consistency,
+            ConsistencyStatus::SourceChanged
+        );
+        assert!(report.metadata.diagnostics.iter().any(|d| {
+            d.code == "source_changed_during_read" && d.severity == DiagnosticSeverity::Warning
+        }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proves `summary_markdown` and `summary_text` emit exact v3 output across
+    /// every section (header, description/software, counts, structure names,
+    /// PDF geometry, image geometry, diagnostics, artifacts, and verbose
+    /// provenance) via the shared `render_summary` helper.
+    ///
+    /// Accepts no parameters. Returns unit after asserting exact Markdown and
+    /// plain-text outputs for both verbose and non-verbose invocations. Panics
+    /// if any byte differs from the expected v3 summary contract.
+    #[test]
+    fn summary_markdown_and_text_render_all_sections_consistently() {
+        let mut report = MetadataReport::default();
+        report.metadata.status = OperationStatus::Complete;
+        report.metadata.identity.path = std::path::PathBuf::from("fixtures/sample.pdf");
+        report.metadata.identity.byte_size = Some(4096);
+        report.metadata.format.bucket = "PDF".into();
+        report.metadata.format.detected_mime = Some("application/pdf".into());
+        report.metadata.format.extension = "pdf".into();
+        report.metadata.format.disagreement = true;
+        report.metadata.digest.digest = Some("deadbeef".into());
+        report.metadata.extraction_support = SupportStatus::Supported;
+        report.metadata.encryption = EncryptionStatus::NotEncrypted;
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Title,
+            "Quarterly Report",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Author,
+            "Alice",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Author,
+            "Bob",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Subject,
+            "Finance",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Keywords,
+            "q1, audit",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Language,
+            "en",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::CreatedAt,
+            "2026-01-01T00:00:00Z",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::ModifiedAt,
+            "2026-01-02T00:00:00Z",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Application,
+            "Glassbox Writer",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Creator,
+            "Glassbox CLI",
+            Completeness::Exact,
+        );
+        add_property(
+            &mut report.metadata,
+            EmbeddedMetadataField::Producer,
+            "PDFium",
+            Completeness::Exact,
+        );
+        add_count(
+            &mut report.metadata,
+            NativeUnit::PhysicalPage,
+            Some(2),
+            FactSource::NativeStructure,
+            Completeness::Exact,
+        );
+        for (kind, name) in [
+            (SchemaKind::Worksheet, "Summary"),
+            (SchemaKind::Column, "Total"),
+            (SchemaKind::ArchiveEntry, "doc.xml"),
+            (SchemaKind::XmlPath, "/root/item"),
+            (SchemaKind::JsonPointer, "/items/0"),
+            (SchemaKind::Document, "main"),
+            (SchemaKind::Embedded, "attach.bin"),
+        ] {
+            add_schema(
+                &mut report.metadata,
+                kind,
+                name,
+                FactSource::NativeStructure,
+            );
+        }
+        report.metadata.pdf = Some(PdfDocumentSignals {
+            security_handler_revision: Some(4),
+            permissions: Some(0x1f),
+        });
+        report.metadata.native_page_signals = vec![
+            NativePageSignal {
+                page_index: 0,
+                text_layer: TextLayerStatus::Present,
+                ocr_recommended: OcrRecommendation::NotRecommended,
+                object_counts: vec![],
+                coverage: Completeness::Exact,
+                uncertainties: vec![],
+                width_points: Some(612.0),
+                height_points: Some(792.0),
+                rotation_quarter_turns: Some(0),
+            },
+            NativePageSignal {
+                page_index: 1,
+                text_layer: TextLayerStatus::Present,
+                ocr_recommended: OcrRecommendation::NotRecommended,
+                object_counts: vec![],
+                coverage: Completeness::Exact,
+                uncertainties: vec![],
+                width_points: Some(612.0),
+                height_points: Some(792.0),
+                rotation_quarter_turns: Some(0),
+            },
+        ];
+        report.metadata.raster = Some(RasterDimensions {
+            width_pixels: 800,
+            height_pixels: 600,
+        });
+        report.metadata.diagnostics.push(Diagnostic {
+            stage: DiagnosticStage::Metadata,
+            severity: DiagnosticSeverity::Info,
+            code: "test_notice".into(),
+            message: "synthetic notice".into(),
+            unit_index: None,
+        });
+        report.metadata.artifacts.push(Artifact {
+            kind: ArtifactKind::Thumbnail,
+            path: std::path::PathBuf::from("thumb.png"),
+            source: FactSource::GeneratedArtifact,
+            completeness: Completeness::Exact,
+            width: Some(320),
+            height: None,
+        });
+        add_provenance(
+            &mut report.metadata,
+            "pdfium-reader",
+            "page-signals",
+            FactSource::NativeStructure,
+        );
+
+        let expected_md = concat!(
+            "# Glassbox inspection\n\n",
+            "- Schema: 3\n",
+            "- Status: complete\n",
+            "- Source: fixtures/sample.pdf\n",
+            "- Format: pdf (application/pdf, .pdf) [extension mismatch]\n",
+            "- Bytes: 4096\n",
+            "- SHA-256: deadbeef\n",
+            "- Readiness: extractable=supported; encrypted=none; text_layer=unknown; ocr=unknown\n",
+            "\n## Description\n\n",
+            "- Title: Quarterly Report\n",
+            "- Authors: Alice, Bob\n",
+            "- Subject: Finance\n",
+            "- Keywords: q1, audit\n",
+            "- Language: en\n",
+            "- Created: 2026-01-01T00:00:00Z\n",
+            "- Modified: 2026-01-02T00:00:00Z\n",
+            "- Application: Glassbox Writer\n",
+            "- Creator tool: Glassbox CLI\n",
+            "- Producer: PDFium\n",
+            "\n## Counts\n\n",
+            "- columns: 1\n",
+            "- pages: 2\n",
+            "\n## Structure names\n\n",
+            "- Sheets: Summary\n",
+            "- Columns: Total\n",
+            "- Entries: doc.xml\n",
+            "- XML paths: /root/item\n",
+            "- JSON pointers: /items/0\n",
+            "- Documents: main\n",
+            "- Embedded: attach.bin\n",
+            "\n## PDF geometry\n\n",
+            "- Pages: 2\n",
+            "- Page size: 612.00 x 792.00 pt (uniform)\n",
+            "- Security revision: 4\n",
+            "- Permissions: 0x1f\n",
+            "\n## Image geometry\n\n",
+            "- 800 x 600 decoded pixels; no DPI is inferred\n",
+            "\n## Diagnostics\n\n",
+            "- Metadata Info test_notice: synthetic notice\n",
+            "\n## Artifacts\n\n",
+            "- Thumbnail: thumb.png (320xunknown)\n",
+            "\n## Provenance\n\n",
+            "- pdfium-reader: page-signals (NativeStructure)\n",
+        );
+        let expected_text = concat!(
+            "Schema: 3\n",
+            "Status: complete\n",
+            "Source: fixtures/sample.pdf\n",
+            "Format: pdf (application/pdf, .pdf) [extension mismatch]\n",
+            "Bytes: 4096\n",
+            "SHA-256: deadbeef\n",
+            "Readiness: extractable=supported; encrypted=none; text_layer=unknown; ocr=unknown\n",
+            "\nDescription:\n",
+            "  Title: Quarterly Report\n",
+            "  Authors: Alice, Bob\n",
+            "  Subject: Finance\n",
+            "  Keywords: q1, audit\n",
+            "  Language: en\n",
+            "  Created: 2026-01-01T00:00:00Z\n",
+            "  Modified: 2026-01-02T00:00:00Z\n",
+            "  Application: Glassbox Writer\n",
+            "  Creator tool: Glassbox CLI\n",
+            "  Producer: PDFium\n",
+            "\nCounts:\n",
+            "  columns: 1\n",
+            "  pages: 2\n",
+            "\nStructure names:\n",
+            "  Sheets: Summary\n",
+            "  Columns: Total\n",
+            "  Entries: doc.xml\n",
+            "  XML paths: /root/item\n",
+            "  JSON pointers: /items/0\n",
+            "  Documents: main\n",
+            "  Embedded: attach.bin\n",
+            "\nPDF geometry:\n",
+            "  Pages: 2\n",
+            "  Page size: 612.00 x 792.00 pt (uniform)\n",
+            "  Security revision: 4\n",
+            "  Permissions: 0x1f\n",
+            "\nImage geometry:\n",
+            "  800 x 600 decoded pixels; no DPI is inferred\n",
+            "\nDiagnostics:\n",
+            "  Metadata Info test_notice: synthetic notice\n",
+            "\nArtifacts:\n",
+            "  Thumbnail: thumb.png (320xunknown)\n",
+            "\nProvenance:\n",
+            "  pdfium-reader: page-signals (NativeStructure)\n",
+        );
+
+        assert_eq!(summary_markdown(&report, true), expected_md);
+        assert_eq!(summary_text(&report, true), expected_text);
+        assert_eq!(summary(&report), summary_markdown(&report, false));
+        assert!(!summary_markdown(&report, false).contains("## Provenance"));
+        assert!(!summary_text(&report, false).contains("Provenance:"));
+    }
 }

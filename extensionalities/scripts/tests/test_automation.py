@@ -60,6 +60,7 @@ class TreeTests(unittest.TestCase):
         self.files = {
             ".gitignore": b"target/\n/extensionalities/dev/\n",
             ".github/README.md": b"# Glassbox\n",
+            ".cargo/config.toml": b'[build]\nbuild-dir = "target"\n',
             ".github/workflows/glassbox-ci.yml": b"ours\n",
             "extensionalities/Cargo.toml": b"[workspace]\n",
             "extensionalities/README.md": b"downstream\n",
@@ -105,6 +106,7 @@ class TreeTests(unittest.TestCase):
         """
         upstream = self.upstream(**{
             ".github/README.md": b"must not overwrite landing page\n",
+            ".cargo/config.toml": b'[build]\nbuild-dir = "upstream-target"\n',
             "extensionalities/README.md": b"must not win\n",
             "extensionalities/new.rs": b"must not be imported\n",
             ".github/workflows/new-upstream.yml": b"must not run\n",
@@ -127,6 +129,32 @@ class TreeTests(unittest.TestCase):
         result = sync.plan(self.root, self.base, self.base)
         self.assertFalse(result["changed"])
         self.assertEqual(result["tree"], sync.oid(self.root, self.base + "^{tree}"))
+
+    def test_plan_cleans_up_temporary_index_directory_on_success_and_failure(self):
+        """Verify sync.plan removes its temporary sync-plan-* index directory on both success and failure.
+
+        Accepts only self (TreeTests).
+        Returns None after asserting zero sync-plan-* directories remain under extensionalities/target
+        following both a successful plan and a mid-index failure.
+        Raises AssertionError if any temporary sync-plan-* directory leaks.
+        """
+        scratch = self.root / "extensionalities/target"
+        upstream = self.upstream()
+
+        sync.plan(self.root, self.base, upstream)
+        self.assertEqual(list(scratch.glob("sync-plan-*")), [])
+
+        real_git = sync.git
+
+        def fail_on_write_tree(root, *args, **kwargs):
+            if args and args[0] == "write-tree":
+                raise sync.SyncError("simulated write-tree failure")
+            return real_git(root, *args, **kwargs)
+
+        with patch.object(sync, "git", side_effect=fail_on_write_tree):
+            with self.assertRaisesRegex(sync.SyncError, "simulated write-tree failure"):
+                sync.plan(self.root, self.base, upstream)
+        self.assertEqual(list(scratch.glob("sync-plan-*")), [])
 
     def test_change_detection_handles_renames_out_of_the_downstream_tree(self):
         """Verify change detection triggers on moved code manifests and skips documentation-only edits.
@@ -225,6 +253,12 @@ class TreeTests(unittest.TestCase):
         self.assertTrue(output.split(b"\t")[0].endswith(b":/extensionalities/dev/"))
 
     def test_publisher_uses_verified_tree_and_does_not_override_identity(self):
+        """Verify fresh sync publication probes the ref (404), publishes verified objects, and opens a PR.
+
+        Accepts only self (TreeTests).
+        Returns None after asserting 4 POST calls and default GitHub commit identity.
+        Raises AssertionError or sync.SyncError if tree overlays, parents, or ref probing regress.
+        """
         upstream = self.upstream()
         candidate = sync.plan(self.root, self.base, upstream)
         calls = []
@@ -239,6 +273,8 @@ class TreeTests(unittest.TestCase):
                 return [[]]
             if path == "branches/main":
                 return {"commit": {"sha": self.base}}
+            if path.startswith("git/ref/"):
+                raise sync.NotFoundError(f"GitHub resource not found (GET {path})")
             if path == "git/trees":
                 self.assertEqual(payload["tree"], candidate["overlays"])
                 return {"sha": candidate["tree"]}
@@ -258,6 +294,160 @@ class TreeTests(unittest.TestCase):
             sync.automate(self.root, self.base, upstream)
             merge.assert_called_once()
         self.assertEqual(sum(method == "POST" for _, _, method in calls), 4)
+
+    def test_retry_after_partial_publication_reconciles_verified_ref_and_blocks_mismatch(self):
+        """Verify retry after partial publication reuses verified ref and fails closed on tampering.
+
+        Accepts only self (TreeTests).
+        Returns None after testing:
+          1. Matching existing ref -> skips POST git/trees|commits|refs, creates PR, and merges.
+          2. Tampered tree SHA on existing ref -> fails closed with SyncError and zero POSTs.
+          3. Mismatched parents on existing ref -> fails closed with SyncError and zero POSTs.
+        Raises AssertionError if retry fails to recover or accepts a tampered existing branch.
+        """
+        upstream = self.upstream()
+        candidate = sync.plan(self.root, self.base, upstream)
+        branch = f"automation/upstream-sync/{candidate['upstream'][:12]}-{candidate['base'][:12]}"
+        existing_sha = "d" * 40
+        env = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REPOSITORY": sync.REPOSITORY,
+            "GH_TOKEN": "synthetic-test-credential",
+        }
+
+        with self.subTest(case="matching-existing-ref-recovers-and-creates-pr"):
+            calls = []
+
+            def api_match(repository, path="", payload=None, method="GET", paginate=False):
+                calls.append((path, payload, method))
+                if path == "branches/main/protection":
+                    return protection()
+                if path == "":
+                    return {"default_branch": "main", "allow_merge_commit": True}
+                if path.startswith("pulls?"):
+                    return [[]]
+                if path == "branches/main":
+                    return {"commit": {"sha": self.base}}
+                if path == f"git/ref/heads/{branch}":
+                    return {
+                        "ref": f"refs/heads/{branch}",
+                        "object": {"type": "commit", "sha": existing_sha},
+                    }
+                if path == f"git/commits/{existing_sha}":
+                    return {
+                        "sha": existing_sha,
+                        "tree": {"sha": candidate["tree"]},
+                        "parents": [{"sha": self.base}, {"sha": upstream}],
+                    }
+                if path == "pulls":
+                    self.assertEqual(payload["head"], branch)
+                    self.assertEqual(payload["base"], "main")
+                    return {"number": 8, "html_url": "https://github.com/example/repository/pull/8"}
+                return {}
+
+            with patch.dict(os.environ, env), \
+                 patch.object(sync, "api", side_effect=api_match), \
+                 patch.object(sync, "merge_when_green") as merge:
+                sync.automate(self.root, self.base, upstream)
+                merge.assert_called_once_with(
+                    sync.REPOSITORY, 8, branch, existing_sha, candidate["base"]
+                )
+            post_paths = [p for p, _, m in calls if m == "POST"]
+            self.assertEqual(post_paths, ["pulls"])
+
+        with self.subTest(case="tampered-tree-sha-fails-closed"):
+            calls = []
+
+            def api_bad_tree(repository, path="", payload=None, method="GET", paginate=False):
+                calls.append((path, payload, method))
+                if path == "branches/main/protection":
+                    return protection()
+                if path == "":
+                    return {"default_branch": "main", "allow_merge_commit": True}
+                if path.startswith("pulls?"):
+                    return [[]]
+                if path == "branches/main":
+                    return {"commit": {"sha": self.base}}
+                if path == f"git/ref/heads/{branch}":
+                    return {
+                        "ref": f"refs/heads/{branch}",
+                        "object": {"type": "commit", "sha": existing_sha},
+                    }
+                if path == f"git/commits/{existing_sha}":
+                    return {
+                        "sha": existing_sha,
+                        "tree": {"sha": "f" * 40},
+                        "parents": [{"sha": self.base}, {"sha": upstream}],
+                    }
+                return {}
+
+            with patch.dict(os.environ, env), \
+                 patch.object(sync, "api", side_effect=api_bad_tree), \
+                 patch.object(sync, "merge_when_green") as merge:
+                with self.assertRaisesRegex(sync.SyncError, "does not match verified tree/parents"):
+                    sync.automate(self.root, self.base, upstream)
+                merge.assert_not_called()
+            self.assertEqual([p for p, _, m in calls if m == "POST"], [])
+
+        with self.subTest(case="mismatched-parents-fails-closed"):
+            calls = []
+
+            def api_bad_parents(repository, path="", payload=None, method="GET", paginate=False):
+                calls.append((path, payload, method))
+                if path == "branches/main/protection":
+                    return protection()
+                if path == "":
+                    return {"default_branch": "main", "allow_merge_commit": True}
+                if path.startswith("pulls?"):
+                    return [[]]
+                if path == "branches/main":
+                    return {"commit": {"sha": self.base}}
+                if path == f"git/ref/heads/{branch}":
+                    return {
+                        "ref": f"refs/heads/{branch}",
+                        "object": {"type": "commit", "sha": existing_sha},
+                    }
+                if path == f"git/commits/{existing_sha}":
+                    return {
+                        "sha": existing_sha,
+                        "tree": {"sha": candidate["tree"]},
+                        "parents": [{"sha": self.base}],
+                    }
+                return {}
+
+            with patch.dict(os.environ, env), \
+                 patch.object(sync, "api", side_effect=api_bad_parents), \
+                 patch.object(sync, "merge_when_green") as merge:
+                with self.assertRaisesRegex(sync.SyncError, "does not match verified tree/parents"):
+                    sync.automate(self.root, self.base, upstream)
+                merge.assert_not_called()
+            self.assertEqual([p for p, _, m in calls if m == "POST"], [])
+
+    def test_api_classifies_http_404_as_not_found_and_non_404_as_sync_error(self):
+        """Verify sync.api distinguishes HTTP 404 NotFoundError from general SyncError failures.
+
+        Accepts only self (TreeTests).
+        Returns None after verifying 404 raises NotFoundError and 500 raises plain SyncError.
+        Raises AssertionError if HTTP status classification fails.
+        """
+        res_404 = subprocess.CompletedProcess(
+            ["gh", "api"], 1,
+            '{"message":"Not Found","status":"404"}',
+            "gh: Not Found (HTTP 404)\n",
+        )
+        with patch.object(sync.subprocess, "run", return_value=res_404):
+            with self.assertRaises(sync.NotFoundError):
+                sync.api(sync.REPOSITORY, "git/ref/heads/missing")
+
+        res_500 = subprocess.CompletedProcess(
+            ["gh", "api"], 1,
+            '{"message":"Internal Server Error","status":"500"}',
+            "gh: Internal Server Error (HTTP 500)\n",
+        )
+        with patch.object(sync.subprocess, "run", return_value=res_500):
+            with self.assertRaises(sync.SyncError) as ctx:
+                sync.api(sync.REPOSITORY, "git/ref/heads/missing")
+            self.assertNotIsInstance(ctx.exception, sync.NotFoundError)
 
 
 class GateTests(unittest.TestCase):
@@ -399,7 +589,7 @@ class ChangesTests(unittest.TestCase):
         self.assertNotIn("litx-inspect", arguments)
 
     def test_full_check_runs_automation_tests_rust_checks_and_smoke(self):
-        """Verify the check command runs scoped automation tests, Cargo checks, and smoke.
+        """Verify the check command runs scoped automation and driver tests, Cargo checks, and smoke.
 
         Accepts only self (ChangesTests) and mocks ci.run and ci.smoke.
         Returns None after asserting exact command order and no harness references.
@@ -413,8 +603,10 @@ class ChangesTests(unittest.TestCase):
         self.assertEqual(
             commands[0],
             (
-                "python3", "-B", "-m", "unittest", "discover",
-                "-s", "extensionalities/scripts/tests", "-p", "test_automation.py", "-v",
+                "python3", "-B", "-m", "unittest",
+                "extensionalities/scripts/tests/test_automation.py",
+                "extensionalities/scripts/tests/test_inspect_extract_outputs_driver.py",
+                "-v",
             ),
         )
         self.assertEqual(commands[1][:2], ("cargo", "clippy"))
@@ -428,19 +620,29 @@ class ChangesTests(unittest.TestCase):
         smoke.assert_called_once_with()
 
     def test_smoke_distinguishes_metadata_inspection_from_canonical_extraction(self):
-        """Verify smoke requires v2 inspect reports and content-bearing extract reports.
+        """Verify smoke requires schema v3 inspect reports, bodymatter Markdown, and extract reports.
 
         Accepts no parameters and mocks only the release-binary subprocess boundary.
-        Returns unit after checking single-file, batch, and offline-OCR invocations.
+        Returns unit after checking single-file, Markdown marker, batch, and offline-OCR invocations.
         Raises AssertionError if smoke accepts a body field or skips the alias checks.
         """
         metadata_report = {
-            "schema_version": 2, "kind": "inspect",
-            "metadata": {"status": "complete", "diagnostics": []},
+            "schema_version": 3, "kind": "inspect", "status": "complete",
+            "file": {"path": "hello.txt", "name": "hello.txt", "bytes": 42, "sha256": "a" * 64},
+            "format": {"type": "text", "extension": "txt"},
+            "description": {},
+            "structure": {"counts": {"lines": 1}},
+            "readiness": {
+                "extractable": "supported",
+                "encrypted": "none",
+                "text_layer": "present",
+                "ocr": "not_needed",
+            },
         }
         extract_report = {
-            "schema_version": 2, "kind": "extract",
-            "metadata": {"status": "complete", "diagnostics": []},
+            "schema_version": 3, "kind": "extract", "status": "complete",
+            "completeness": "exact",
+            "metadata": metadata_report,
             "content": {"units": [{
                 "text": (ci.ROOT / "extensionalities/fixtures/hello.txt").read_text()
             }]},
@@ -451,12 +653,8 @@ class ChangesTests(unittest.TestCase):
             calls.append(arguments)
             if "--batch" in arguments:
                 return json.dumps({"id": "smoke", "report": metadata_report}).encode()
-            if "--identify" in arguments:
-                self.assertEqual(arguments[1], "extract")
-                return json.dumps({
-                    "errors": [{"code": "ocr_model_missing"}],
-                    "text": {"truncated": True},
-                }).encode()
+            if "--format" in arguments and "markdown" in arguments:
+                return b'<!-- bodymatter:v1 <page number="1" origin="native"/> -->\n\nNative PDF evidence.\n'
             report = metadata_report if arguments[1] == "inspect" else extract_report
             return json.dumps(report).encode()
 
@@ -464,8 +662,11 @@ class ChangesTests(unittest.TestCase):
             calls.append(arguments)
             self.assertEqual(arguments[1], "extract")
             report = {
-                "kind": "extract", "completeness": "partial",
-                "metadata": {"diagnostics": [{"code": "pdf_ocr"}]},
+                "schema_version": 3, "kind": "extract",
+                "status": "partial", "completeness": "partial",
+                "metadata": {**metadata_report, "status": "partial",
+                             "diagnostics": [{"code": "pdf_ocr"}]},
+                "diagnostics": [{"code": "pdf_ocr"}],
                 "content": {"units": [{"text": "Native PDF evidence"}]},
             }
             return subprocess.CompletedProcess(arguments, 2, json.dumps(report).encode(), b"")
@@ -474,7 +675,7 @@ class ChangesTests(unittest.TestCase):
                 ci.subprocess, "run", side_effect=missing_model):
             ci.smoke()
         self.assertEqual(sum("--batch" in call for call in calls), 2)
-        self.assertEqual(sum(call[1] == "extract" for call in calls), 3)
+        self.assertEqual(sum(call[1] == "extract" for call in calls), 4)
 
     def test_workflow_linter_is_pinned_scoped_and_cache_isolated(self):
         with patch.object(ci.subprocess, "run") as run:
