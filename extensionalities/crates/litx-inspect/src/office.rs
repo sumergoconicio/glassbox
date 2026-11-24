@@ -136,23 +136,44 @@ pub(crate) fn metadata(archive: &mut Archive, report: &mut InspectReport) {
     }
 }
 
-pub(crate) fn inspect(archive: &mut Archive, report: &mut InspectReport, options: &InspectOptions) {
-    let result = inspect_inner(archive, report, options);
-    if let Err(error) = result {
-        report.error("office", error);
+/// Inspects an OpenDocument or OOXML package inside an open ZIP archive.
+///
+/// Accepts an open archive, mutable destination report, and extraction options.
+/// Returns `true` when ODF or OOXML recognized the archive (including when a
+/// recognized package fails and records an `"office"` error so downstream ZIP
+/// readers do not run), and `false` when neither ODF nor OOXML matched.
+pub(crate) fn inspect(
+    archive: &mut Archive,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+) -> bool {
+    match inspect_inner(archive, report, options) {
+        Ok(handled) => handled,
+        Err(error) => {
+            report.error("office", error);
+            true
+        }
     }
 }
 
+/// Dispatches ODF (`mimetype`) and OOXML (`[Content_Types].xml`) package parsing.
+///
+/// Accepts an open archive, mutable destination report, and extraction options.
+/// Returns `Ok(true)` when ODF or OOXML recognized and inspected the archive,
+/// `Ok(false)` when neither ODF nor OOXML matched, or an error when reading or
+/// validating a recognized Office package fails.
 fn inspect_inner(
     archive: &mut Archive,
     report: &mut InspectReport,
     options: &InspectOptions,
-) -> xml::Result<()> {
-    if archive.names.iter().any(|n| n == "mimetype") {
-        crate::odf::inspect(archive, report, options)?;
+) -> xml::Result<bool> {
+    if archive.names.iter().any(|n| n == "mimetype")
+        && crate::odf::inspect(archive, report, options)?
+    {
+        return Ok(true);
     }
     if !archive.names.iter().any(|n| n == "[Content_Types].xml") {
-        return Ok(());
+        return Ok(false);
     }
     let types = read_xml(archive, "[Content_Types].xml")?;
     if !types.is(CT, "Types") {
@@ -188,7 +209,7 @@ fn inspect_inner(
         }
     }
     let Some(((ext, ns, root_name), part)) = main else {
-        return Ok(());
+        return Ok(false);
     };
     if part.split('/').any(|p| matches!(p, ".." | "." | "")) || part.contains('\\') {
         return Err("unsafe OOXML main part name".into());
@@ -245,7 +266,7 @@ fn inspect_inner(
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn resolve_part(base: &str, target: &str) -> xml::Result<String> {

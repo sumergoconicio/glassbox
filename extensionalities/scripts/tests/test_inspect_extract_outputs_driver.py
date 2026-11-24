@@ -456,6 +456,84 @@ class DocsOnlyValidatorTests(SandboxTestCase):
         self.assertEqual(len(result["standalone_matches"]), 1)
         self.assertEqual(result["standalone_matches"][0]["file"], "fixtures/leak.txt")
 
+    def test_dependencies_md_valid_relative_link_included_and_passes(self) -> None:
+        """Verify DEPENDENCIES.md with a valid relative link is included in doc_files and passes V-IO-10.
+
+        Parameters:
+          self: TestCase instance with isolated sandbox directory.
+
+        Returns:
+          None after asserting DEPENDENCIES.md appears in doc_files and V-IO-10 passes.
+
+        Failure modes:
+          Raises AssertionError if DEPENDENCIES.md is omitted from doc_files or link check fails.
+        """
+        self._write_valid_doc_tree(self.tmp)
+        (self.tmp / "scripts").mkdir(parents=True, exist_ok=True)
+        (self.tmp / "scripts" / "install-helpers.py").write_text(
+            "# helper installer\n", encoding="utf-8"
+        )
+        (self.tmp / "DEPENDENCIES.md").write_text(
+            "# Optional dependencies\n\nRun [the helper installer](scripts/install-helpers.py).\n",
+            encoding="utf-8",
+        )
+        result = driver.validate_docs_tree(self.tmp)
+        checks = {c["name"]: c for c in result["checks"]}
+        self.assertEqual(result["status"], "PASS", result)
+        self.assertIn("DEPENDENCIES.md", result["doc_files"])
+        self.assertTrue(checks["relative_markdown_links"]["ok"])
+        self.assertEqual(result["broken_links"], [])
+
+    def test_dependencies_md_broken_relative_link_fails(self) -> None:
+        """Verify DEPENDENCIES.md with a broken relative link fails relative_markdown_links.
+
+        Parameters:
+          self: TestCase instance with isolated sandbox directory.
+
+        Returns:
+          None after asserting relative_markdown_links fails and reports source DEPENDENCIES.md.
+
+        Failure modes:
+          Raises AssertionError if broken links in DEPENDENCIES.md are ignored or misattributed.
+        """
+        self._write_valid_doc_tree(self.tmp)
+        (self.tmp / "DEPENDENCIES.md").write_text(
+            "# Optional dependencies\n\nBroken: [missing helper](scripts/missing-helper.py).\n",
+            encoding="utf-8",
+        )
+        result = driver.validate_docs_tree(self.tmp)
+        checks = {c["name"]: c for c in result["checks"]}
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(checks["relative_markdown_links"]["ok"])
+        self.assertEqual(len(result["broken_links"]), 1)
+        self.assertEqual(result["broken_links"][0]["source"], "DEPENDENCIES.md")
+        self.assertEqual(result["broken_links"][0]["target"], "scripts/missing-helper.py")
+
+    def test_dependencies_md_forbidden_sibling_token_fails(self) -> None:
+        """Verify DEPENDENCIES.md containing a forbidden sibling token fails standalone hygiene.
+
+        Parameters:
+          self: TestCase instance with isolated sandbox directory.
+
+        Returns:
+          None after asserting standalone_zero_sibling_refs fails and reports file DEPENDENCIES.md.
+
+        Failure modes:
+          Raises AssertionError if forbidden sibling tokens in DEPENDENCIES.md go undetected.
+        """
+        self._write_valid_doc_tree(self.tmp)
+        leaked_token = driver.forbidden_sibling_tokens()[0]
+        (self.tmp / "DEPENDENCIES.md").write_text(
+            f"# Optional dependencies\n\nForbidden ref: {leaked_token}.\n",
+            encoding="utf-8",
+        )
+        result = driver.validate_docs_tree(self.tmp)
+        checks = {c["name"]: c for c in result["checks"]}
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(checks["standalone_zero_sibling_refs"]["ok"])
+        self.assertEqual(len(result["standalone_matches"]), 1)
+        self.assertEqual(result["standalone_matches"][0]["file"], "DEPENDENCIES.md")
+
 
 class ResultPayloadSchemaTests(unittest.TestCase):
     def test_overall_status_reflects_verification_matrix(self) -> None:

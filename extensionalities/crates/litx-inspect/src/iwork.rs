@@ -72,11 +72,12 @@ pub(crate) fn has_iwork_marker(names: &[String]) -> bool {
 /// Extracts a bounded QuickLook preview for `.pages`, `.numbers`, and `.key` packages.
 ///
 /// Accepts an open ZIP archive, destination report, extraction options, and the
-/// worker OCR session. Returns unit after recording derived-preview metadata and
-/// either one bounded [`NativeUnit::DatasetPreview`] unit (when `native_selection`
-/// is set) or legacy bounded preview text/Markdown (when `native_selection` is
-/// `None`). Generic ZIP archives lacking an iWork structural marker return early
-/// without emitting `iwork_preview` diagnostics. Preview decoding is always
+/// worker OCR session. Returns `false` when the extension is not `pages`,
+/// `numbers`, or `key`, or when the archive lacks a structural iWork marker
+/// (without emitting `iwork_preview` diagnostics). Otherwise records derived-preview
+/// metadata and either one bounded [`NativeUnit::DatasetPreview`] unit (when
+/// `native_selection` is set) or legacy bounded preview text/Markdown (when
+/// `native_selection` is `None`), and returns `true`. Preview decoding is always
 /// isolated from original-document selection so embedded multi-page PDFs never
 /// emit native [`NativeUnit::PhysicalPage`] units. Archive read failures,
 /// missing previews, out-of-range selections, and preview-decoder errors are
@@ -86,13 +87,13 @@ pub(crate) fn inspect(
     report: &mut InspectReport,
     options: &InspectOptions,
     ocr: &mut OcrSession,
-) {
+) -> bool {
     if !matches!(
         report.format.extension.as_str(),
         "pages" | "numbers" | "key"
     ) || !has_iwork_marker(&archive.names)
     {
-        return;
+        return false;
     }
     for name in [
         "QuickLook/Preview.pdf",
@@ -135,10 +136,10 @@ pub(crate) fn inspect(
                     report.text.origin = "embedded_preview".into();
                     report.text.truncated = true;
                     let Ok(plan) = plan_result else {
-                        return;
+                        return true;
                     };
                     if !plan.contains(1) {
-                        return;
+                        return true;
                     }
                     preview_options.thumbnail = None;
                     let preview_report =
@@ -146,7 +147,7 @@ pub(crate) fn inspect(
                     let had_errors = !preview_report.errors.is_empty();
                     report.errors.extend(preview_report.errors);
                     if had_errors && preview_report.text.content.is_empty() {
-                        return;
+                        return true;
                     }
                     let used_ocr = matches!(
                         preview_report.text.origin.as_str(),
@@ -203,7 +204,7 @@ pub(crate) fn inspect(
                         }],
                         completeness: Completeness::Partial,
                     });
-                    return;
+                    return true;
                 }
 
                 // LITX-AUD-019: the notice is provenance-neutral; the actual
@@ -248,12 +249,12 @@ pub(crate) fn inspect(
                 }
                 report.text.origin = "embedded_preview".into();
                 report.text.truncated = true;
-                return;
+                return true;
             }
             Ok(None) => {}
             Err(error) => {
                 report.error("iwork_preview", error);
-                return;
+                return true;
             }
         }
     }
@@ -261,4 +262,5 @@ pub(crate) fn inspect(
         "iwork_preview",
         "no supported embedded QuickLook preview; native IWA extraction is unavailable",
     );
+    true
 }

@@ -1021,8 +1021,11 @@ impl Inspector {
 ///
 /// Accepts a source path, inspection limits and output options, and a mutable
 /// session. Returns a report with bounded identification and any supported
-/// extraction. Filesystem, parser, renderer, and OCR failures are recorded in
-/// `report.errors`; unsupported formats retain their static support boundary.
+/// extraction; ZIP archives short-circuit in precedence order (`office`, `epub`,
+/// `iwork`, `cbz`) and fall back to byte-confirmed generic ZIP identification
+/// when all specialized readers decline. Filesystem, parser, renderer, and OCR
+/// failures are recorded in `report.errors`; unsupported formats retain their
+/// static support boundary.
 fn inspect_with_session(
     path: &Path,
     options: &InspectOptions,
@@ -1117,10 +1120,13 @@ fn inspect_with_session(
         {
             match archive::Archive::open(path, &mut report) {
                 Ok(mut archive) => {
-                    office::inspect(&mut archive, &mut report, options);
-                    epub::inspect(&mut archive, &mut report, options);
-                    comics::cbz(&mut archive, &mut report, options);
-                    iwork::inspect(&mut archive, &mut report, options, ocr);
+                    let handled = office::inspect(&mut archive, &mut report, options)
+                        || epub::inspect(&mut archive, &mut report, options)
+                        || iwork::inspect(&mut archive, &mut report, options, ocr)
+                        || comics::cbz(&mut archive, &mut report, options);
+                    if !handled {
+                        office::identify(&mut report, "zip", "application/zip", "ZIP");
+                    }
                     archive::summarize(&mut report, options);
                     // Only allowlisted embedded preview entries may be read.
                     // LITX-AUD-012: fall back only when no thumbnail exists.

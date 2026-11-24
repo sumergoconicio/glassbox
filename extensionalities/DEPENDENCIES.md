@@ -12,7 +12,7 @@ python3 extensionalities/scripts/install-helpers.py libreoffice imagemagick ffmp
 
 This prints the exact plan. Add `--apply` to review it and type `yes` in an interactive terminal. The plan skips working installations and nonempty packs already present in the selected directory. Linux package installation uses APT on Debian or Ubuntu. macOS uses Homebrew. Windows uses WinGet. ImageMagick 6 is detected through its `convert` command on Unix. ImageMagick 7 uses `magick`. Other Linux package managers need a manual plan. Container deployment is outside this installer.
 
-Selecting language packs also includes English as the baseline. The installer downloads missing traineddata files from a pinned [Tesseract tessdata_fast revision](https://github.com/tesseract-ocr/tessdata_fast/tree/87416418657359cb625c412a48b6e1d6d41c29bd). Use `--tessdata-dir` to choose the destination. By default, the data lives alongside the helper receipt at `~/.config/glassbox/tessdata`.
+Selecting language packs also includes English as the baseline. The installer downloads missing traineddata files from a pinned [Tesseract tessdata_fast revision](https://github.com/tesseract-ocr/tessdata_fast/tree/87416418657359cb625c412a48b6e1d6d41c29bd). Pass `--tess-sha256 CODE=<sha256>` for each downloaded language pack. The installer checks the SHA-256 digest over HTTPS before writing any pack. Use `--tessdata-dir` to choose the destination. By default, the data lives alongside the helper receipt at `~/.config/glassbox/tessdata`.
 
 ### Use the saved paths
 

@@ -14,10 +14,11 @@ Modes:
     `--evidence-dir`.
 
   --docs-only:
-    Verifies V-IO-10 across `extensionalities/README.md`, `extensionalities/docs/*.md`,
-    `extensionalities/crates/`, and `extensionalities/fixtures/`: relative Markdown
-    link integrity, presence of all 23 `format.type` IDs, sampled fingerprint spec,
-    `bodymatter:v1` consumer recipe, CLI flags, and zero sibling-project references.
+    Verifies V-IO-10 across `extensionalities/README.md`, `extensionalities/DEPENDENCIES.md`,
+    `extensionalities/docs/*.md`, `extensionalities/crates/`, and
+    `extensionalities/fixtures/`: relative Markdown link integrity, presence of all 23
+    `format.type` IDs, sampled fingerprint spec, `bodymatter:v1` consumer recipe, CLI
+    flags, and zero sibling-project references.
 
 Exit codes:
   0 = PASS
@@ -1222,14 +1223,31 @@ def extract_markdown_anchors(markdown: str) -> set[str]:
 def validate_docs_tree(
     ext_dir: Path, forbidden_tokens: tuple[str, ...] | None = None
 ) -> dict:
-    """Validate V-IO-10 documentation links, required v3/bodymatter tokens, and standalone hygiene."""
+    """Validate V-IO-10 documentation links, required v3/bodymatter tokens, and standalone hygiene.
+
+    Parameters:
+      ext_dir: Root `extensionalities/` directory containing top-level docs, `docs/`,
+        `crates/`, and `fixtures/`.
+      forbidden_tokens: Optional override tuple of case-insensitive forbidden sibling-project
+        tokens; defaults to `forbidden_sibling_tokens()`.
+
+    Returns:
+      Dictionary containing V-IO-10 status (`"PASS"` or `"FAIL"`), per-check outcomes,
+      checked `doc_files`, `links_checked`, `broken_links`, `missing_format_types`,
+      `missing_tokens`, and `standalone_matches`.
+
+    Failure modes:
+      Propagates `OSError` if a discovered regular file cannot be read; missing optional
+      roots are skipped and reported through the returned `checks` list.
+    """
     tokens = (
         forbidden_tokens if forbidden_tokens is not None else forbidden_sibling_tokens()
     )
     doc_files: list[Path] = []
-    readme = ext_dir / "README.md"
-    if readme.is_file():
-        doc_files.append(readme)
+    for top_doc in ("README.md", "DEPENDENCIES.md"):
+        candidate_doc = ext_dir / top_doc
+        if candidate_doc.is_file():
+            doc_files.append(candidate_doc)
     docs_dir = ext_dir / "docs"
     if docs_dir.is_dir():
         doc_files.extend(sorted(docs_dir.glob("*.md")))
@@ -1342,9 +1360,10 @@ def validate_docs_tree(
     }
     missing_tokens = [key for key, present in required_tokens.items() if not present]
 
-    # Standalone check across crates/, docs/, README.md, fixtures/
+    # Standalone check across crates/, docs/, README.md, DEPENDENCIES.md, fixtures/
     scan_roots: list[Path] = [
         ext_dir / "README.md",
+        ext_dir / "DEPENDENCIES.md",
         ext_dir / "docs",
         ext_dir / "crates",
         ext_dir / "fixtures",
@@ -1402,7 +1421,10 @@ def validate_docs_tree(
         {
             "name": "standalone_zero_sibling_refs",
             "ok": len(standalone_matches) == 0,
-            "detail": f"scanned {scanned_files} files across crates/docs/README/fixtures, matches={len(standalone_matches)}",
+            "detail": (
+                f"scanned {scanned_files} files across crates/docs/README/DEPENDENCIES/fixtures,"
+                f" matches={len(standalone_matches)}"
+            ),
         },
     ]
     status = "PASS" if all(c["ok"] for c in checks) else "FAIL"

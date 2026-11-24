@@ -156,13 +156,21 @@ fn cell_text(
     Ok(value)
 }
 
+/// Inspects an OpenDocument (`.odt`, `.odp`, `.ods`) package from an open ZIP archive.
+///
+/// Accepts an open ZIP archive, mutable destination report, and extraction options.
+/// Returns `Ok(true)` when `mimetype` identifies an OpenDocument text, presentation,
+/// or spreadsheet package and extraction completes, or `Ok(false)` when `mimetype` is
+/// absent or names a non-ODF media type (such as EPUB). Archive read failures,
+/// invalid UTF-8 `mimetype` bytes, malformed `content.xml`, mismatched ODF body
+/// structure, and expansion/selection errors return `Err`.
 pub(crate) fn inspect(
     archive: &mut Archive,
     report: &mut InspectReport,
     options: &InspectOptions,
-) -> xml::Result<()> {
+) -> xml::Result<bool> {
     let Some(bytes) = archive.read("mimetype")? else {
-        return Ok(());
+        return Ok(false);
     };
     let mime = std::str::from_utf8(&bytes)?.trim();
     let (ext, body_kind, name) = match mime {
@@ -173,7 +181,7 @@ pub(crate) fn inspect(
         "application/vnd.oasis.opendocument.spreadsheet" => {
             ("ods", "spreadsheet", "OpenDocument spreadsheet")
         }
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let root = office::read_xml(archive, "content.xml")?;
     if !root.is(O, "document-content") {
@@ -308,7 +316,7 @@ pub(crate) fn inspect(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Appends text to a bounded unit buffer, clipping retention on a character

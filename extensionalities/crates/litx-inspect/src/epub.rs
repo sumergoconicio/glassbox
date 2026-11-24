@@ -16,15 +16,22 @@ const DC: &str = "http://purl.org/dc/elements/1.1/";
 /// Inspects an EPUB archive if `META-INF/container.xml` is present.
 ///
 /// Accepts an open ZIP archive, destination report, and extraction options.
-/// Returns unit after populating metadata and selected spine text; container
-/// or OPF failures are recorded under stage `"epub"`.
-pub(crate) fn inspect(archive: &mut Archive, report: &mut InspectReport, options: &InspectOptions) {
+/// Returns `true` when `META-INF/container.xml` is present (including when
+/// container or OPF failures are recorded under stage `"epub"` so downstream
+/// archive readers do not run), and `false` when `META-INF/container.xml` is
+/// absent.
+pub(crate) fn inspect(
+    archive: &mut Archive,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+) -> bool {
     if !archive.names.iter().any(|n| n == "META-INF/container.xml") {
-        return;
+        return false;
     }
     if let Err(error) = inner(archive, report, options) {
         report.error("epub", error);
     }
+    true
 }
 
 /// Parses EPUB package structure and extracts selected native spine items.
