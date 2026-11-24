@@ -214,9 +214,38 @@ fn selector_usage_and_coverage_errors_have_distinct_exits() {
     let missing = run(&["extract", path, "--pages", "8-9", "--no-ocr"]);
     assert_eq!(missing.status.code(), Some(1));
     let missing = json(&missing);
-    assert_eq!(missing["metadata"]["status"], "failed");
+    assert_eq!(missing["status"], "failed");
+    assert_eq!(missing["metadata"]["status"], "complete");
+    assert!(missing["metadata"].get("diagnostics").is_none());
+    assert!(
+        missing["diagnostics"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|d| d["stage"] == "selection"))
+    );
     assert_eq!(missing["completeness"], "unavailable");
     assert_eq!(missing["content"]["units"], serde_json::json!([]));
+
+    // GB-AUD-17: extracting an out-of-range page from a valid PDF fails the
+    // extraction request while keeping nested inspection metadata complete.
+    let pdf_missing = run(&[
+        "extract",
+        "../../fixtures/native.pdf",
+        "--pages",
+        "99-99",
+        "--no-ocr",
+    ]);
+    assert_eq!(pdf_missing.status.code(), Some(1));
+    let pdf_missing = json(&pdf_missing);
+    assert_eq!(pdf_missing["status"], "failed");
+    assert_eq!(pdf_missing["metadata"]["status"], "complete");
+    assert!(pdf_missing["metadata"].get("diagnostics").is_none());
+    assert!(
+        pdf_missing["diagnostics"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|d| d["stage"] == "selection"))
+    );
+    assert_eq!(pdf_missing["completeness"], "unavailable");
+    assert_eq!(pdf_missing["content"]["units"], serde_json::json!([]));
 }
 
 /// Verifies deprecated page and packet flags retain behavior while warning on stderr.
@@ -241,9 +270,9 @@ fn deprecated_flags_warn_without_changing_full_extraction() {
     );
 }
 
-/// Verifies canonical extraction persists Markdown and the identical v2 JSON report.
+/// Verifies canonical extraction persists Markdown and the identical v3 JSON report.
 #[test]
-fn output_persists_selected_markdown_and_v2_json() {
+fn output_persists_selected_markdown_and_v3_json() {
     let path = lines("output");
     let directory = workdir("output-artifacts");
     let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
@@ -273,17 +302,19 @@ fn output_persists_selected_markdown_and_v2_json() {
     assert_eq!(output.status.code(), Some(0));
     let response = json(&output);
     let report = &response["report"];
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "complete");
     assert_eq!(report["metadata"]["status"], "complete");
     assert_eq!(report["completeness"], "partial");
     assert_eq!(report["selection"]["omitted"], "selection");
-    assert_eq!(report["metadata"]["artifacts"].as_array().unwrap().len(), 2);
-    let markdown_artifact = report["metadata"]["artifacts"]
+    assert_eq!(report["artifacts"].as_array().unwrap().len(), 2);
+    let markdown_artifact = report["artifacts"]
         .as_array()
         .unwrap()
         .iter()
         .find(|artifact| artifact["kind"] == "markdown_content")
         .unwrap();
-    let json_artifact = report["metadata"]["artifacts"]
+    let json_artifact = report["artifacts"]
         .as_array()
         .unwrap()
         .iter()
@@ -296,16 +327,17 @@ fn output_persists_selected_markdown_and_v2_json() {
     let saved: Value =
         serde_json::from_slice(&std::fs::read(json_artifact["path"].as_str().unwrap()).unwrap())
             .unwrap();
+    assert_eq!(saved["schema_version"], 3);
     assert_eq!(saved["selection"], report["selection"]);
     assert_eq!(
-        saved["metadata"]["identity"]["path"],
-        report["metadata"]["identity"]["path"]
+        saved["metadata"]["file"]["path"],
+        report["metadata"]["file"]["path"]
     );
 }
 
-/// Verifies extraction batch emits ordered reports and preserves later work after a failure.
+/// Verifies extraction batch emits ordered v3 reports and preserves later work.
 #[test]
-fn batch_emits_v2_reports_and_recovers_after_out_of_range() {
+fn batch_emits_v3_reports_and_recovers_after_out_of_range() {
     let path = lines("batch");
     let mut child = Command::new(env!("CARGO_BIN_EXE_glassbox"))
         .args(["extract", "--batch", "--no-ocr", "--pages", "99"])
@@ -330,8 +362,9 @@ fn batch_emits_v2_reports_and_recovers_after_out_of_range() {
     assert_eq!(responses[0]["id"], "first");
     assert_eq!(responses[1]["id"], "second");
     for response in responses {
+        assert_eq!(response["report"]["schema_version"], 3);
         assert_eq!(response["report"]["kind"], "extract");
-        assert_eq!(response["report"]["metadata"]["status"], "complete");
+        assert_eq!(response["report"]["status"], "complete");
         assert_eq!(
             response["report"]["content"]["units"]
                 .as_array()
@@ -349,6 +382,7 @@ fn inspect_remains_metadata_only_beside_canonical_extract() {
     let inspected = run(&["inspect", path.to_str().unwrap()]);
     assert_eq!(inspected.status.code(), Some(0));
     let inspected = json(&inspected);
+    assert_eq!(inspected["schema_version"], 3);
     assert_eq!(inspected["kind"], "inspect");
     assert!(inspected.get("content").is_none());
     assert!(inspected.get("text").is_none());
@@ -359,5 +393,191 @@ fn inspect_remains_metadata_only_beside_canonical_extract() {
 
     let extracted = run(&["extract", path.to_str().unwrap(), "--no-ocr"]);
     assert_eq!(extracted.status.code(), Some(0));
-    assert_eq!(json(&extracted)["content"]["units"][0]["text"], "zero");
+    let extracted = json(&extracted);
+    assert_eq!(extracted["schema_version"], 3);
+    assert_eq!(extracted["content"]["units"][0]["text"], "zero");
+}
+
+/// Verifies `bodymatter:v1` markers emit by default and `--no-markers` strips stdout and `--output-dir` `.md`.
+///
+/// Accepts no parameters. Returns unit after checking default PDF/XLSX Markdown
+/// markers, `--no-markers` stdout stripping, and `--no-markers` combined with
+/// `--format json --output-dir`. Synthetic headings, leaked markers, or missing
+/// GFM pipe tables panic.
+#[test]
+fn extract_markdown_markers_default_on_and_no_markers_strips_stdout_and_saved_md() {
+    let default_pdf = run(&[
+        "extract",
+        "../../fixtures/multipage.pdf",
+        "--no-ocr",
+        "--format",
+        "markdown",
+    ]);
+    assert_eq!(default_pdf.status.code(), Some(0));
+    let pdf_md = String::from_utf8(default_pdf.stdout).unwrap();
+    assert!(
+        pdf_md.contains("<!-- bodymatter:v1 <page number=\"1\" origin=\"native\"/> -->"),
+        "{pdf_md}"
+    );
+    assert!(!pdf_md.contains("# Glassbox extraction"), "{pdf_md}");
+    assert!(!pdf_md.contains("## Unit "), "{pdf_md}");
+
+    let stripped_pdf = run(&[
+        "extract",
+        "../../fixtures/multipage.pdf",
+        "--no-ocr",
+        "--format",
+        "markdown",
+        "--no-markers",
+    ]);
+    assert_eq!(stripped_pdf.status.code(), Some(0));
+    let stripped_md = String::from_utf8(stripped_pdf.stdout).unwrap();
+    assert!(!stripped_md.contains("<!-- bodymatter:v1"), "{stripped_md}");
+    assert!(
+        stripped_md.contains("Final page confirms full-document extraction."),
+        "{stripped_md}"
+    );
+
+    let out_dir = workdir("no-markers-output");
+    let json_with_out = Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args([
+            "extract",
+            "../../fixtures/multipage.pdf",
+            "--no-ocr",
+            "--no-markers",
+            "--format",
+            "json",
+            "--output-dir",
+        ])
+        .arg(&out_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert_eq!(json_with_out.status.code(), Some(0));
+    let report = json(&json_with_out);
+    assert_eq!(report["schema_version"], 3);
+    let md_path = report["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "markdown_content")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    let saved_md = std::fs::read_to_string(md_path).unwrap();
+    assert_eq!(saved_md, stripped_md);
+    assert!(!saved_md.contains("<!-- bodymatter:v1"), "{saved_md}");
+
+    let xlsx_md = String::from_utf8(
+        run(&[
+            "extract",
+            "../../fixtures/grid.xlsx",
+            "--no-ocr",
+            "--format",
+            "markdown",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert!(
+        xlsx_md.contains("<!-- bodymatter:v1 <sheet number=\"1\" name=\"Summary\"/> -->"),
+        "{xlsx_md}"
+    );
+    assert!(xlsx_md.contains("| ---"), "{xlsx_md}");
+}
+
+/// Verifies `--verbose` and `--full-hash` on single-file extract including `fp-` output stems.
+///
+/// Accepts no parameters and creates a temporary sparse file (`128 MiB + 1` byte)
+/// under the ignored target directory, cleaning it up before returning. Missing
+/// provenance under `--verbose`, unexpected provenance by default, missing
+/// `fp-` stems, or ignored `--full-hash` panics.
+#[test]
+fn extract_verbose_and_full_hash_behave_consistently_with_inspect() {
+    use glassbox_inspect::hashing::{DEFAULT_FULL_HASH_MAX_BYTES, SAMPLED_FINGERPRINT_SCHEME};
+    use std::io::{Seek, SeekFrom};
+
+    let quiet = json(&run(&["extract", "../../fixtures/hello.txt", "--no-ocr"]));
+    assert!(quiet.get("provenance").is_none());
+    assert!(quiet["metadata"].get("provenance").is_none());
+
+    let verbose = json(&run(&[
+        "extract",
+        "../../fixtures/hello.txt",
+        "--no-ocr",
+        "--verbose",
+    ]));
+    assert!(
+        verbose["provenance"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "{verbose}"
+    );
+    assert!(
+        verbose["metadata"]["provenance"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "{verbose}"
+    );
+
+    let directory = workdir("extract-sparse-hash");
+    let large = directory.join("large-media.bin");
+    let out_dir = directory.join("out");
+    let total_len = DEFAULT_FULL_HASH_MAX_BYTES + 1;
+    {
+        let mut file = std::fs::File::create(&large).unwrap();
+        file.set_len(total_len).unwrap();
+        file.write_all(b"SPARSE-EXTRACT-HEAD").unwrap();
+        file.seek(SeekFrom::Start(total_len - 16)).unwrap();
+        file.write_all(b"SPARSE-EXT-TAIL!").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let sampled_out = Command::new(env!("CARGO_BIN_EXE_glassbox"))
+        .args([
+            "extract",
+            large.to_str().unwrap(),
+            "--no-ocr",
+            "--output-dir",
+        ])
+        .arg(&out_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(matches!(sampled_out.status.code(), Some(0) | Some(2)));
+    let sampled = json(&sampled_out);
+    assert_eq!(sampled["schema_version"], 3);
+    assert!(sampled["metadata"]["file"].get("sha256").is_none());
+    let fp = sampled["metadata"]["file"]["fingerprint"]["value"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        sampled["metadata"]["file"]["fingerprint"]["scheme"],
+        SAMPLED_FINGERPRINT_SCHEME
+    );
+    let expected_stem = format!("fp-{}", &fp[..12]);
+    assert!(
+        sampled["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact["path"].as_str().unwrap().contains(&expected_stem)),
+        "{sampled}"
+    );
+
+    let full_out = run(&[
+        "extract",
+        large.to_str().unwrap(),
+        "--no-ocr",
+        "--full-hash",
+    ]);
+    assert!(matches!(full_out.status.code(), Some(0) | Some(2)));
+    let full = json(&full_out);
+    assert_eq!(
+        full["metadata"]["file"]["sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert!(full["metadata"]["file"].get("fingerprint").is_none());
+
+    let _ = std::fs::remove_dir_all(&directory);
 }

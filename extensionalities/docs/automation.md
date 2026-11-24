@@ -8,99 +8,106 @@ parent: docs/README.md
 # Automation and directory inventories
 
 Glassbox supports two scripted flows: JSONL batch mode and directory inventory.
-Both stream JSONL records to stdout and keep diagnostics on stderr.
-Both accept `--jobs N` and `--output-dir DIR`.
+Both stream ordered JSONL records to stdout and write diagnostics to stderr.
+Both accept `--jobs N`, `--output-dir DIR`, `--full-hash`, and `--verbose`.
 
 ## JSONL batch mode
 
-Pass `--batch` to `inspect` or `extract`. Send one JSON request per stdin line:
+Pass `--batch` to `glassbox inspect` or `glassbox extract`.
+Send one JSON request per stdin line:
 
 ```json
 {"id": "lease-1", "path": "/data/contracts/lease.pdf"}
 ```
 
-`id` is optional and may be null or duplicated. `path` must be a string.
-One response line follows each request, in request order.
-The emitter adds a one-based `sequence`, independent of your optional or duplicated `id`:
+`id` is optional and may be null or duplicated; `path` must be a string.
+One response line follows each request in request order, carrying a one-based `sequence`:
 
 ```json
-{"id": "lease-1", "path": "/data/contracts/lease.pdf", "status": "complete", "report": {"schema_version": 2, "kind": "inspect"}, "sequence": 1}
+{"id": "lease-1", "path": "/data/contracts/lease.pdf", "status": "complete", "report": {"schema_version": 3, "kind": "inspect"}, "sequence": 1}
 ```
 
-The `report` object is abbreviated above; a real response carries the full v2 report.
-Cancelled requests carry an `error` object instead of a `report`.
+The `report` object above is abbreviated; a real response carries the full schema v3 report.
+In `extract --batch`, `--no-markers` also applies to saved `.md` artifacts under `--output-dir`.
+Cancelled requests carry an `error` object instead of `report`:
 
 ```json
 {"id": "lease-2", "path": "/data/contracts/lease.pdf", "status": "cancelled", "cancelled": true, "error": {"stage": "cancellation", "code": "request_not_started", "message": "batch cancelled before this request started"}, "sequence": 2}
 ```
 
-File-reader failures can return a failed v2 report with diagnostics.
-Malformed requests return an invalid response:
+File-reader failures return a failed v3 report with diagnostics.
+Malformed lines return an invalid response:
 
 ```json
 {"id": null, "status": "invalid", "error": {"stage": "batch", "message": "request requires a string path"}, "sequence": 3}
 ```
 
-An invalid line keeps your `id` when the line parsed as JSON; unparseable lines return `id: null`.
-Invalid lines never stop later valid work.
-A line above 65536 bytes is rejected as invalid and drained.
+An invalid line keeps your `id` when valid JSON parsed; unparseable lines return `id: null`.
+Invalid lines never stop later valid requests.
+Lines exceeding 65,536 bytes are rejected as invalid and drained.
 Batch mode rejects `--pretty`, `--format`, and `--thumbnail` with exit 64.
 
 ## Directory inventory
 
-Point `inspect` at a directory to enumerate its regular files:
+Pass a directory path to `glassbox inspect` to inventory its regular files:
 
 ```sh
 "$GLASSBOX" inspect /data/archive
 ```
 
-This lists immediate regular files only. Add `--recursive` to descend into subdirectories on the same mount.
-Output is ordered JSONL with one record per file. Each record uses the same envelope as batch mode.
-`--pretty` is rejected with exit 64; directory output is JSONL only.
-The internal admission number serves as the record `id`. A record looks like:
+By default, this inspects immediate regular files only.
+Add `--recursive` to descend into real subdirectories on the same mount.
+Add `--full-hash` to stream full SHA-256 above 128 MiB, or `--verbose` to include reader provenance.
+Output is ordered JSONL using the same envelope as batch mode, with the admission number as `id`:
 
 ```json
-{"id": 1, "path": "/data/archive/notes.txt", "status": "complete", "report": {"schema_version": 2, "kind": "inspect"}, "sequence": 1}
+{"id": 1, "path": "/data/archive/notes.txt", "status": "complete", "report": {"schema_version": 3, "kind": "inspect"}, "sequence": 1}
 ```
 
-The `report` object is abbreviated above.
+The `report` object above is abbreviated.
+Directory inspection rejects `--pretty`, `--thumbnail`, and non-JSON `--format` with exit 64.
 
-Safety rules, enforced by the traversal:
+Safety rules enforced by traversal:
 
-- Symbolic links are never followed. Each link emits an explicit partial skip record.
-- Every entry must stay on the root's mount. A different mount, including a same-device bind mount, emits a `cross_mount_skipped` partial record.
+- Symbolic links are never followed; each link emits a partial `symlink_skipped` record.
+- Every entry stays on the root mount; different mounts (including bind mounts) emit partial `cross_mount_skipped` records.
 - Unknown mount identity fails closed as a failed record.
-- Roots on network, FUSE, or unknown filesystem types are rejected before traversal.
-- Non-regular, non-link entries are skipped without records. Subdirectories are visited only with `--recursive`.
-- Non-Unicode paths produce a failed diagnostic record instead of a report.
-- The inventory and artifact publication are Linux-only. Other platforms report the operation as unsupported.
+- Network, FUSE, and unknown filesystem roots are rejected before traversal begins.
+- Non-regular, non-link entries are skipped without records; subdirectories require `--recursive`.
+- Non-UTF-8 paths emit a failed diagnostic record instead of a report.
+- Directory inventory and artifact publication are Linux-only; other platforms report the operation as unsupported.
 - `--output-dir` must sit outside the scanned directory.
 
-A skipped link or mount makes the aggregate partial (exit 2).
-A failed record makes the aggregate failed (exit 1).
-The traversal compares each file's anchored identity with the inspected file; a mismatch withholds the digest and downgrades the report.
+A skipped link or mount makes the aggregate exit 2 (`partial`).
+A failed record makes the aggregate exit 1 (`failed`).
+Traversal checks anchored file identity against inspection; a mismatch withholds any digest or fingerprint and downgrades the report.
 
 ## Save artifacts
 
 Both modes accept `--output-dir DIR`.
-Inspection saves a content-free summary and a JSON report per file.
-Extraction saves Markdown content and a JSON report per file.
-Names combine a sanitized source stem, a six-digit sequence, and a twelve-character digest prefix (`nohash` when the digest is untrusted).
-Files are written atomically with mode 0600 into a 0700 directory.
-Existing files are never overwritten; a collision preserves the old bytes and downgrades that record.
+Inspection saves a content-free Markdown summary (`.md`) and a schema v3 JSON report (`.json`) per file.
+Extraction saves Markdown content (`.md`, honoring `--no-markers`) and a schema v3 JSON report (`.json`) per file.
+
+Artifact stems combine a sanitized source basename, a six-digit sequence, and a hash token:
+
+- `<12-char sha256 prefix>` when a consistent full `file.sha256` was computed.
+- `fp-<12-char fingerprint prefix>` when a consistent sampled `file.fingerprint` was computed.
+- `unhashed` when hashing failed, was unavailable, or detected a source change.
+
+Files publish atomically with mode `0600` into a `0700` directory.
+Existing files are never overwritten; collisions preserve old bytes and fail that record.
 
 ## Concurrency and backpressure
 
-`--jobs N` defaults to 1 and accepts values from 1 to 32.
-N is one shared budget for file work and OCR, not a multiplier.
-Admission waits when N requests are unfinished.
-Results print in request order.
-Out-of-order results wait behind the current head within a bounded reorder buffer of 4 MiB per job.
-The current head result always writes immediately, whatever its size.
+`--jobs N` defaults to 1 and accepts 1 to 32.
+`N` is one shared budget across file work and local OCR, not a multiplier.
+Admission waits when `N` requests are unfinished.
+Responses print in request order using a bounded reorder buffer of 4 MiB per job.
+The current head result always writes immediately, regardless of size.
 
-A SIGINT stops new admissions.
-Work in progress finishes, unfinished requests return `cancelled` records, and the process exits 1.
-A closed stdout returns exit 1 without a panic.
+`SIGINT` stops new admissions.
+In-flight work finishes cleanly, unstarted requests emit `cancelled` records, and the process exits 1.
+A closed stdout exits 1 without panicking.
 
 ## Exit codes
 
@@ -111,25 +118,24 @@ A closed stdout returns exit 1 without a panic.
 | Any partial or unsupported report, nothing failed | 2 |
 | Everything complete | 0 |
 
-Severity is ordered: 64 beats 1, which beats 2, which beats 0.
-Records go to stdout; diagnostics go to stderr.
+Severity precedence is `64 > 1 > 2 > 0`.
+Records print to stdout; diagnostics print to stderr.
 
 ## Continuous integration
 
 The [Glassbox CI workflow](../../.github/workflows/glassbox-ci.yml) checks only the downstream Cargo workspace.
-It compiles upstream dependencies without running their tests or lint checks.
+It builds upstream dependencies without running upstream tests or lints.
 Checks cover:
 
-- Formatting for `glassbox-cli` and `glassbox-inspect`, without following upstream path dependencies.
-- Workflow syntax and expressions, using pinned actionlint.
-- Clippy with warnings denied, plus the full downstream workspace tests and the Python automation tests.
-- Release builds and release smoke checks: v2 inspection, extraction, batch requests, and offline OCR failure behavior.
+- Formatting for `glassbox-cli` and `glassbox-inspect` without following upstream path dependencies.
+- Workflow syntax and expressions using pinned `actionlint`.
+- Clippy with warnings denied, full downstream workspace tests, and Python automation tests.
+- Release builds and smoke checks: schema v3 inspection, extraction, batch requests, and offline OCR failure behavior.
 - Linux x64 and ARM64 on standard GitHub-hosted runners.
 
 Upstream dependency changes also trigger downstream checks.
-Change detection skips expensive jobs for unrelated changes.
-The stable `Glassbox downstream gate` job still reports a result, which avoids permanently pending required checks.
-Existing ignored Rust tests remain ignored; CI does not provide independent audit clearance.
+Change detection skips heavy jobs for unrelated changes while keeping `Glassbox downstream gate` reporting cleanly.
+Existing ignored Rust tests remain ignored; CI never replaces independent local audit clearance.
 
 Run the same checks locally:
 
@@ -140,98 +146,82 @@ python3 -B extensionalities/scripts/ci.py workflows
 ```
 
 Workflow validation additionally requires Go 1.24+ and access to public Go modules.
-The workflow checks do not run upstream workflow files.
+Workflow checks do not run upstream workflow files.
 
 ## Local build cleanup
 
 Use the [local build recipe](installation.md#build) when you only need `glassbox`.
-The full verification workflow still builds `litx` to check compatibility.
-Upstream parity compares Glassbox commands with LiteParse's `lit`.
+Full verification builds both `glassbox` and the compatibility alias binary `litx`.
+Upstream parity checks compare `glassbox parse` against LiteParse's `lit`.
 
-Parity runs create isolated Cargo build trees. Keep their logs and results separate from the build trees.
-Before starting a run, record the exact disposable paths and get approval to remove them after the run.
-Check for stale paths before a campaign, after a run ends or is cancelled, and when disk space is low.
-Clean approved paths after their jobs exit. For other paths, get approval before removal.
-Keep the current release, shared caches in use, fixtures, and audit evidence.
-See the [agent guide](../AGENTS.md#local-build-cleanup) for the safety checks.
+Routine builds share the repository's `target/` for Cargo intermediates. Spikes inside the checkout inherit this configuration.
+Parity runs set both `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to their isolated run path. Use both variables when measuring a clean build. A custom target directory alone selects the final artifact location.
+Run cleanup against the intended profile or isolated build path. Cargo can clean the shared build directory from any workspace that uses it.
+Keep logs and results separate from disposable build trees.
+Record exact disposable paths before starting and confirm approval before deleting non-build paths.
+Check for stale build trees before a campaign, after a run ends, and when disk space is low.
+Preserve current release binaries, active caches, fixtures, and audit evidence.
+See the [agent guide](../AGENTS.md#local-build-cleanup) for full cleanup safety checks.
 
 ## Branch and merge policy
 
 Develop and audit changes locally on a feature branch.
 After publication approval, push that branch and open a PR targeting Glassbox's `main`.
-GitHub Actions provides the final external check; it does not replace the local audit.
-Wait for every applicable check to succeed.
-Then request explicit permission to merge that PR.
-Passing checks alone never authorize a feature PR merge.
+GitHub Actions is the final external check, never a replacement for local audit.
+Wait for every required check to pass, then request explicit permission to merge.
+Passing checks alone never authorize merging a feature PR.
 
-After permission, merge the checked head through GitHub without bypassing protection.
-Fetch the resulting remote commit and fast-forward local `main` to match.
-Stop if local `main` has diverged or contains changes.
-Do not create a separate local merge commit and push it to protected `main`.
-Do not delete the feature branch without separate permission.
+After approval, merge through GitHub without bypassing protection.
+Fetch the remote commit and fast-forward local `main` to match.
+Stop if local `main` diverged or has uncommitted edits.
+Never push a local merge commit to protected `main`, and never delete branches without separate permission.
 Weekly upstream-sync PRs are the approved automatic exception.
 
 ## Weekly upstream synchronization
 
-The [sync workflow](../../.github/workflows/glassbox-upstream-sync.yml) runs Mondays at 03:17 UTC.
-It also supports manual dispatch.
-The workflow creates a sync PR, waits for every reported check, and merges only when all succeed.
-Pending or missing checks wait up to 40 minutes.
-Failed, skipped, neutral, or cancelled checks stop the merge.
-Base or head changes also stop the merge.
-Existing open sync PRs require resolution before another sync starts.
+The [sync workflow](../../.github/workflows/glassbox-upstream-sync.yml) runs Mondays at 03:17 UTC and supports manual dispatch.
+It opens a sync PR and waits up to 40 minutes for every reported check.
+The workflow merges only when every check succeeds.
+Failed, skipped, neutral, or cancelled checks stop the merge, as do base or head changes.
+Resolve any open sync PR before starting another sync.
 
-The sync uses a precise ownership boundary:
+Ownership boundaries preserved by sync:
 
-- `extensionalities/` retains its exact Git tree, including its lockfile.
-- `.github/workflows/` retains its exact Git tree.
-- The root ignore file follows upstream, with `/extensionalities/dev/` preserved.
+- `extensionalities/` keeps its exact Git tree and lockfile.
+- `.github/workflows/` keeps its exact Git tree.
+- Root `.gitignore` mirrors upstream while preserving `/extensionalities/dev/`.
 - All other tracked paths mirror `run-llama/liteparse`'s `main`, including upstream deletions.
 
-Keep fork-specific changes within the protected paths.
-The sync does not preserve other root-level customizations.
-Its merge commit records both the current Glassbox and upstream commits as parents.
-Planning never changes working files, the normal Git index, or branch references.
-The automation never force-pushes, changes credentials, or rewrites downstream code to repair compatibility.
-A failed build or dependency change leaves the PR unmerged.
+Keep fork-specific work inside protected paths.
+The automation never force-pushes, alters credentials, or edits downstream code.
+A broken build or dependency change leaves the sync PR unmerged.
 
 ## One-time activation checklist
 
-This checklist records the one-time repository setup that the committed source configuration was built for.
-This is a historical record, not an instruction to repeat the setup.
-Each step needed separate approval. This page does not activate or change a live repository.
-Do not infer the current live GitHub settings from this page; verify repository state directly before relying on it.
+This checklist records the historical one-time repository setup for the committed configuration.
+It is a record, not an instruction to repeat setup.
+Do not infer live GitHub settings from this page; verify repository state directly.
 
-1. Review local validation and approve the cutover.
-2. Disable the inherited upstream workflows in Glassbox before publishing the setup PR.
+1. Review local validation and approve cutover.
+2. Disable inherited upstream workflows before publishing the setup PR.
 3. Protect `main` and require `Glassbox downstream gate` from GitHub Actions.
 4. Require PRs and up-to-date branches; enforce protection for administrators.
-5. Block force pushes and deletion; require resolved conversations.
-6. Preserve any other existing protection requirements.
+5. Block force pushes and branch deletion; require resolved conversations.
+6. Preserve any other existing branch-protection rules.
 7. Add the separately approved `UPSTREAM_SYNC_TOKEN` repository secret.
-8. Publish the setup branch and PR, then verify the Glassbox jobs on GitHub.
+8. Publish the setup branch and PR, then verify Glassbox jobs on GitHub.
 9. Wait for explicit permission before merging the setup PR.
-10. After merging, verify the weekly schedule and synchronize local `main`.
+10. After merging, verify the weekly schedule and fast-forward local `main`.
 
-The sync token needs repository and PR writes, check reads, and branch-protection read access.
-Use `repo` and `workflow` scopes for a classic sync token, subject to your account permissions.
-The ordinary CI jobs never receive this token.
-The sync job never executes newly fetched upstream code.
-Use a personal or app token so new PRs can trigger CI.
-Copying a global token into a repository secret needs explicit approval.
-
-The workflow does not configure billing, paid runners, package publishing, or spending limits.
-Standard runners do not replace account-level spending controls.
-Use only standard runners for this public repository.
-The sync does not approve PRs, bypass protections, or enable GitHub's native auto-merge setting.
-It requests a normal, head-pinned merge only after every check succeeds.
-After a timeout or interruption, inspect the existing PR before closing or merging it.
-Branches and PRs are never automatically deleted.
+The sync token needs repository writes, PR writes, check reads, and branch-protection reads.
+A classic token requires `repo` and `workflow` scopes.
+Ordinary CI jobs never receive this token, and the sync job never executes newly fetched upstream code.
+Use standard runners only; the workflow does not configure billing, paid runners, or package publishing.
+The sync never enables GitHub auto-merge or deletes branches automatically.
 
 ## Drive Glassbox from Python
 
-Run from the repository root. Export `GLASSBOX` from the installation recipe first.
-Use the standard library only. Do not invoke a shell:
+Run from the repository root using the standard library only (no shell invocation):
 
 ```python
 import json
@@ -262,21 +252,20 @@ for line in result.stdout.splitlines():
     if report is None:
         print(response.get("id"), response["status"], response.get("error", {}).get("message", ""))
         continue
-    print(response["id"], report["metadata"]["status"])
+    print(response["id"], report["status"], report["metadata"]["format"]["type"])
 print("aggregate exit:", result.returncode)
 raise SystemExit(result.returncode)
 ```
 
-The batch input is JSON, not positional arguments; each path is encoded inside its request line.
-`capture_output=True` collects every response in memory before the program continues.
-It suits bounded batches, not unbounded streams.
-For large batches, use `Popen` and write one request line at a time.
-Read each response before writing more. Drain stderr in a separate thread so no pipe fills.
-Check the process exit code for the aggregate outcome.
+Batch input encodes each path inside JSON, not positional arguments.
+`capture_output=True` buffers every response in memory and suits bounded batches only.
+For large streams, use `subprocess.Popen` and write one request at a time.
+Read each response before sending more, and drain stderr on a background thread.
+Inspect the process exit code for the aggregate outcome.
 
 ## Where to go next
 
-- [CLI reference and parsing](cli.md) for flags and migrations.
-- [Reports](reports.md) for the response schema.
-- [Metadata inspection](inspect.md) and [content extraction](extract.md) for single-file use.
+- [CLI reference and parsing](cli.md) for all flags and migrations.
+- [Reports](reports.md) for schema v3 report fields.
+- [Metadata inspection](inspect.md) and [Content extraction](extract.md) for single-file workflows.
 - [OCR and troubleshooting](ocr-and-troubleshooting.md) for failure handling.

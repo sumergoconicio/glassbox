@@ -306,7 +306,9 @@ fn extract_without_ocr_does_not_claim_recognition() {
             ..ExtractOptions::default()
         },
     );
+    assert_eq!(report.status, OperationStatus::Complete);
     assert_eq!(report.metadata.status, OperationStatus::Complete);
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert!(
         report.metadata.diagnostics.is_empty(),
         "{:?}",
@@ -336,18 +338,18 @@ fn extract_with_unavailable_ocr_model_keeps_native_unit_unclaimed() {
     );
     assert!(
         report
-            .metadata
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "probe_ocr"),
         "{:?}",
-        report.metadata.diagnostics
+        report.diagnostics
     );
     assert_eq!(report.content.units.len(), 1);
     let unit = &report.content.units[0];
     assert_eq!(unit.provenance[0].origin, ContentOrigin::Native);
     assert_eq!(unit.provenance[0].ocr, None);
-    assert_eq!(report.metadata.status, OperationStatus::Partial);
+    assert_eq!(report.status, OperationStatus::Partial);
+    assert_eq!(report.metadata.status, OperationStatus::Complete);
 }
 
 #[test]
@@ -371,13 +373,14 @@ fn enabled_english_alias_ocr_reports_canonical_provenance_facts() {
     );
     assert!(
         !aliased
-            .metadata
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "probe_ocr"),
         "{:?}",
-        aliased.metadata.diagnostics
+        aliased.diagnostics
     );
+    assert_eq!(aliased.status, OperationStatus::Complete);
+    assert_eq!(aliased.metadata.status, OperationStatus::Complete);
     assert_eq!(aliased.content.units.len(), 1);
     let unit = &aliased.content.units[0];
     assert_eq!(unit.provenance[0].origin, ContentOrigin::Ocr);

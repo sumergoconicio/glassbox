@@ -101,10 +101,13 @@ fn compatibility_command_preserves_inspection_extraction_and_defaults() {
             })
             .collect();
         assert_eq!(reports[0], reports[1]);
+        if arguments[0] != "defaults" {
+            assert_eq!(reports[0]["schema_version"], 3);
+        }
     }
 }
 
-/// Checks both aliases preserve v2 JSONL responses and request errors.
+/// Checks both aliases preserve schema v3 JSONL responses and request errors.
 ///
 /// Accepts no parameters. Returns unit after malformed and repeated requests.
 /// Aggregate status is 64 for malformed input; response divergence panics.
@@ -136,6 +139,7 @@ fn compatibility_command_preserves_batch_responses_and_request_errors() {
         assert!(lines[0]["error"].is_object());
         assert_eq!(lines[1]["id"], "first");
         assert_eq!(lines[2]["id"], "repeat");
+        assert_eq!(lines[1]["report"]["schema_version"], 3);
         assert_eq!(lines[1]["report"], lines[2]["report"]);
         responses.push(lines);
     }

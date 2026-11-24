@@ -7,74 +7,124 @@ parent: docs/README.md
 
 # Formats and limits
 
-Glassbox identifies files from a bounded byte prefix and their extension. Identification never implies extraction support. This page lists what each format family returns and where the fixed boundaries are.
+Glassbox identifies files from a 64 KiB byte prefix and their filename suffix.
+Format identification never implies extraction support.
+This page lists the 23 canonical format types, per-format behavior, and fixed safety caps.
+
+## Canonical `format.type` families
+
+Schema v3 classifies every file into one of 23 lowercase `format.type` identifiers.
+Conclusive byte detection overrides the filename suffix.
+When byte detection is inconclusive, the longest known suffix decides (`tar.gz`, `tar.bz2`, `tar.xz`, and `tar.zst` match before single suffixes).
+Unknown or missing suffixes map to `other`.
+
+- `pdf` (`pdf`)
+- `office_docs` (`doc`, `docx`, `odt`, `rtf`, `pages`)
+- `presentations` (`ppt`, `pptx`, `odp`, `key`)
+- `spreadsheets` (`xls`, `xlsx`, `xlsm`, `ods`, `numbers`)
+- `text` (`txt`, `md`, `rst`, `tex`)
+- `tabular_data` (`csv`, `tsv`, `parquet`, `arrow`)
+- `structured_data` (`json`, `jsonl`, `xml`, `yaml`, `yml`, `toml`)
+- `images` (`jpg`, `jpeg`, `png`, `gif`, `webp`, `heic`, `avif`, `tif`, `tiff`, `bmp`)
+- `vector_graphics` (`svg`, `eps`)
+- `ebooks` (`epub`, `mobi`, `azw`, `azw3`, `prc`, `djvu`, `djv`)
+- `comics` (`cbz`, `cbr`)
+- `audio` (`mp3`, `m4a`, `aac`, `flac`, `wav`, `ogg`, `opus`, `aiff`)
+- `video` (`mp4`, `mkv`, `mov`, `avi`, `webm`, `m4v`, `mpeg`)
+- `archives` (`tar.gz`, `tar.bz2`, `tar.xz`, `tar.zst`, `zip`, `rar`, `7z`, `tar`, `gz`, `bz2`, `xz`, `zst`)
+- `source_code` (`py`, `go`, `js`, `ts`, `jsx`, `tsx`, `java`, `c`, `cpp`, `rs`, `sh`, `sql`)
+- `web` (`html`, `htm`, `css`, `mhtml`)
+- `databases` (`sqlite`, `sqlite3`, `db`, `mdb`, `accdb`)
+- `personal_info` (`eml`, `msg`, `mbox`, `ics`, `vcf`)
+- `subtitles` (`srt`, `vtt`, `ass`)
+- `fonts` (`ttf`, `otf`, `woff`, `woff2`)
+- `3d_cad` (`stl`, `obj`, `gltf`, `glb`, `step`, `stp`, `dwg`, `dxf`)
+- `applications` (`exe`, `msi`, `apk`, `deb`, `rpm`, `appimage`)
+- `other` (unmapped or missing suffix)
+
+`format.extension` keeps the literal normalized lowercase suffix without a leading dot, and is omitted when absent.
+`format.extension_mismatch: true` appears only when conclusive byte detection disagrees with a known suffix family.
+Valid aliases within the same family (such as `.jpg`/`.jpeg` or `.azw3`/MOBI) do not trigger a mismatch.
 
 ## Support matrix
 
 | Input | Inspection | Extraction | Native unit | Boundaries |
 | --- | --- | --- | --- | --- |
-| PDF | Pages, security, per-page signals, object counts | Yes | Physical page | 4096 pages; 64 MiB text; 128 MiB OCR raster budget |
-| Raster images | Image count, header validation, decoded pixel dimensions | Yes | One image unit | 16384 x 16384 decode bound; 128 MiB decode allocation |
-| Plain text, Markdown, source code | Exact line count | Yes | Logical line | UTF-8 input only; 16 MiB read window; 65536 emitted units |
-| DOCX | Package parts, properties, counts | Yes | Top-level paragraph or table, as one block | 4096 blocks; blocks are never split; 65536 characters per unit |
-| PPTX | Slides, properties, counts | Yes | Slide | Slides follow relationship order; 65536 characters per slide |
-| XLSX, XLSM | Sheets, columns, headers | Yes | Worksheet | 262144 cells; 64 MiB cell values; 4096 sheets |
-| ODT | Properties, counts | Yes | Top-level paragraph or table | Same atomic block rule as DOCX |
-| ODP | Slides, properties | Yes | Slide | Document order |
-| ODS | Sheets, columns, headers | Yes | Worksheet | Spreadsheet caps above |
-| EPUB | Spine, manifest, OPF properties | Yes | Spine item | 4096 manifest items and spine entries; XHTML parts only |
-| MOBI, AZW, AZW3, PRC | Headers, EXTH properties | Yes | Decoded text record | Uncompressed or PalmDOC records only; 64 KiB per record; 32 MiB expanded |
-| CSV, TSV | Headers, bounded row profile | Preview only | Dataset row preview | 1 MiB reader cap |
-| JSON | Key names, scalar counts | Preview only | Dataset preview | 1 MiB schema-path budget; cap trip keeps the observed prefix with partial status |
-| XML | Element paths and counts | Preview only | Dataset preview | 16 MiB input; 200000 elements; depth 128; 1 MiB schema-path budget |
-| ZIP, CBZ | Entry names and counts; CBZ page count from image names | No content units | Archive entry | 4096 entries; 16 MiB per entry; 256 MiB total |
+| PDF | Pages, geometry, security, text-layer and OCR readiness | Yes | Physical page (`<page>` with `/PageLabels`) | 4096 pages; 64 MiB text; 128 MiB OCR raster budget |
+| Raster images | Image count, header check, pixel dimensions | Yes | One image unit | 16384 x 16384 decode bound; 128 MiB decode allocation |
+| Plain text, Markdown, source code | Exact line count | Yes | Logical line | UTF-8 only; 16 MiB read window; 65536 emitted units |
+| DOCX | Package parts, properties, counts | Yes | Top-level paragraph, table (`<table>`), or explicit `<w:br w:type="page"/>` (`<page-break>`) | 4096 blocks; 65536 chars/unit; ignores `<w:lastRenderedPageBreak/>` |
+| PPTX | Slides, properties, counts | Yes | Slide (`<slide>`) | Relationship order; 65536 characters per slide |
+| XLSX, XLSM | Sheets, columns, headers | Yes | Worksheet (`<sheet name="...">` + GFM table) | 262144 cells; 64 MiB cell values; 4096 sheets |
+| ODT | Properties, counts | Yes | Top-level paragraph or table (`<table>`) | Same atomic block rules as DOCX; no page-break inference |
+| ODP | Slides, properties | Yes | Slide (`<slide>`) | Document order |
+| ODS | Sheets, columns, headers | Yes | Worksheet (`<sheet name="...">` + GFM table) | Same spreadsheet caps as XLSX |
+| EPUB | Spine, manifest, OPF properties | Yes | Spine item (`<chapter href="...">`) | 4096 manifest and spine entries; XHTML parts only |
+| MOBI, AZW, AZW3, PRC | Headers, EXTH properties | Yes | Decoded text record | Uncompressed or PalmDOC only; 64 KiB/record; 32 MiB expanded |
+| CSV, TSV | Headers, bounded row profile | Preview only | Dataset row (`<sheet>` + GFM table) | 1 MiB reader cap |
+| JSON | Key names, scalar counts | Preview only | Dataset preview | 1 MiB schema-path budget; partial status on cap hit |
+| XML | Element paths and counts | Preview only | Dataset preview | 16 MiB input; 200000 elements; depth 128; 1 MiB path budget |
+| ZIP, CBZ | Entry names and counts; CBZ image count | Identification only | Archive entry | 4096 entries; 16 MiB per entry; 256 MiB total |
 | RAR, CBR | Header listing only | Not supported | None | No decompression; 16384 headers |
 | Apple iWork (Pages, Numbers, Key) | Embedded previews | Preview only | Derived preview | No complete native decoder |
-| DjVu | Identification | Not supported | None | No text, image, or OCR extraction; no page count |
-| Parquet | Footer identification | Not supported | None | Extraction is deferred |
-| Other formats | Identification | Not supported | None | Report states `unsupported` |
+| DjVu (`djvu`, `djv`) | Identification | Identification only | None | No text, image, OCR, or page-count extraction |
+| Parquet | Footer identification | Identification only | None | Extraction is deferred |
+| Other formats | Identification | Not supported | None | Report marks `status: "unsupported"` |
 
-Plain text units follow exact newline rules from the source. Lines split at each `\n`; a `\r` directly before it is dropped. A trailing newline does not create an extra empty unit. A final line without a newline still counts as one unit. Empty input has zero lines. A leading byte-order mark is ignored.
+Plain text splits lines at `\n` and strips an immediately preceding `\r`.
+A trailing newline does not add an empty unit; a final line without `\n` still counts.
+Empty input has zero lines, and a leading byte-order mark is ignored.
 
-Text reads are bounded by a 16 MiB window. A file past the window is cut to whole lines inside the window; the cut line is never emitted as a whole unit, and the available count is disclosed as partial instead of a fabricated complete count. A cut through a multi-byte character backs off to the last complete character. Every line in the window is counted, so availability stays exact for the window. One extraction emits at most 65,536 selected units; a denser source withholds the remaining selected units, and the report discloses the truncation instead of shrinking the count. Explicit ranges that fit inside the cap still complete.
+Plain text reads stop at a 16 MiB window and cut cleanly on whole UTF-8 lines.
+A file past 16 MiB reports partial availability rather than a fabricated total.
+One extraction emits at most 65,536 selected units; withheld units are disclosed as truncated coverage.
 
 ## Dataset outputs stay previews
 
-CSV, TSV, JSON, XML, spreadsheets, and iWork previews are bounded. They prove structure and provide samples. No flag turns them into a full export. Extraction reports mark preview units as `derived_preview` with `partial` completeness. See [content extraction](extract.md).
+CSV, TSV, JSON, XML, spreadsheets, and iWork outputs are bounded previews.
+No flag converts them into full exports.
+Extraction reports mark preview units with `origin: "derived_preview"` and `completeness: "partial"`.
+See [Content extraction](extract.md) for GFM table rendering.
 
 ## Schema-path budgets
 
-JSON and XML inspection publishes schema paths, never values. Both run under a 1 MiB cumulative path budget. When the budget stops the stream, the observed path prefix is published, the count is qualified as partial, and a `metadata_cap_exceeded` warning diagnostic marks the operation partial. XML element counts stay exact; JSON scalar counts become a lower bound at the cap.
-
-## Identification evidence
-
-`format.basis` records how a file was identified. `bytes` means the byte signature decided. `extension` means the signature was ambiguous and the extension chose. `format.disagreement` is true when the extension and the byte signature disagree. A renamed file keeps its true detected family, and the report says so.
+JSON and XML inspection publishes schema paths in `structure.names`, never values.
+Both run under a 1 MiB cumulative path budget.
+When the budget stops collection, Glassbox publishes the observed prefix and emits a `metadata_cap_exceeded` warning with `partial` status.
+XML element counts stay exact; JSON scalar counts become a lower bound at the cap.
 
 ## Encryption
 
-PDF security state is recorded, including handler revision and permission bits. Accessible encrypted PDFs open with PDFium and report `encrypted_accessible`. Encrypted MOBI text is unavailable; metadata is retained. Password-protected or DRM'd parts produce diagnostics and partial or failed states. Nothing is bypassed.
+PDF security state appears in `structure.pdf` (`security_handler_revision` and `permissions`) and `readiness.encrypted`.
+Accessible encrypted PDFs open with PDFium and report `readiness.encrypted: "accessible"`.
+Locked encrypted files report `readiness.encrypted: "locked"`.
+Encrypted MOBI text stays unavailable while embedded metadata is retained.
+Glassbox never bypasses passwords or DRM.
 
-## Unsupported and unknown inputs
+## Unsupported and identification-only inputs
 
-An unknown format still inspects: you get identity, digest, and format detection. Its report marks `extraction_support: unsupported`, and inspection exits 2. A file whose bytes cannot be read reports `failed` with exit code 1. Identification-only formats (generic ZIP, CBZ, DjVu, Parquet) complete with exit code 0 because identification is their supported operation.
+Unknown formats still report `file`, `format`, and hashing facts with `readiness.extractable: "unsupported"` and exit 2.
+Unreadable files report `status: "failed"` and exit 1.
+Identification-only formats (generic ZIP, CBZ, DjVu, Parquet) report `readiness.extractable: "identification_only"` and complete inspection with exit 0.
 
 ## Safety cap inventory
 
-All caps are fixed in the readers. No flag raises them:
+All reader caps are fixed; no flag raises them:
 
-- PDF: 4096 pages, 64 MiB decoded text, 128 MiB OCR staging.
-- Container source reader: 256 MiB physical input, 16 MiB per range, 64 MiB cumulative.
-- Archive: 4096 entries, 16 MiB per entry, 256 MiB total.
-- Spreadsheets: 1048576 rows, 262144 cells, 64 MiB values, 4096 sheets.
-- Images: 16384 x 16384 pixels, 128 MiB allocation.
-- Plain text: 16 MiB read window, 65536 emitted selected units.
-- DOCX and PPTX: 65536 characters per unit; Word tables nest at most 16 levels inside one unit.
+- PDF: 4096 pages, 64 MiB decoded text, 128 MiB shared OCR staging.
+- Container reader: 256 MiB physical input, 16 MiB per range, 64 MiB cumulative.
+- Archives: 4096 entries, 16 MiB per entry, 256 MiB total.
+- Spreadsheets: 1,048,576 rows, 262,144 cells, 64 MiB values, 4096 sheets.
+- Images: 16,384 x 16,384 pixels, 128 MiB allocation.
+- Plain text: 16 MiB read window, 65,536 emitted selected units.
+- DOCX and PPTX: 65,536 characters per unit; Word tables nest at most 16 levels.
 - JSON and XML schema paths: 1 MiB cumulative retained bytes.
 
-Cap exhaustion always produces a disclosure: a diagnostic, a truncation marker, or a qualified partial count. It never produces a silent cut.
+Every cap hit discloses the omission through a diagnostic, truncation marker, or partial status.
 
 ## Where to go next
 
-- [CLI reference and parsing](cli.md) for the command surface.
-- [Metadata inspection](inspect.md) and [content extraction](extract.md) for the two operations.
+- [CLI reference and parsing](cli.md) for all flags and exits.
+- [Metadata inspection](inspect.md) for the full 23-format table and v3 readiness mapping.
+- [Content extraction](extract.md) for `bodymatter:v1` markers and native selection.
 - [OCR and troubleshooting](ocr-and-troubleshooting.md) for OCR behavior per format.

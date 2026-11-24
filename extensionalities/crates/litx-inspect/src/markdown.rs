@@ -2,16 +2,32 @@
 use crate::{InspectOptions, InspectReport, office::W, xml::Node};
 use serde::Serialize;
 
+/// Maximum number of columns materialized per preview row in [`SheetRows::write`].
+pub(crate) const MAX_PREVIEW_COLS: usize = 256;
+/// Maximum cumulative preview cells materialized across an entire workbook.
+pub(crate) const MAX_WORKBOOK_PREVIEW_CELLS: usize = 65_536;
+
 #[derive(Debug, Default, Serialize)]
 pub struct Markdown {
     pub content: String,
     pub basis: &'static str,
     pub truncated: bool,
+    /// Running Unicode scalar count of `content`, avoiding O(N^2) rescans on append.
+    #[serde(skip)]
+    pub(crate) chars: usize,
+}
+
+/// One buffered worksheet preview row with its one-based physical start row,
+/// column-indexed cell values, and retained repeat count.
+struct BufferedSheetRow {
+    start_row: usize,
+    cells: Vec<(usize, String)>,
+    repeats: usize,
 }
 
 #[derive(Default)]
 pub(crate) struct SheetRows {
-    rows: Vec<(Vec<(usize, String)>, usize)>,
+    rows: Vec<BufferedSheetRow>,
     chars: usize,
     truncated: bool,
     sampled_rows: usize,
@@ -19,37 +35,36 @@ pub(crate) struct SheetRows {
 }
 
 impl SheetRows {
-    pub fn push(&mut self, cells: Vec<(usize, String)>, repeats: usize, cap: usize) {
-        let take = repeats.min(6usize.saturating_sub(self.sampled_rows));
-        self.more_rows |= take < repeats;
-        if take == 0 {
-            return;
-        }
-        if self.truncated {
-            return;
-        }
-        self.chars = self.chars.saturating_add(
-            cells
-                .iter()
-                .map(|(_, s)| s.chars().count().saturating_add(4))
-                .sum::<usize>(),
-        );
-        self.truncated = self.chars > cap;
-        if !self.truncated {
-            self.rows.push((cells, take));
-            self.sampled_rows += take;
-        }
-    }
-
     /// True once the preview character budget is exhausted mid-row.
+    ///
+    /// Accepts `&self`. Returns `true` when `push_bounded` or `push_bounded_row`
+    /// already cut a cell or exceeded the preview character budget. Performs no
+    /// I/O and cannot fail.
+    #[cfg(test)]
     pub(crate) fn is_truncated(&self) -> bool {
         self.truncated
     }
 
-    /// Buffer one preview row, bounding each stored cell to the remaining
-    /// character budget and marking the preview truncated when text is cut.
-    pub(crate) fn push_bounded<S: AsRef<str>>(
+    /// Reports whether another preview row can still be buffered before hitting
+    /// either the 6-row preview cap or the preview character budget.
+    ///
+    /// Accepts `&self`. Returns `true` when buffering another row can retain
+    /// cells. Performs no I/O and cannot fail.
+    pub(crate) fn can_buffer_row(&self) -> bool {
+        !self.truncated && self.sampled_rows < 6
+    }
+
+    /// Buffers one preview row tagged with its one-based physical start row,
+    /// bounding each stored cell to the remaining character budget and marking
+    /// the preview truncated when text is cut or rows exceed the 6-row cap.
+    ///
+    /// Accepts the one-based physical `start_row`, column-indexed `(col, value)`
+    /// cells (preserving literal tabs and newlines verbatim without splitting),
+    /// logical row repeat count, and preview character cap. Returns unit.
+    /// Performs no I/O and cannot fail.
+    pub(crate) fn push_bounded_row<S: AsRef<str>>(
         &mut self,
+        start_row: usize,
         cells: &[(usize, S)],
         repeats: usize,
         cap: usize,
@@ -74,80 +89,156 @@ impl SheetRows {
                 break;
             }
         }
-        self.rows.push((bounded, take));
+        self.rows.push(BufferedSheetRow {
+            start_row,
+            cells: bounded,
+            repeats: take,
+        });
         self.sampled_rows += take;
     }
+
+    /// Buffers one preview row using sequential one-based row numbering.
+    ///
+    /// Accepts column-indexed `(col, value)` cells, repeat count, and preview
+    /// character cap. Delegates to [`SheetRows::push_bounded_row`]. Performs no
+    /// I/O and cannot fail.
+    #[cfg(test)]
+    pub(crate) fn push_bounded<S: AsRef<str>>(
+        &mut self,
+        cells: &[(usize, S)],
+        repeats: usize,
+        cap: usize,
+    ) {
+        let next_row = self.sampled_rows.saturating_add(1);
+        self.push_bounded_row(next_row, cells, repeats, cap);
+    }
+    /// Materializes bounded worksheet preview rows and (for legacy callers)
+    /// Markdown table output under per-sheet column and workbook-wide cell caps.
+    ///
+    /// Accepts the mutable [`crate::Sheet`] summary, mutable [`InspectReport`],
+    /// [`InspectOptions`], and a shared mutable `remaining_preview_cells` budget
+    /// initialized to [`MAX_WORKBOOK_PREVIEW_CELLS`] per workbook. Returns the
+    /// one-based physical row numbers corresponding to `[first_row, ...preview_rows]`
+    /// in exact source order. Clips materialized columns to [`MAX_PREVIEW_COLS`],
+    /// stops row materialization when `remaining_preview_cells` cannot fit the
+    /// next row, and skips legacy `report.markdown` rendering when
+    /// `options.native_selection` is active so legacy Markdown truncation cannot
+    /// abort v3 extraction previews.
     pub fn write(
         self,
         sheet: &mut crate::Sheet,
         report: &mut InspectReport,
         options: &InspectOptions,
-    ) {
-        append(
-            report,
-            &format!("## Sheet: {}\n\n", escape(&sheet.name)),
-            options,
-            "native_structure",
-        );
-        let mut header = true;
-        sheet.preview_truncated = self.more_rows || self.truncated;
-        for (cells, repeats) in self.rows {
-            let cells: std::collections::BTreeMap<_, _> = cells.into_iter().collect();
-            let mut line = String::from("|");
-            for col in 1..=sheet.cols {
-                let value = cells.get(&col).map(String::as_str).unwrap_or("");
-                line.push_str(&format!(
-                    " {} |",
-                    escape(value)
-                        .replace('|', "\\|")
-                        .replace(['\n', '\t'], "<br>")
-                ));
-                if line.len() > options.max_chars.saturating_mul(4) {
-                    break;
-                }
-            }
-            line.push('\n');
-            for _ in 0..repeats {
-                if !header {
-                    sheet.preview_rows.push(
-                        (1..=sheet.cols)
-                            .map(|col| {
-                                let value = cells.get(&col).map(String::as_str).unwrap_or("");
-                                if value.chars().count() > 512 {
-                                    sheet.preview_truncated = true;
-                                }
-                                value.chars().take(512).collect()
-                            })
-                            .collect(),
-                    );
-                }
-                append(report, &line, options, "native_structure");
-                if header {
-                    let separator = format!("|{}\n", " --- |".repeat(sheet.cols));
-                    append(report, &separator, options, "native_structure");
-                    header = false;
-                }
-                if report.markdown.truncated {
-                    // The Markdown cap stopped row handling mid-sheet.
-                    sheet.preview_truncated = true;
-                    break;
-                }
-            }
-            if report.markdown.truncated {
-                sheet.preview_truncated = true;
-                break;
-            }
-        }
-        report.markdown.truncated |= self.truncated;
-        if self.more_rows {
+        remaining_preview_cells: &mut usize,
+    ) -> Vec<u64> {
+        let legacy_markdown = options.native_selection.is_none();
+        let col_limit = sheet.cols.min(MAX_PREVIEW_COLS);
+        if legacy_markdown {
             append(
                 report,
-                "\n> Dataset preview: first five data rows; source data was not exported.\n",
+                &format!("## Sheet: {}\n\n", escape(&sheet.name)),
                 options,
                 "native_structure",
             );
         }
-        append(report, "\n", options, "native_structure");
+        let mut header = true;
+        let mut row_numbers = Vec::new();
+        sheet.preview_truncated = self.more_rows || self.truncated;
+        if col_limit < sheet.cols {
+            sheet.first_row_truncated = true;
+            sheet.preview_truncated = true;
+        }
+        'rows: for BufferedSheetRow {
+            start_row,
+            cells,
+            repeats,
+        } in self.rows
+        {
+            let cells: std::collections::BTreeMap<_, _> = cells.into_iter().collect();
+            let line = if legacy_markdown {
+                let mut line = String::from("|");
+                for col in 1..=col_limit {
+                    let value = cells.get(&col).map(String::as_str).unwrap_or("");
+                    line.push_str(&format!(
+                        " {} |",
+                        escape(value)
+                            .replace('|', "\\|")
+                            .replace(['\n', '\t'], "<br>")
+                    ));
+                    if line.len() > options.max_chars.saturating_mul(4) {
+                        break;
+                    }
+                }
+                line.push('\n');
+                Some(line)
+            } else {
+                None
+            };
+            for repeat_offset in 0..repeats {
+                if col_limit > *remaining_preview_cells {
+                    sheet.preview_truncated = true;
+                    if header {
+                        sheet.first_row_truncated = true;
+                    }
+                    break 'rows;
+                }
+                *remaining_preview_cells -= col_limit;
+                let mut cell_clipped = false;
+                let row_values = (1..=col_limit)
+                    .map(|col| {
+                        let value = cells.get(&col).map(String::as_str).unwrap_or("");
+                        if value.chars().count() > 512 {
+                            cell_clipped = true;
+                        }
+                        value.chars().take(512).collect()
+                    })
+                    .collect();
+                if header {
+                    if cell_clipped {
+                        sheet.first_row_truncated = true;
+                        sheet.preview_truncated = true;
+                    }
+                    sheet.first_row = Some(row_values);
+                } else {
+                    if cell_clipped {
+                        sheet.preview_truncated = true;
+                    }
+                    sheet.preview_rows.push(row_values);
+                }
+                row_numbers.push(start_row.saturating_add(repeat_offset) as u64);
+                if let Some(line) = line.as_deref() {
+                    append(report, line, options, "native_structure");
+                    if header {
+                        let separator = format!("|{}\n", " --- |".repeat(col_limit));
+                        append(report, &separator, options, "native_structure");
+                        header = false;
+                    }
+                    if report.markdown.truncated {
+                        // The Markdown cap stopped row handling mid-sheet.
+                        sheet.preview_truncated = true;
+                        break 'rows;
+                    }
+                } else if header {
+                    header = false;
+                }
+            }
+        }
+        if self.truncated {
+            sheet.first_row_truncated = true;
+        }
+        if legacy_markdown {
+            report.markdown.truncated |= self.truncated;
+            if self.more_rows {
+                append(
+                    report,
+                    "\n> Dataset preview: first five data rows; source data was not exported.\n",
+                    options,
+                    "native_structure",
+                );
+            }
+            append(report, "\n", options, "native_structure");
+        }
+        row_numbers
     }
 }
 
@@ -168,6 +259,13 @@ pub(crate) fn escape(value: &str) -> String {
     out
 }
 
+/// Appends a Markdown block to `report.markdown` up to `options.max_chars`.
+///
+/// Accepts the mutable report, block text, inspection options, and provenance
+/// basis tag. Returns unit after advancing `report.markdown.chars` in O(taken)
+/// time without rescanning existing content. Marks `report.markdown.truncated`
+/// when `block` exceeds the remaining character budget. Performs no I/O and
+/// cannot fail.
 pub(crate) fn append(
     report: &mut InspectReport,
     block: &str,
@@ -177,12 +275,21 @@ pub(crate) fn append(
     if report.markdown.truncated {
         return;
     }
-    let remaining = options
-        .max_chars
-        .saturating_sub(report.markdown.content.chars().count());
-    let take = block.chars().count().min(remaining);
-    report.markdown.content.extend(block.chars().take(take));
-    report.markdown.truncated = take < block.chars().count();
+    let remaining = options.max_chars.saturating_sub(report.markdown.chars);
+    let mut take_chars = 0usize;
+    let mut truncated = false;
+    let mut byte_end = block.len();
+    for (idx, _) in block.char_indices() {
+        if take_chars == remaining {
+            byte_end = idx;
+            truncated = true;
+            break;
+        }
+        take_chars += 1;
+    }
+    report.markdown.content.push_str(&block[..byte_end]);
+    report.markdown.chars = report.markdown.chars.saturating_add(take_chars);
+    report.markdown.truncated = truncated;
     report.markdown.basis = if report.markdown.basis.is_empty() || report.markdown.basis == basis {
         basis
     } else {
@@ -244,6 +351,16 @@ pub(crate) fn table(table: &crate::DocumentTable, cap: usize) -> String {
     out
 }
 
+/// Renders a WordprocessingML body tree into transitional Markdown blocks on
+/// `report.markdown`.
+///
+/// Accepts the parsed XML `root` node, mutable [`InspectReport`] (supplying
+/// pre-extracted `report.tables` and receiving appended Markdown), and
+/// [`InspectOptions`] controlling the `max_chars` preview cap. Returns unit.
+/// Zero-based `<w:outlineLvl>` values convert to one-based heading levels with
+/// saturating addition and clamp to `1..=6` so extreme values like `usize::MAX`
+/// cannot overflow. Performs no I/O and cannot fail; output stops once
+/// `report.markdown.truncated` is set by the character cap.
 pub(crate) fn word(root: &Node, report: &mut InspectReport, options: &InspectOptions) {
     fn walk(node: &Node, report: &mut InspectReport, options: &InspectOptions, index: &mut usize) {
         if node.is(W, "tbl") {
@@ -264,7 +381,7 @@ pub(crate) fn word(root: &Node, report: &mut InspectReport, options: &InspectOpt
                 .first()
                 .and_then(|n| n.attr_ns(W, "val"))
                 .and_then(|s| s.parse::<usize>().ok())
-                .map(|n| n + 1)
+                .map(|n| n.saturating_add(1))
                 .or_else(|| {
                     node.descendants(W, "pStyle")
                         .first()

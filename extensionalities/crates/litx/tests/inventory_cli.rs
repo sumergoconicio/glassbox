@@ -126,11 +126,8 @@ fn immediate_and_recursive_inventory_are_deterministic_and_no_follow() {
             .filter(|record| record["report"].is_object())
             .all(|record| {
                 record["status"] == "complete"
-                    && record["report"]["metadata"]["digest"]["digest"]
-                        .as_str()
-                        .unwrap()
-                        .len()
-                        == 64
+                    && record["report"]["schema_version"] == 3
+                    && record["report"]["file"]["sha256"].as_str().unwrap().len() == 64
             })
     );
     assert_eq!(
@@ -148,8 +145,8 @@ fn immediate_and_recursive_inventory_are_deterministic_and_no_follow() {
     assert_eq!(records.len(), 7);
     assert!(records.iter().any(|record| {
         record["path"].as_str().unwrap() == root.join("sub/nested.txt").to_str().unwrap()
-            && record["report"]["metadata"]["identity"]["path"]
-                == root.join("sub/nested.txt").to_str().unwrap()
+            && record["report"]["schema_version"] == 3
+            && record["report"]["file"]["path"] == root.join("sub/nested.txt").to_str().unwrap()
     }));
     assert_eq!(
         records
@@ -162,27 +159,27 @@ fn immediate_and_recursive_inventory_are_deterministic_and_no_follow() {
 
 /// Verifies identification-only inspection completes while extraction is unsupported.
 ///
-/// Accepts no parameters. Returns unit after DjVu and Parquet inspect/extract
-/// calls. Status confusion, executable advice strings, guessed OCR states, or
-/// calibrated-cost fabrication panics.
+/// Accepts no parameters. Returns unit after DjVu inspect/extract calls. Status
+/// confusion, leaked advice fields, guessed OCR states, or schema drift panics.
 #[test]
-fn identification_only_status_and_inert_advice_are_distinct() {
+fn identification_only_status_and_readiness_are_distinct() {
     for fixture in ["../../fixtures/single.djvu", "../../fixtures/bundled.djvu"] {
         let inspected = run(&["inspect", fixture]);
         assert_eq!(inspected.status.code(), Some(0), "{fixture}");
         let report = json(&inspected);
-        assert_eq!(report["metadata"]["status"], "complete");
-        assert_eq!(
-            report["metadata"]["extraction_support"],
-            "identification_only"
-        );
-        assert_eq!(report["metadata"]["advice"][0]["operation"], "inspect");
-        assert_eq!(report["metadata"]["advice"][0]["cost"], "unknown");
-        assert_eq!(report["metadata"]["ocr_recommended"], "unknown");
-        assert!(report["metadata"]["advice"][0]["arguments"].is_array());
+        assert_eq!(report["schema_version"], 3);
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["format"]["type"], "ebooks");
+        assert_eq!(report["readiness"]["extractable"], "identification_only");
+        assert_eq!(report["readiness"]["ocr"], "unknown");
+        assert!(report.get("advice").is_none());
+        assert!(report.get("next_step").is_none());
         let extracted = run(&["extract", fixture, "--no-ocr"]);
         assert_eq!(extracted.status.code(), Some(2), "{fixture}");
-        assert_eq!(json(&extracted)["metadata"]["status"], "unsupported");
+        let extracted_json = json(&extracted);
+        assert_eq!(extracted_json["schema_version"], 3);
+        assert_eq!(extracted_json["status"], "unsupported");
+        assert_eq!(extracted_json["metadata"]["status"], "unsupported");
     }
 }
 
@@ -205,6 +202,8 @@ fn invalid_directory_modes_return_64_and_extract_rejects_directories() {
     let extracted = run(&["extract", path, "--no-ocr"]);
     assert_eq!(extracted.status.code(), Some(1));
     let report = json(&extracted);
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "failed");
     assert_eq!(report["metadata"]["status"], "failed");
     assert_eq!(report["content"]["units"].as_array().map(Vec::len), Some(0));
     assert!(!String::from_utf8_lossy(&extracted.stdout).contains("must not be extracted"));
@@ -228,7 +227,8 @@ fn non_utf8_filename_does_not_panic_or_stop_inventory() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0]["error"]["code"], "non_utf8_path_unsupported");
     assert_eq!(records[0]["status"], "failed");
-    assert_eq!(records[1]["report"]["metadata"]["status"], "complete");
+    assert_eq!(records[1]["report"]["schema_version"], 3);
+    assert_eq!(records[1]["report"]["status"], "complete");
 }
 
 /// Verifies private no-overwrite metadata artifacts and metadata-only summaries.
@@ -258,7 +258,8 @@ fn metadata_artifacts_are_private_complete_and_collision_safe() {
         String::from_utf8_lossy(&first.stderr)
     );
     let report = json(&first);
-    let artifacts = report["metadata"]["artifacts"].as_array().unwrap();
+    assert_eq!(report["schema_version"], 3);
+    let artifacts = report["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 2);
     assert_eq!(
         std::fs::metadata(&output_dir).unwrap().permissions().mode() & 0o777,
@@ -277,14 +278,13 @@ fn metadata_artifacts_are_private_complete_and_collision_safe() {
         let bytes = std::fs::read(path).unwrap();
         if artifact["kind"] == "metadata_summary" {
             let summary = String::from_utf8(bytes.clone()).unwrap();
-            assert!(summary.contains("Glassbox metadata inspection"));
+            assert!(summary.contains("# Glassbox inspection"), "{summary}");
+            assert!(summary.contains("- Schema: 3"), "{summary}");
             assert!(!summary.contains("UNIQUE BODY SENTINEL"));
         } else {
             let saved: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                saved["metadata"]["identity"]["path"],
-                report["metadata"]["identity"]["path"]
-            );
+            assert_eq!(saved["schema_version"], 3);
+            assert_eq!(saved["file"]["path"], report["file"]["path"]);
         }
         before.push((path.to_path_buf(), bytes));
     }
@@ -295,7 +295,7 @@ fn metadata_artifacts_are_private_complete_and_collision_safe() {
         .output()
         .unwrap();
     assert_eq!(second.status.code(), Some(1));
-    assert_eq!(json(&second)["metadata"]["status"], "failed");
+    assert_eq!(json(&second)["status"], "failed");
     for (path, bytes) in before {
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
@@ -374,4 +374,75 @@ fn concurrent_artifact_writers_are_exclusive() {
             .iter()
             .all(|path| !path.file_name().unwrap().to_string_lossy().starts_with('.'))
     );
+}
+
+/// Verifies deep recursive inventory preserves sorted order, pinned identity, and depth limits.
+///
+/// Accepts no parameters. Returns unit after running `glassbox inspect --recursive --jobs 2`
+/// on a tree spanning sibling branches and a chain exceeding the 256-level depth cap.
+/// Out-of-order records, missing digests, unguarded depth traversal, or wrong exit status
+/// panics; the temporary tree is cleaned up afterward.
+#[cfg(target_os = "linux")]
+#[test]
+fn deep_recursive_inventory_preserves_order_and_guards_depth() {
+    let root = workdir("deep-recursive").canonicalize().unwrap();
+    std::fs::write(root.join("00_first.txt"), b"first").unwrap();
+    let mut deepest = root.join("branch");
+    for _ in 1..256 {
+        deepest.push("d");
+    }
+    let overflow_dir = deepest.join("m_overflow");
+    std::fs::create_dir_all(&overflow_dir).unwrap();
+    std::fs::write(deepest.join("a_leaf.txt"), b"leaf").unwrap();
+    std::fs::write(overflow_dir.join("hidden.txt"), b"must-not-visit").unwrap();
+    std::fs::write(root.join("zz_last.txt"), b"last").unwrap();
+
+    let output = run(&[
+        "inspect",
+        root.to_str().unwrap(),
+        "--recursive",
+        "--jobs",
+        "2",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = jsonl(&output);
+    assert_eq!(records.len(), 4);
+    let paths: Vec<&str> = records
+        .iter()
+        .map(|record| record["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            root.join("00_first.txt").to_str().unwrap(),
+            deepest.join("a_leaf.txt").to_str().unwrap(),
+            overflow_dir.to_str().unwrap(),
+            root.join("zz_last.txt").to_str().unwrap(),
+        ]
+    );
+    assert_eq!(records[0]["report"]["status"], "complete");
+    assert_eq!(records[1]["report"]["status"], "complete");
+    assert_eq!(
+        records[1]["report"]["file"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(records[2]["status"], "partial");
+    assert_eq!(records[2]["error"]["code"], "directory_depth_exceeded");
+    assert_eq!(records[3]["report"]["status"], "complete");
+    assert!(
+        records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record["sequence"] == index + 1 && record["id"] == index + 1)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

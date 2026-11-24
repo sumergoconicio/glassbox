@@ -141,12 +141,12 @@ fn repeated_same_file_does_not_contaminate_model_or_option_sessions() {
         ..Default::default()
     };
     let failed = inspector.extract(&image, &missing);
-    assert!(failed.metadata.diagnostics.iter().any(|diagnostic| {
+    assert!(failed.diagnostics.iter().any(|diagnostic| {
         diagnostic.message.contains("unavailable") && diagnostic.message.contains("no downloads")
     }));
     let before_ordinary = budget.snapshot().ocr_started;
     let ordinary = inspector.extract(&image, &ExtractOptions::default());
-    assert!(!ordinary.metadata.diagnostics.iter().any(|diagnostic| {
+    assert!(!ordinary.diagnostics.iter().any(|diagnostic| {
         diagnostic
             .message
             .contains("definitely_missing_glassbox_model")
@@ -211,7 +211,8 @@ fn cli_jobs_matrix_preserves_order_ids_line_errors_and_status_severity() {
         assert_eq!(records[3]["status"], "invalid");
         assert_eq!(records[3]["id"], Value::Null);
         assert_eq!(records[4]["id"], "same");
-        assert_eq!(records[4]["report"]["metadata"]["status"], "complete");
+        assert_eq!(records[4]["report"]["schema_version"], 3);
+        assert_eq!(records[4]["report"]["status"], "complete");
         assert!(
             records
                 .iter()
@@ -325,4 +326,121 @@ fn broken_stdout_with_open_stdin_returns_one_without_worker_deadlock() {
     };
     assert_eq!(status.code(), Some(1));
     drop(child.stdin.take());
+}
+
+/// Verifies batch and directory JSONL emit schema v3 and honor `--verbose`, `--full-hash`, and `--no-markers`.
+///
+/// Accepts no parameters and exercises inspect `--batch`, inspect directory,
+/// and extract `--batch --output-dir --no-markers` with a temporary sparse
+/// `> 128 MiB` file that is cleaned up before returning. Wrong schema versions,
+/// dropped outer JSONL keys, leaked provenance, or unstripped markers panic.
+#[test]
+fn batch_and_directory_modes_emit_v3_and_honor_verbose_full_hash_and_no_markers() {
+    use glassbox_inspect::hashing::{DEFAULT_FULL_HASH_MAX_BYTES, SAMPLED_FINGERPRINT_SCHEME};
+    use std::io::{Seek, SeekFrom};
+
+    let root = workdir("v3-flags");
+    let large = root.join("oversized.parquet");
+    let total_len = DEFAULT_FULL_HASH_MAX_BYTES + 1;
+    {
+        let mut file = std::fs::File::create(&large).unwrap();
+        file.set_len(total_len).unwrap();
+        file.write_all(b"PAR1BATCH-SPARSE").unwrap();
+        file.seek(SeekFrom::Start(total_len - 4)).unwrap();
+        file.write_all(b"PAR1").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let request = format!("{{\"id\":\"big\",\"path\":\"{}\"}}\n", large.display());
+    let sampled_batch = run(&["inspect", "--batch"], request.as_bytes());
+    assert_eq!(sampled_batch.status.code(), Some(0));
+    let sampled_records = jsonl(&sampled_batch);
+    assert_eq!(sampled_records.len(), 1);
+    assert_eq!(sampled_records[0]["sequence"], 1);
+    assert_eq!(sampled_records[0]["id"], "big");
+    assert_eq!(sampled_records[0]["status"], "complete");
+    assert_eq!(sampled_records[0]["report"]["schema_version"], 3);
+    assert!(sampled_records[0]["report"].get("provenance").is_none());
+    assert!(sampled_records[0]["report"]["file"].get("sha256").is_none());
+    assert_eq!(
+        sampled_records[0]["report"]["file"]["fingerprint"]["scheme"],
+        SAMPLED_FINGERPRINT_SCHEME
+    );
+
+    let full_verbose_batch = run(
+        &["inspect", "--batch", "--full-hash", "--verbose"],
+        request.as_bytes(),
+    );
+    assert_eq!(full_verbose_batch.status.code(), Some(0));
+    let full_records = jsonl(&full_verbose_batch);
+    assert_eq!(full_records[0]["report"]["schema_version"], 3);
+    assert_eq!(
+        full_records[0]["report"]["file"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(
+        full_records[0]["report"]["file"]
+            .get("fingerprint")
+            .is_none()
+    );
+    assert!(
+        full_records[0]["report"]["provenance"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    let dir_verbose = run(&["inspect", root.to_str().unwrap(), "--verbose"], b"");
+    assert_eq!(dir_verbose.status.code(), Some(0));
+    let dir_records = jsonl(&dir_verbose);
+    assert_eq!(dir_records.len(), 1);
+    assert_eq!(dir_records[0]["sequence"], 1);
+    assert_eq!(dir_records[0]["report"]["schema_version"], 3);
+    assert!(
+        dir_records[0]["report"]["provenance"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    let out_dir = workdir("v3-batch-extract-out");
+    let pdf_request = format!(
+        "{{\"id\":\"pdf1\",\"path\":\"{}\"}}\n",
+        fixture("multipage.pdf").display()
+    );
+    let extract_batch = run(
+        &[
+            "extract",
+            "--batch",
+            "--no-ocr",
+            "--verbose",
+            "--no-markers",
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        pdf_request.as_bytes(),
+    );
+    assert_eq!(extract_batch.status.code(), Some(0));
+    let extract_records = jsonl(&extract_batch);
+    assert_eq!(extract_records[0]["report"]["schema_version"], 3);
+    assert!(
+        extract_records[0]["report"]["provenance"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    let md_path = extract_records[0]["report"]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "markdown_content")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    let saved_md = std::fs::read_to_string(md_path).unwrap();
+    assert!(!saved_md.contains("<!-- bodymatter:v1"), "{saved_md}");
+    assert!(saved_md.contains("Final page confirms full-document extraction."));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

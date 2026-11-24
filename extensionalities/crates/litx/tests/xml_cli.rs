@@ -47,35 +47,22 @@ fn litx(args: &[&str]) -> Command {
     command
 }
 
-/// Asserts the v2 XML report contains element paths/counts but no values/profile body.
+/// Asserts the v3 XML report contains element paths/counts but no values/profile body.
 ///
 /// Accepts a metadata JSON report. Returns unit after checking three elements,
 /// two paths, digest, and value absence. Legacy `xml`/text fields cause a panic.
 fn assert_xml_metadata(report: &Value) {
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["kind"], "inspect");
-    assert_eq!(report["metadata"]["status"], "complete");
-    assert_eq!(
-        report["metadata"]["digest"]["digest"]
-            .as_str()
-            .unwrap()
-            .len(),
-        64
-    );
-    assert!(
-        report["metadata"]["counts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|count| count["unit"] == "xml_element" && count["value"] == 3)
-    );
-    let identifiers = report["metadata"]["schema_identifiers"].as_array().unwrap();
-    assert_eq!(identifiers.len(), 2);
-    assert!(
-        identifiers
-            .iter()
-            .any(|identifier| identifier["name"] == "/catalog/book")
-    );
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["format"]["type"], "structured_data");
+    assert_eq!(report["file"]["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(report["structure"]["counts"]["elements"], 3);
+    let paths = report["structure"]["names"]["xml_paths"]
+        .as_array()
+        .unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(paths.iter().any(|path| path == "/catalog/book"));
     assert!(report.get("xml").is_none());
     assert!(report.get("text").is_none());
     assert!(!serde_json::to_string(report).unwrap().contains("SENTINEL"));
@@ -86,10 +73,10 @@ fn assert_xml_metadata(report: &Value) {
     );
 }
 
-/// Verifies v2 inspect and explicit extract publish separate value-free XML models.
+/// Verifies v3 inspect and explicit extract publish separate value-free XML models.
 ///
 /// Accepts no parameters. Returns unit after comparing schema identifiers with
-/// the legacy structural profile. Attribute/text value leakage or wrong exits panic.
+/// the extraction structural profile. Attribute/text value leakage or wrong exits panic.
 #[test]
 fn xml_inspect_and_extract_publish_value_free_structure() {
     let directory = workdir("parity");
@@ -106,17 +93,12 @@ fn xml_inspect_and_extract_publish_value_free_structure() {
     let fresh: Value = serde_json::from_slice(&inspected.stdout).unwrap();
     let full: Value = serde_json::from_slice(&extracted.stdout).unwrap();
     assert_xml_metadata(&fresh);
+    assert_eq!(full["schema_version"], 3);
     assert_eq!(full["kind"], "extract");
-    assert_eq!(full["metadata"]["diagnostics"], serde_json::json!([]));
-    assert!(
-        full["metadata"]["counts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|count| count["unit"] == "xml_element" && count["value"] == 3)
-    );
+    assert!(full.get("diagnostics").is_none());
+    assert_eq!(full["metadata"]["structure"]["counts"]["elements"], 3);
     assert_eq!(
-        full["metadata"]["schema_identifiers"]
+        full["metadata"]["structure"]["names"]["xml_paths"]
             .as_array()
             .unwrap()
             .len(),
@@ -136,7 +118,7 @@ fn xml_inspect_and_extract_publish_value_free_structure() {
 /// Verifies malformed XML fails closed with exit 1 and content-free diagnostics.
 ///
 /// Accepts no parameters. Returns unit after inspecting an undefined entity.
-/// No partial schema profile or sentinel body text may appear in the v2 report.
+/// No partial schema profile or sentinel body text may appear in the v3 report.
 #[test]
 fn xml_fresh_cli_fails_closed_on_invalid_input_with_exit_one() {
     let directory = workdir("invalid");
@@ -144,8 +126,9 @@ fn xml_fresh_cli_fails_closed_on_invalid_input_with_exit_one() {
     let output = litx(&["inspect", path.to_str().unwrap()]).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["metadata"]["status"], "failed");
-    assert_eq!(report["metadata"]["diagnostics"][0]["stage"], "metadata");
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["diagnostics"][0]["stage"], "metadata");
     assert!(report.get("xml").is_none());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -184,18 +167,18 @@ fn xml_batch_recovers_valid_invalid_valid_and_matches_fresh_transport() {
         .collect();
     assert_eq!(responses.len(), 3);
     assert_xml_metadata(&responses[0]["report"]);
-    assert_eq!(responses[1]["report"]["metadata"]["status"], "failed");
+    assert_eq!(responses[1]["report"]["status"], "failed");
     assert_xml_metadata(&responses[2]["report"]);
     assert_eq!(
-        responses[0]["report"]["metadata"]["schema_identifiers"],
-        responses[2]["report"]["metadata"]["schema_identifiers"]
+        responses[0]["report"]["structure"]["names"]["xml_paths"],
+        responses[2]["report"]["structure"]["names"]["xml_paths"]
     );
 
     let fresh = litx(&["inspect", good.to_str().unwrap()]).output().unwrap();
     let fresh: Value = serde_json::from_slice(&fresh.stdout).unwrap();
     assert_eq!(
-        responses[0]["report"]["metadata"]["schema_identifiers"],
-        fresh["metadata"]["schema_identifiers"]
+        responses[0]["report"]["structure"]["names"]["xml_paths"],
+        fresh["structure"]["names"]["xml_paths"]
     );
     let text: String = responses
         .iter()
@@ -264,7 +247,8 @@ fn xml_declaration_errors_stay_content_free_through_cli_transport() {
     let output = litx(&["inspect", path.to_str().unwrap()]).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["metadata"]["status"], "failed");
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["status"], "failed");
     assert!(report.get("xml").is_none());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(

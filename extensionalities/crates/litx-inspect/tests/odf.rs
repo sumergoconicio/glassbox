@@ -105,7 +105,8 @@ fn odt_table_unit_keeps_separators_and_clips_early_under_character_caps() {
     // the early-clipped buffer equals the prefix the full text would clip to,
     // and the unit is disclosed as partial instead of silently shortened.
     let clipped = glassbox_inspect::extract(&fixture("tables.odt"), &options(40));
-    assert_eq!(clipped.metadata.status, OperationStatus::Partial);
+    assert_eq!(clipped.status, OperationStatus::Partial);
+    assert_eq!(clipped.metadata.status, OperationStatus::Complete);
     assert_eq!(clipped.selection.omitted, OmissionStatus::SafetyLimit);
     assert_eq!(
         clipped.content.units[0].text.as_deref(),
@@ -120,9 +121,59 @@ fn odt_table_unit_keeps_separators_and_clips_early_under_character_caps() {
     assert_eq!(clipped.content.units[1].completeness, Completeness::Partial);
     assert!(
         clipped
-            .metadata
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "content_limit")
+    );
+}
+
+/// Verifies ODS preview repetition does not overflow when `max_chars` is `usize::MAX`.
+///
+/// Accepts no parameters. Returns unit after inspecting and extracting `grid.ods`
+/// with an unbounded character cap. Panics if arithmetic overflows, diagnostics
+/// appear, or worksheet extraction metadata and rows diverge from the fixture.
+#[test]
+fn ods_max_chars_usize_max_does_not_overflow_preview_repetition() {
+    use glassbox_inspect::reports::{
+        Completeness, ExtractOptions, NativeSelection, NativeUnit, OperationStatus,
+    };
+
+    let report = inspect(
+        &fixture("grid.ods"),
+        &InspectOptions {
+            max_chars: usize::MAX,
+            ..InspectOptions::default()
+        },
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.counts.sheets, Some(1));
+    assert_eq!(report.sheets.len(), 1);
+    let sheet = &report.sheets[0];
+    assert_eq!(sheet.name, "Notes");
+    assert_eq!(sheet.used_range.as_deref(), Some("A1:B4"));
+    assert_eq!((sheet.rows, sheet.cols), (4, 2));
+    assert_eq!(sheet.non_empty_cells, 8);
+    assert_eq!(report.text.content.matches("We can inspect").count(), 2);
+
+    let extracted = glassbox_inspect::extract(
+        &fixture("grid.ods"),
+        &ExtractOptions {
+            selection: NativeSelection::All,
+            max_chars: usize::MAX,
+            ..ExtractOptions::default()
+        },
+    );
+    assert_eq!(extracted.status, OperationStatus::Complete);
+    assert_eq!(extracted.content.units.len(), 1);
+    let unit = &extracted.content.units[0];
+    assert_eq!(unit.unit_index, 1);
+    assert_eq!(unit.unit, NativeUnit::Worksheet);
+    assert_eq!(unit.source_part.as_deref(), Some("content.xml#sheet/Notes"));
+    assert_eq!(unit.completeness, Completeness::Exact);
+    assert_eq!(unit.rows.len(), 4);
+    assert!(
+        unit.text
+            .as_deref()
+            .is_some_and(|text| text.matches("We can inspect").count() == 2)
     );
 }

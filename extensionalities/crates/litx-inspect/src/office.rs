@@ -1,7 +1,7 @@
-// Module: glassbox-inspect OOXML (WordprocessingML/Presentationml) reader.
-// File: office.rs.
-// Responsibility: Identify OOXML packages, read container metadata, and
-// extract native units with boundary-aware, budget-bounded text ownership.
+//! Module: glassbox-inspect OOXML (WordprocessingML/PresentationML) reader.
+//! File: office.rs.
+//! Responsibility: Identify OOXML packages, read container metadata, and
+//! extract native units with boundary-aware, budget-bounded text ownership.
 use crate::{
     Claim, InspectOptions, InspectReport, Preflight,
     archive::Archive,
@@ -23,6 +23,10 @@ const UNIT_TEXT_CHAR_CAP: usize = 65_536;
 /// Maximum nested Word table depth inside one unit's text assembly; deeper
 /// nested tables are skipped and the clip is reported.
 const WORD_TABLE_NESTING_CAP: usize = 16;
+/// Maximum number of native units expanded from one DOCX body.
+const DOCX_UNIT_CAP: usize = 4096;
+/// Maximum wrapper nesting depth traversed inside a DOCX `<w:body>` or table.
+const DOCX_WRAPPER_DEPTH_CAP: usize = 32;
 /// Explicit partial diagnostic appended when unit text assembly clips.
 const UNIT_TEXT_TRUNCATION_MARKER: &str = "\n[unit text truncated]";
 
@@ -132,23 +136,44 @@ pub(crate) fn metadata(archive: &mut Archive, report: &mut InspectReport) {
     }
 }
 
-pub(crate) fn inspect(archive: &mut Archive, report: &mut InspectReport, options: &InspectOptions) {
-    let result = inspect_inner(archive, report, options);
-    if let Err(error) = result {
-        report.error("office", error);
+/// Inspects an OpenDocument or OOXML package inside an open ZIP archive.
+///
+/// Accepts an open archive, mutable destination report, and extraction options.
+/// Returns `true` when ODF or OOXML recognized the archive (including when a
+/// recognized package fails and records an `"office"` error so downstream ZIP
+/// readers do not run), and `false` when neither ODF nor OOXML matched.
+pub(crate) fn inspect(
+    archive: &mut Archive,
+    report: &mut InspectReport,
+    options: &InspectOptions,
+) -> bool {
+    match inspect_inner(archive, report, options) {
+        Ok(handled) => handled,
+        Err(error) => {
+            report.error("office", error);
+            true
+        }
     }
 }
 
+/// Dispatches ODF (`mimetype`) and OOXML (`[Content_Types].xml`) package parsing.
+///
+/// Accepts an open archive, mutable destination report, and extraction options.
+/// Returns `Ok(true)` when ODF or OOXML recognized and inspected the archive,
+/// `Ok(false)` when neither ODF nor OOXML matched, or an error when reading or
+/// validating a recognized Office package fails.
 fn inspect_inner(
     archive: &mut Archive,
     report: &mut InspectReport,
     options: &InspectOptions,
-) -> xml::Result<()> {
-    if archive.names.iter().any(|n| n == "mimetype") {
-        crate::odf::inspect(archive, report, options)?;
+) -> xml::Result<bool> {
+    if archive.names.iter().any(|n| n == "mimetype")
+        && crate::odf::inspect(archive, report, options)?
+    {
+        return Ok(true);
     }
     if !archive.names.iter().any(|n| n == "[Content_Types].xml") {
-        return Ok(());
+        return Ok(false);
     }
     let types = read_xml(archive, "[Content_Types].xml")?;
     if !types.is(CT, "Types") {
@@ -184,7 +209,7 @@ fn inspect_inner(
         }
     }
     let Some(((ext, ns, root_name), part)) = main else {
-        return Ok(());
+        return Ok(false);
     };
     if part.split('/').any(|p| matches!(p, ".." | "." | "")) || part.contains('\\') {
         return Err("unsafe OOXML main part name".into());
@@ -241,7 +266,7 @@ fn inspect_inner(
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn resolve_part(base: &str, target: &str) -> xml::Result<String> {
@@ -431,13 +456,261 @@ fn pptx(
     Ok(())
 }
 
-/// Extracts selected top-level DOCX paragraphs and atomic tables.
+/// One source-order DOCX body unit assembled before native selection filtering.
+struct DocxPlannedUnit {
+    unit: crate::reports::NativeUnit,
+    text: Option<String>,
+    partial: bool,
+}
+
+/// Appends one planned DOCX unit while enforcing [`DOCX_UNIT_CAP`].
+///
+/// Accepts the destination vector and planned unit. Returns `Ok(())` when the
+/// unit fits within the cap, or an error when adding the unit would exceed
+/// `DOCX_UNIT_CAP`. Performs no I/O.
+fn push_docx_unit(planned: &mut Vec<DocxPlannedUnit>, unit: DocxPlannedUnit) -> xml::Result<()> {
+    if planned.len() >= DOCX_UNIT_CAP {
+        return Err("DOCX native block cap exceeded".into());
+    }
+    planned.push(unit);
+    Ok(())
+}
+
+/// Reports whether `node` is an explicit WordprocessingML page break (`<w:br w:type="page"/>`).
+///
+/// Accepts a parsed XML element node. Returns `true` only for `w:br` elements
+/// whose `w:type` (or unprefixed `type`) attribute equals `"page"`. Soft
+/// `<w:lastRenderedPageBreak/>`, plain `<w:br/>`, and non-page break types
+/// return `false`. Performs no I/O and cannot fail.
+fn is_word_page_break(node: &Node) -> bool {
+    node.is(W, "br") && node.attr_ns(W, "type").or_else(|| node.attr("type")) == Some("page")
+}
+
+/// Reports whether `node` is WordprocessingML control metadata, section
+/// properties, or deleted/moved-from markup excluded from body text.
+///
+/// Accepts a parsed XML element node. Returns `true` for `w:sdtPr`,
+/// `w:sdtEndPr`, `w:sectPr`, `w:del`, and `w:moveFrom`. Performs no I/O and
+/// cannot fail.
+fn is_word_skipped_metadata(node: &Node) -> bool {
+    node.ns == W
+        && matches!(
+            node.name.as_str(),
+            "sdtPr" | "sdtEndPr" | "sectPr" | "del" | "moveFrom"
+        )
+}
+
+/// Reports whether `node` is a supported WordprocessingML content-bearing
+/// wrapper whose children belong to the surrounding body or table flow.
+///
+/// Accepts a parsed XML element node. Returns `true` for `w:sdt`,
+/// `w:sdtContent`, `w:ins`, `w:moveTo`, `w:smartTag`, `w:customXml`, and
+/// `w:hyperlink`. Performs no I/O and cannot fail.
+fn is_word_content_wrapper(node: &Node) -> bool {
+    node.ns == W
+        && matches!(
+            node.name.as_str(),
+            "sdt" | "sdtContent" | "ins" | "moveTo" | "smartTag" | "customXml" | "hyperlink"
+        )
+}
+
+/// Reports whether `node` contains any unextracted WordprocessingML block or
+/// non-empty `w:t` text node beneath it.
+///
+/// Accepts a parsed XML element node. Returns `true` when `node` or any
+/// descendant is `w:p`, `w:tbl`, or a `w:t` containing non-whitespace text.
+/// Performs no I/O and cannot fail.
+fn contains_word_content(node: &Node) -> bool {
+    let mut found = false;
+    node.visit(&mut |descendant| {
+        if found {
+            return;
+        }
+        if descendant.is(W, "p")
+            || descendant.is(W, "tbl")
+            || (descendant.is(W, "t") && !descendant.text().trim().is_empty())
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Collects DOCX body `<w:p>` and `<w:tbl>` blocks in exact document order
+/// across supported content-bearing wrappers.
+///
+/// Accepts a container node (`w:body` or a supported wrapper), destination
+/// vector, current wrapper depth, and a mutable flag set to `true` whenever an
+/// unsupported wrapper or depth overflow hides nested `<w:p>`, `<w:tbl>`, or
+/// non-empty `<w:t>` content. Returns `Ok(())` when within [`DOCX_UNIT_CAP`],
+/// or an error if adding a block would exceed [`DOCX_UNIT_CAP`]. Control and
+/// section metadata (`w:sdtPr`, `w:sdtEndPr`, `w:sectPr`) and deleted or
+/// moved-from markup (`w:del`, `w:moveFrom`) are skipped intentionally.
+fn collect_docx_blocks<'a>(
+    node: &'a Node,
+    blocks: &mut Vec<&'a Node>,
+    depth: usize,
+    skipped_content: &mut bool,
+) -> xml::Result<()> {
+    for child in node.children() {
+        if child.is(W, "p") || child.is(W, "tbl") {
+            if blocks.len() >= DOCX_UNIT_CAP {
+                return Err("DOCX native block cap exceeded".into());
+            }
+            blocks.push(child);
+        } else if is_word_skipped_metadata(child) {
+            // Control properties, section properties, and deleted/moved-from
+            // ranges are excluded from active body text.
+        } else if is_word_content_wrapper(child) {
+            if depth >= DOCX_WRAPPER_DEPTH_CAP {
+                if contains_word_content(child) {
+                    *skipped_content = true;
+                }
+            } else {
+                collect_docx_blocks(child, blocks, depth + 1, skipped_content)?;
+            }
+        } else if contains_word_content(child) {
+            *skipped_content = true;
+        }
+    }
+    Ok(())
+}
+
+/// Accumulates owned text fragments for one DOCX paragraph and splits it at
+/// explicit `<w:br w:type="page"/>` elements.
+struct WordParagraphSplitter<'a> {
+    planned: &'a mut Vec<DocxPlannedUnit>,
+    text: String,
+    budget: UnitTextBudget,
+    saw_page_break: bool,
+}
+
+impl<'a> WordParagraphSplitter<'a> {
+    /// Creates a splitter targeting `planned` with a fresh per-unit character budget.
+    ///
+    /// Accepts the mutable destination vector. Returns an empty splitter with
+    /// no page breaks observed. Performs no I/O and cannot fail.
+    fn new(planned: &'a mut Vec<DocxPlannedUnit>) -> Self {
+        Self {
+            planned,
+            text: String::new(),
+            budget: UnitTextBudget::new(),
+            saw_page_break: false,
+        }
+    }
+
+    /// Walks `node` in document order, splitting at explicit page breaks while
+    /// ignoring `<w:lastRenderedPageBreak/>`, skipping control/deleted metadata,
+    /// traversing inline content wrappers (`w:sdt`/`w:sdtContent`/`w:ins`), and
+    /// skipping nested block boundaries.
+    ///
+    /// Accepts a parsed XML node and whether direct character data is owned by
+    /// an enclosing `w:t` element. Returns `Ok(())` on completion, or an error
+    /// if emitting a split unit exceeds [`DOCX_UNIT_CAP`]. Performs no I/O.
+    fn walk(&mut self, node: &Node, owns_text: bool) -> xml::Result<()> {
+        for content in &node.content {
+            match content {
+                Content::Text(text) if owns_text => self.budget.push(&mut self.text, text),
+                Content::Element(child) => {
+                    if child.is(W, "t") {
+                        self.walk(child, true)?;
+                    } else if child.is(W, "tab") {
+                        self.budget.push(&mut self.text, "\t");
+                    } else if is_word_page_break(child) {
+                        self.emit_page_break()?;
+                    } else if child.is(W, "br") || child.is(W, "cr") {
+                        self.budget.push(&mut self.text, "\n");
+                    } else if child.is(W, "lastRenderedPageBreak")
+                        || is_word_skipped_metadata(child)
+                    {
+                        // Soft rendered page breaks, control metadata, and
+                        // deleted/moved-from markup do not emit active text.
+                    } else if child.is(W, "p") || child.is(W, "tbl") {
+                        self.budget.truncated = true;
+                    } else {
+                        self.walk(child, false)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes any non-empty text accumulated before an explicit page break and
+    /// appends a [`crate::reports::NativeUnit::PageBreak`] unit.
+    ///
+    /// Accepts `&mut self`. Returns `Ok(())` on success, or an error when
+    /// appending exceeds [`DOCX_UNIT_CAP`]. Performs no I/O.
+    fn emit_page_break(&mut self) -> xml::Result<()> {
+        self.saw_page_break = true;
+        if !self.text.trim().is_empty() || self.budget.truncated {
+            let mut flushed = std::mem::take(&mut self.text);
+            if self.budget.truncated {
+                flushed.push_str(UNIT_TEXT_TRUNCATION_MARKER);
+            }
+            push_docx_unit(
+                self.planned,
+                DocxPlannedUnit {
+                    unit: crate::reports::NativeUnit::DocumentBlock,
+                    text: Some(flushed),
+                    partial: self.budget.truncated,
+                },
+            )?;
+        } else {
+            self.text.clear();
+        }
+        self.budget = UnitTextBudget::new();
+        push_docx_unit(
+            self.planned,
+            DocxPlannedUnit {
+                unit: crate::reports::NativeUnit::PageBreak,
+                text: None,
+                partial: false,
+            },
+        )
+    }
+
+    /// Flushes remaining paragraph text after walking the entire `<w:p>` node.
+    ///
+    /// Accepts `self`. Returns `Ok(())` on success, or an error when appending
+    /// exceeds [`DOCX_UNIT_CAP`]. Paragraphs without explicit page breaks always
+    /// emit one block unit; paragraphs split by an explicit page break emit a
+    /// trailing block unit only when non-empty or clipped. Performs no I/O.
+    fn finish(mut self) -> xml::Result<()> {
+        if !self.saw_page_break || !self.text.trim().is_empty() || self.budget.truncated {
+            if self.budget.truncated {
+                self.text.push_str(UNIT_TEXT_TRUNCATION_MARKER);
+            }
+            push_docx_unit(
+                self.planned,
+                DocxPlannedUnit {
+                    unit: crate::reports::NativeUnit::DocumentBlock,
+                    text: Some(self.text),
+                    partial: self.budget.truncated,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Extracts selected DOCX body paragraphs, atomic tables, and explicit page breaks.
 ///
 /// Accepts the document root, main part name, report, and native selection.
-/// Returns unit after ordered body children are emitted. A missing body, excess
-/// unit count, or unsatisfiable range returns an error; nested blocks are not split.
-/// Each unit's text assembly is bounded; a clip appends the explicit truncation
-/// marker and downgrades that unit's completeness to partial.
+/// Returns unit after ordered body blocks (including blocks inside supported
+/// content-bearing wrappers such as `w:sdt`/`w:sdtContent`, `w:ins`, `w:moveTo`,
+/// `w:smartTag`, `w:customXml`, and `w:hyperlink`) are emitted: `<w:tbl>` nodes
+/// emit [`crate::reports::NativeUnit::Table`], explicit `<w:br w:type="page"/>`
+/// breaks split surrounding paragraph text and emit
+/// [`crate::reports::NativeUnit::PageBreak`] (ignoring
+/// `<w:lastRenderedPageBreak/>`), and ordinary paragraphs emit
+/// [`crate::reports::NativeUnit::DocumentBlock`]. A missing body, excess unit
+/// count, or unsatisfiable range returns an error; unsupported wrappers or
+/// depth-capped wrappers that hide content set `report.text.truncated = true`
+/// and emit an extraction diagnostic so omitted content never reports complete
+/// exact extraction. Each unit's text assembly is bounded; a clip appends the
+/// explicit truncation marker and downgrades that unit's completeness to partial.
 fn docx_units(
     root: &Node,
     part: &str,
@@ -448,42 +721,91 @@ fn docx_units(
         .children()
         .find(|node| node.is(W, "body"))
         .ok_or("DOCX document has no body")?;
-    let blocks: Vec<&Node> = body
-        .children()
-        .filter(|node| node.is(W, "p") || node.is(W, "tbl"))
-        .collect();
-    if blocks.len() > 4096 {
-        return Err("DOCX native block cap exceeded".into());
+    let mut blocks = Vec::new();
+    let mut skipped_content = false;
+    collect_docx_blocks(body, &mut blocks, 0, &mut skipped_content)?;
+    if skipped_content {
+        report.text.truncated = true;
+        report.error(
+            "office",
+            "DOCX body contains unsupported or deeply nested wrapper elements with unextracted content",
+        );
+    }
+    let mut planned = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if block.is(W, "p") {
+            let mut splitter = WordParagraphSplitter::new(&mut planned);
+            splitter.walk(block, false)?;
+            splitter.finish()?;
+        } else {
+            let mut text = String::new();
+            let mut budget = UnitTextBudget::new();
+            budget.word_table(block, &mut text, 1);
+            if budget.truncated {
+                text.push_str(UNIT_TEXT_TRUNCATION_MARKER);
+            }
+            push_docx_unit(
+                &mut planned,
+                DocxPlannedUnit {
+                    unit: crate::reports::NativeUnit::Table,
+                    text: Some(text),
+                    partial: budget.truncated,
+                },
+            )?;
+        }
     }
     let plan = crate::selection::begin(
         report,
         selection,
         crate::reports::NativeUnit::DocumentBlock,
-        blocks.len() as u64,
+        planned.len() as u64,
     )?;
-    for (index, block) in blocks.into_iter().enumerate() {
+    let mut table_ordinal: u64 = 0;
+    let mut page_break_ordinal: u64 = 0;
+    for (index, item) in planned.into_iter().enumerate() {
         let number = index as u64 + 1;
+        let marker_index = match item.unit {
+            crate::reports::NativeUnit::Table => {
+                table_ordinal += 1;
+                Some(table_ordinal)
+            }
+            crate::reports::NativeUnit::PageBreak => {
+                page_break_ordinal += 1;
+                Some(page_break_ordinal)
+            }
+            _ => None,
+        };
         if !plan.contains(number) {
             continue;
         }
-        let mut text = String::new();
-        let mut budget = UnitTextBudget::new();
-        if block.is(W, "p") {
-            budget.paragraph(block, &mut text);
-        } else {
-            budget.word_table(block, &mut text, 1);
-        }
-        if budget.truncated {
-            text.push_str(UNIT_TEXT_TRUNCATION_MARKER);
-        }
-        let mut unit = crate::selection::text_unit(
-            number,
-            crate::reports::NativeUnit::DocumentBlock,
-            Some(format!("{part}#body/{number}")),
-            text,
-            crate::reports::ContentOrigin::Native,
-        );
-        if budget.truncated {
+        let mut unit = match item.text {
+            Some(text) => crate::selection::text_unit(
+                number,
+                item.unit,
+                Some(format!("{part}#body/{number}")),
+                text,
+                crate::reports::ContentOrigin::Native,
+            ),
+            None => crate::reports::ContentUnit {
+                unit_index: number,
+                unit: item.unit,
+                source_part: Some(format!("{part}#body/{number}")),
+                label: None,
+                marker_index: None,
+                text: None,
+                rows: Vec::new(),
+                provenance: vec![crate::reports::ExtractionProvenance {
+                    reader: "native-reader".into(),
+                    stage: "native-unit-extract".into(),
+                    source: crate::reports::FactSource::NativeStructure,
+                    origin: crate::reports::ContentOrigin::Native,
+                    ocr: None,
+                }],
+                completeness: crate::reports::Completeness::Exact,
+            },
+        };
+        unit.marker_index = marker_index;
+        if item.partial {
             unit.completeness = crate::reports::Completeness::Partial;
         }
         report.native_units.push(unit);
@@ -545,6 +867,8 @@ fn walk_owned_content(
                             emit("\n");
                         } else if child.is(W, "p") || child.is(W, "tbl") {
                             skipped_boundary = true;
+                        } else if is_word_skipped_metadata(child) {
+                            // Control properties and deleted/moved-from runs are excluded.
                         } else {
                             skipped_boundary |= walk_owned_content(child, family, false, emit);
                         }
@@ -619,14 +943,19 @@ impl UnitTextBudget {
     }
 
     /// Appends one Word table as rows and tab-separated cells. Rows and cells
-    /// are direct children, and each nested table is rendered exactly once
-    /// inside its parent cell, so text never duplicates per nesting level.
+    /// are collected across direct children and supported content-bearing
+    /// wrappers without crossing nested table boundaries, so each nested table
+    /// is rendered exactly once inside its parent cell.
     fn word_table(&mut self, table: &Node, out: &mut String, depth: usize) {
-        for (row_index, row) in table.children().filter(|n| n.is(W, "tr")).enumerate() {
+        let mut rows = Vec::new();
+        collect_word_children(table, "tr", &mut rows, 0, &mut self.truncated);
+        for (row_index, row) in rows.into_iter().enumerate() {
             if row_index > 0 {
                 self.push(out, "\n");
             }
-            for (cell_index, cell) in row.children().filter(|n| n.is(W, "tc")).enumerate() {
+            let mut cells = Vec::new();
+            collect_word_children(row, "tc", &mut cells, 0, &mut self.truncated);
+            for (cell_index, cell) in cells.into_iter().enumerate() {
                 if cell_index > 0 {
                     self.push(out, "\t");
                 }
@@ -655,13 +984,45 @@ impl UnitTextBudget {
     }
 }
 
+/// Collects direct or wrapper-enclosed `w:<target>` children (such as `tr`
+/// inside `tbl` or `tc` inside `tr`) without crossing nested table or cell
+/// boundaries.
+///
+/// Accepts a parent node, target local name, destination vector, current
+/// wrapper depth, and truncation flag set when wrapper nesting exceeds
+/// [`DOCX_WRAPPER_DEPTH_CAP`]. Performs no I/O and cannot fail.
+fn collect_word_children<'a>(
+    node: &'a Node,
+    target: &str,
+    out: &mut Vec<&'a Node>,
+    depth: usize,
+    truncated: &mut bool,
+) {
+    for child in node.children() {
+        if child.is(W, target) {
+            out.push(child);
+        } else if is_word_skipped_metadata(child) {
+            // Control metadata and deleted ranges are excluded.
+        } else if is_word_content_wrapper(child) {
+            if depth >= DOCX_WRAPPER_DEPTH_CAP {
+                *truncated = true;
+            } else {
+                collect_word_children(child, target, out, depth + 1, truncated);
+            }
+        }
+    }
+}
+
 /// Collects a Word cell's block-level `w:p`/`w:tbl` content in document order
-/// without crossing nested-table boundaries: recursion stops at paragraphs and
-/// tables, so nested table content belongs to its own table alone.
+/// without crossing nested-table boundaries: recursion stops at paragraphs,
+/// tables, and excluded control/deleted metadata, so nested table content
+/// belongs to its own table alone.
 fn collect_word_blocks<'a>(node: &'a Node, blocks: &mut Vec<&'a Node>) {
     for child in node.children() {
         if child.is(W, "p") || child.is(W, "tbl") {
             blocks.push(child);
+        } else if is_word_skipped_metadata(child) {
+            // Control metadata and deleted ranges are excluded.
         } else {
             collect_word_blocks(child, blocks);
         }
@@ -1091,5 +1452,82 @@ mod tests {
         assert_eq!(report.counts.paragraphs, Some(5));
         assert_eq!(report.preflight.len(), 1);
         assert!(!report.preflight[0].needs_ocr);
+    }
+
+    /// Explicit `<w:br w:type="page"/>` splits surrounding paragraph text into
+    /// separate block units separated by `NativeUnit::PageBreak`, while
+    /// `<w:lastRenderedPageBreak/>`, plain `<w:br/>`, and `<w:br w:type="column"/>`
+    /// never emit page-break units, and `<w:tbl>` emits `NativeUnit::Table`.
+    #[test]
+    fn docx_units_split_explicit_page_breaks_and_tag_tables() {
+        let root = word_root(concat!(
+            "<w:body>",
+            "<w:p><w:r><w:t>before</w:t><w:br w:type=\"page\"/><w:t>after</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>soft </w:t><w:lastRenderedPageBreak/><w:t>join</w:t><w:br/><w:t>line</w:t></w:r></w:p>",
+            "<w:p><w:r><w:br w:type=\"page\"></w:br></w:r></w:p>",
+            "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+            "<w:p><w:r><w:br type=\"page\"/><w:t>leading</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>trailing</w:t><w:br w:type=\"page\"/></w:r></w:p>",
+            "</w:body>",
+        ));
+        let mut report = InspectReport::default();
+        docx_units(
+            &root,
+            "word/document.xml",
+            &mut report,
+            &crate::reports::NativeSelection::All,
+        )
+        .expect("selection must be satisfiable");
+
+        let summary: Vec<_> = report
+            .native_units
+            .iter()
+            .map(|u| (u.unit_index, u.unit.clone(), u.text.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    1,
+                    crate::reports::NativeUnit::DocumentBlock,
+                    Some("before".into()),
+                ),
+                (2, crate::reports::NativeUnit::PageBreak, None),
+                (
+                    3,
+                    crate::reports::NativeUnit::DocumentBlock,
+                    Some("after".into()),
+                ),
+                (
+                    4,
+                    crate::reports::NativeUnit::DocumentBlock,
+                    Some("soft join\nline".into()),
+                ),
+                (5, crate::reports::NativeUnit::PageBreak, None),
+                (6, crate::reports::NativeUnit::Table, Some("cell".into())),
+                (7, crate::reports::NativeUnit::PageBreak, None),
+                (
+                    8,
+                    crate::reports::NativeUnit::DocumentBlock,
+                    Some("leading".into()),
+                ),
+                (
+                    9,
+                    crate::reports::NativeUnit::DocumentBlock,
+                    Some("trailing".into()),
+                ),
+                (10, crate::reports::NativeUnit::PageBreak, None),
+            ]
+        );
+        for unit in report
+            .native_units
+            .iter()
+            .filter(|u| u.unit == crate::reports::NativeUnit::PageBreak)
+        {
+            assert!(unit.text.is_none());
+            assert!(unit.rows.is_empty());
+            assert!(unit.label.is_none());
+            assert_eq!(unit.completeness, crate::reports::Completeness::Exact);
+        }
     }
 }

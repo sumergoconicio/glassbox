@@ -94,13 +94,18 @@ fn assert_no_content_fields(value: &Value) {
     }
 }
 
-/// Checks the common v2 envelope, streamed digest, and content-free serialization.
+/// Checks the legacy v2 metadata-wrapper envelope, streamed digest, and content-free serialization.
 ///
 /// Accepts an input path and report. Returns the serialized JSON for further
 /// family-specific assertions. Mismatched schema, kind, digest, byte count, or
 /// forbidden body fields panic with the source path.
 fn assert_common(path: &Path, report: &glassbox_inspect::reports::MetadataReport) -> Value {
-    assert_eq!(report.schema_version, 2, "{}", path.display());
+    assert_eq!(
+        report.schema_version,
+        glassbox_inspect::reports::LEGACY_REPORT_SCHEMA_VERSION,
+        "{}",
+        path.display()
+    );
     assert_eq!(report.kind, ReportKind::Inspect, "{}", path.display());
     assert_ne!(
         report.metadata.status,
@@ -196,12 +201,44 @@ fn supported_families_publish_structure_without_body_values() {
         assert_common(&path, &report);
         let summary = glassbox_inspect::metadata::summary(&report);
         assert!(
+            summary.contains("- Schema: 3"),
+            "{} summary missing v3 schema marker: {summary}",
+            path.display()
+        );
+        assert!(
             !summary.contains(sentinel),
             "{} leaked its body sentinel",
             path.display()
         );
+        let plain = glassbox_inspect::metadata::summary_text(&report, false);
+        assert!(
+            plain.contains("Schema: 3\n"),
+            "{} plain-text summary missing v3 schema marker: {plain}",
+            path.display()
+        );
+        assert!(
+            !plain.contains(sentinel),
+            "{} plain-text summary leaked its body sentinel",
+            path.display()
+        );
         assert!(!serde_json::to_string(&report).unwrap().contains(sentinel));
     }
+
+    // Literal filename suffix is preserved on misnamed files and family aliases.
+    let xlsm_path = directory.join("workbook.xlsm");
+    let xlsm_report = inspect(&xlsm_path, &InspectOptions::default());
+    assert_eq!(xlsm_report.metadata.format.extension, "xlsm");
+    assert!(!xlsm_report.metadata.format.disagreement);
+
+    let misnamed = fixture(
+        &directory,
+        "report.pdf",
+        &std::fs::read(fixtures().join("notes.docx")).unwrap(),
+    );
+    let misnamed_report = inspect(&misnamed, &InspectOptions::default());
+    assert_eq!(misnamed_report.metadata.format.extension, "pdf");
+    assert!(misnamed_report.metadata.format.disagreement);
+    assert_eq!(misnamed_report.metadata.format.bucket, "Office Docs");
 }
 
 /// Verifies generated JSON, XML, CSV, and plain-text schema/count metadata.

@@ -134,7 +134,8 @@ fn clean_identification_only_document_keeps_the_unsupported_boundary() {
     assert_eq!(title, Some("Native Pocket Book".to_owned()));
 
     let extracted = extract(&path, &options(NativeSelection::All));
-    assert_eq!(extracted.metadata.status, OperationStatus::Unsupported);
+    assert_eq!(extracted.status, OperationStatus::Unsupported);
+    assert_eq!(extracted.metadata.status, OperationStatus::Complete);
     assert_eq!(extracted.selection.omitted, OmissionStatus::Unsupported);
     assert!(extracted.content.units.is_empty());
 }

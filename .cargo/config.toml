@@ -1,0 +1,4 @@
+[build]
+# Share intermediates across the workspaces in this checkout. Cargo uses each
+# workspace's target directory for its final artifacts.
+build-dir = "target"

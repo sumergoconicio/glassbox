@@ -88,21 +88,20 @@ fn report_json(output: &Output) -> Value {
 
 /// Asserts canonical extraction retains its static DjVu boundary.
 ///
-/// Accepts a v2 extraction JSON report. Returns unit after checking empty native
+/// Accepts a v3 extraction JSON report. Returns unit after checking empty native
 /// units and the static diagnostic. Native text leakage or OCR stages panic.
 fn assert_extract_boundary(report: &Value) {
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["kind"], "extract");
-    assert_eq!(report["metadata"]["format"]["bucket"], "Ebooks");
-    assert_eq!(
-        report["metadata"]["format"]["detected_mime"],
-        "image/vnd.djvu"
-    );
+    assert_eq!(report["status"], "unsupported");
+    assert_eq!(report["metadata"]["format"]["type"], "ebooks");
+    assert_eq!(report["metadata"]["format"]["mime"], "image/vnd.djvu");
     assert_eq!(report["metadata"]["status"], "unsupported");
-    let errors = report["metadata"]["diagnostics"].as_array().unwrap();
+    let errors = report["diagnostics"].as_array().unwrap();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0]["stage"], "metadata");
     assert_eq!(errors[0]["message"], DIAGNOSTIC);
-    assert!(report["metadata"]["djvu"].is_null());
+    assert!(report["metadata"].get("djvu").is_none());
     assert_eq!(report["content"]["units"], serde_json::json!([]));
     assert_eq!(report["selection"]["omitted"], "unsupported");
     assert!(
@@ -112,34 +111,19 @@ fn assert_extract_boundary(report: &Value) {
     );
 }
 
-/// Asserts the v2 report identifies DjVu without native analysis or content.
+/// Asserts the v3 report identifies DjVu without native analysis or content.
 ///
 /// Accepts a metadata JSON report. Returns unit after checking schema, support,
 /// status, diagnostics, digest, and hidden marker absence. Body fields panic.
 fn assert_metadata_boundary(report: &Value) {
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["kind"], "inspect");
-    assert_eq!(report["metadata"]["format"]["bucket"], "Ebooks");
-    assert_eq!(
-        report["metadata"]["format"]["detected_mime"],
-        "image/vnd.djvu"
-    );
-    assert_eq!(
-        report["metadata"]["extraction_support"],
-        "identification_only"
-    );
-    assert_eq!(report["metadata"]["status"], "complete");
-    assert_eq!(
-        report["metadata"]["diagnostics"][0]["code"],
-        "djvu_identification_only"
-    );
-    assert_eq!(
-        report["metadata"]["digest"]["digest"]
-            .as_str()
-            .unwrap()
-            .len(),
-        64
-    );
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["format"]["type"], "ebooks");
+    assert_eq!(report["format"]["mime"], "image/vnd.djvu");
+    assert_eq!(report["readiness"]["extractable"], "identification_only");
+    assert_eq!(report["diagnostics"][0]["code"], "djvu_identification_only");
+    assert_eq!(report["file"]["sha256"].as_str().unwrap().len(), 64);
     assert!(report.get("text").is_none());
     assert!(report.get("markdown").is_none());
     assert!(
@@ -229,14 +213,9 @@ fn batch_preserves_the_boundary_and_continues_with_the_next_file() {
         .collect();
     assert_eq!(responses.len(), 2);
     assert_extract_boundary(&responses[0]["report"]);
-    assert_eq!(
-        responses[1]["report"]["metadata"]["format"]["bucket"],
-        "Text"
-    );
-    assert_eq!(
-        responses[1]["report"]["metadata"]["diagnostics"],
-        serde_json::json!([])
-    );
+    assert_eq!(responses[1]["report"]["schema_version"], 3);
+    assert_eq!(responses[1]["report"]["metadata"]["format"]["type"], "text");
+    assert!(responses[1]["report"].get("diagnostics").is_none());
     assert!(
         !responses[1]["report"]["content"]["units"][0]["text"]
             .as_str()
