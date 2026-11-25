@@ -75,7 +75,7 @@ Safety rules enforced by traversal:
 - Network, FUSE, and unknown filesystem roots are rejected before traversal begins.
 - Non-regular, non-link entries are skipped without records; subdirectories require `--recursive`.
 - Non-UTF-8 paths emit a failed diagnostic record instead of a report.
-- Directory inventory and artifact publication are Linux-only; other platforms report the operation as unsupported.
+- Linux and macOS support directory inventory and private artifact publication. Other platforms report these operations as unsupported.
 - `--output-dir` must sit outside the scanned directory.
 
 A skipped link or mount makes the aggregate exit 2 (`partial`).
@@ -131,7 +131,7 @@ Checks cover:
 - Workflow syntax and expressions using pinned `actionlint`.
 - Clippy with warnings denied, full downstream workspace tests, and Python automation tests.
 - Release builds and smoke checks: schema v3 inspection, extraction, batch requests, and offline OCR failure behavior.
-- Linux x64 and ARM64 on standard GitHub-hosted runners.
+- Linux x64, Linux ARM64, and macOS Apple Silicon (`macos-latest`) on standard GitHub-hosted runners.
 
 Upstream dependency changes also trigger downstream checks.
 Change detection skips heavy jobs for unrelated changes while keeping `Glassbox downstream gate` reporting cleanly.

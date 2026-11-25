@@ -211,9 +211,10 @@ fn invalid_directory_modes_return_64_and_extract_rejects_directories() {
 
 /// Verifies non-Unicode filenames produce valid diagnostics and later files continue.
 ///
-/// Accepts no parameters. Returns unit after one ordered directory run. A panic,
-/// invalid JSONL record, lost later file, or non-operational aggregate panics.
-#[cfg(unix)]
+/// Accepts no parameters. Returns unit after one ordered directory run on Linux
+/// (macOS APFS rejects non-UTF-8 filenames at creation). A panic, invalid JSONL
+/// record, lost later file, or non-operational aggregate panics.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_filename_does_not_panic_or_stop_inventory() {
     use std::os::unix::ffi::OsStringExt;
@@ -382,7 +383,7 @@ fn concurrent_artifact_writers_are_exclusive() {
 /// on a tree spanning sibling branches and a chain exceeding the 256-level depth cap.
 /// Out-of-order records, missing digests, unguarded depth traversal, or wrong exit status
 /// panics; the temporary tree is cleaned up afterward.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn deep_recursive_inventory_preserves_order_and_guards_depth() {
     let root = workdir("deep-recursive").canonicalize().unwrap();

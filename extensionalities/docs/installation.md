@@ -62,11 +62,18 @@ This feature is not fully verified yet.
 
 ## Platform coverage
 
-Glassbox is developed and locally tested on Linux ARM64 (aarch64).
-Linux x64 is required for release coverage and is not yet verified locally.
-The Glassbox CI workflow targets Linux x64 and ARM64.
-Other platforms inherit the upstream prerequisites and remain unverified.
-Artifact saving and directory inventory are Linux-only.
+Local development tests Glassbox on Linux ARM64 (aarch64).
+The Glassbox CI workflow targets Linux x64, Linux ARM64, and macOS Apple Silicon (`macos-latest`).
+GitHub Actions CI verifies Linux x64 and macOS.
+Linux and macOS support private artifact saving and directory inventory.
+Other platforms report these operations as unsupported and remain unverified.
+
+On macOS, install native OCR dependencies with Homebrew before building:
+
+```sh
+brew install tesseract leptonica
+export TESSDATA_PREFIX="$(brew --prefix)/share/tessdata"
+```
 
 ## Verify the build
 

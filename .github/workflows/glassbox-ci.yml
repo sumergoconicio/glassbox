@@ -63,22 +63,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_TARGET_DIR: ${{ github.workspace }}/extensionalities/target/ci
       CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/extensionalities/target/ci
-      TESSDATA_PREFIX: /usr/share/tesseract-ocr/5/tessdata
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Install native dependencies and English OCR data
+      - name: Install native dependencies and English OCR data (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build pkg-config libtesseract-dev libleptonica-dev tesseract-ocr-eng poppler-utils
+          echo "TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata" >> "$GITHUB_ENV"
+      - name: Install native dependencies and English OCR data (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tesseract leptonica
+          echo "TESSDATA_PREFIX=$(brew --prefix)/share/tessdata" >> "$GITHUB_ENV"
       - run: rustup toolchain install stable --profile minimal --component clippy
       - run: rustup default stable
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -87,6 +93,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/pdfium-rs
+            ~/Library/Caches/pdfium-rs
           key: glassbox-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'extensionalities/Cargo.lock') }}
       - run: python3 -B extensionalities/scripts/ci.py check
 

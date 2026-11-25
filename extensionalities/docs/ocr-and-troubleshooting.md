@@ -60,9 +60,11 @@ Both use upstream PDFium and OCR stages. Their selection, reports, output format
 | Exit 2 with `unsupported` on an identified file | The format has no content reader. See [formats and limits](formats.md). |
 | Exit 2 on DjVu or Parquet extraction | These formats are identification-only. Inspection completes; extraction does not. |
 | Exit 1 on `extract` of a directory | Extraction reads single files. Inventory directories with `inspect DIR`. |
-| Inventory reports the operation as unavailable | Directory inventory requires Linux mountinfo. Run it on Linux. |
+| Inventory reports the operation as unavailable | Linux (`/proc/self/mountinfo`) and macOS (local `fstatfs` and `st_dev` checks) support directory inventory. Run it on Linux or macOS. |
 | Inventory exits 2 with `symlink_skipped` or `cross_mount_skipped` | Safety rules skipped those entries. Do not expect their reports. |
 | Inventory rejects the root as non-local | Network mounts such as NFS or CIFS are rejected by design. Copy files to a local filesystem. |
+| macOS inventory rejects `/tmp` or `/var` as a symbolic link | `/tmp` and `/var` are macOS symbolic links to `/private/tmp` and `/private/var`. Pass the real path under `/private/tmp` or `/private/var`. |
+| macOS inventory emits `cloud_placeholder_skipped` (`Partial`) | Glassbox skips iCloud or FileProvider dataless placeholders (`SF_DATALESS`) without triggering a network download. |
 | `metadata_cap_exceeded` or `content_limit` diagnostics | A fixed cap applied. Output is partial and disclosed. Caps are not configurable. |
 | OCR diagnostic mentions missing `eng.traineddata` | Install Tesseract language data and set `TESSDATA_PREFIX`. |
 | OCR diagnostic names another missing model, such as `zz.traineddata` | The requested `--ocr-language` has no local model. Install it or choose an available language. |

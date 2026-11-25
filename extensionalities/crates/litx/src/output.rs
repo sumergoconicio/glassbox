@@ -6,55 +6,19 @@ use glassbox_inspect::reports::{
     Artifact, ArtifactKind, Completeness, Diagnostic, DiagnosticSeverity, DiagnosticStage,
     DigestReport, DocumentMetadata, ExtractReport, MetadataReport, OperationStatus,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 
-#[cfg(target_os = "linux")]
-const AT_EMPTY_PATH: i32 = 0x1000;
-#[cfg(target_os = "linux")]
-const AT_FDCWD: i32 = -100;
-#[cfg(target_os = "linux")]
-const AT_SYMLINK_FOLLOW: i32 = 0x400;
-#[cfg(target_os = "linux")]
-const O_CLOEXEC: i32 = 0x80000;
-#[cfg(target_os = "linux")]
-const O_WRONLY: i32 = 1;
-#[cfg(target_os = "linux")]
-const O_CREAT: i32 = 0x40;
-#[cfg(target_os = "linux")]
-const O_EXCL: i32 = 0x80;
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_DIRECTORY: i32 = 0x4000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
-const O_DIRECTORY: i32 = 0x10000;
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_NOFOLLOW: i32 = 0x8000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
-const O_NOFOLLOW: i32 = 0x20000;
-#[cfg(target_os = "linux")]
-const O_TMPFILE: i32 = 0x400000 | O_DIRECTORY;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn open(path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
-    fn openat(dirfd: i32, path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
-    fn linkat(
-        olddirfd: i32,
-        oldpath: *const std::os::raw::c_char,
-        newdirfd: i32,
-        newpath: *const std::os::raw::c_char,
-        flags: i32,
-    ) -> i32;
-    fn unlinkat(dirfd: i32, path: *const std::os::raw::c_char, flags: i32) -> i32;
-}
-
-/// One fully encoded artifact awaiting anonymous temporary-file publication.
+/// One fully encoded artifact awaiting private temporary-file publication.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct PendingArtifact {
-    /// Public path and typed artifact facts included in the v2 report.
+    /// Public path and typed artifact facts included in the v3 report.
     artifact: Artifact,
     /// Complete bytes written before any public directory entry is created.
     bytes: Vec<u8>,
@@ -218,15 +182,20 @@ pub(crate) fn initialize_output_directory(directory: &Path) -> std::io::Result<P
 /// Opens the final output directory without following a symbolic link.
 ///
 /// Accepts a validated absolute directory path. Returns an owned directory
-/// handle anchored for anonymous file creation. Missing paths, links, and host
-/// open errors are returned without creating output files.
-#[cfg(target_os = "linux")]
+/// handle anchored for private temporary file creation. Missing paths, links,
+/// and host open errors are returned without creating output files.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
     let path_string = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in output path"))?;
     // SAFETY: path_string is NUL-terminated and alive for the call; open copies it.
-    let descriptor = unsafe { open(path_string.as_ptr(), O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) };
+    let descriptor = unsafe {
+        libc::open(
+            path_string.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if descriptor < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -236,14 +205,16 @@ fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// One prepared artifact awaiting its final public name.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum PreparedFile {
     /// Unnamed temporary inode created through O_TMPFILE and held open until
     /// one of the descriptor linking strategies publishes it.
+    #[cfg(target_os = "linux")]
     Anonymous(std::fs::File),
-    /// Private staged temporary name holding the complete bytes; used when
-    /// the kernel or filesystem rejects anonymous O_TMPFILE creation. The
-    /// guard removes the staged name on drop unless publication disarms it.
+    /// Private staged temporary name holding the complete bytes. On Linux this
+    /// is used when the kernel or filesystem rejects anonymous O_TMPFILE
+    /// creation; on macOS it is the primary publication path. The guard removes
+    /// the staged name on drop unless publication disarms it.
     Staged(StagedName),
 }
 
@@ -256,13 +227,14 @@ enum PreparedFile {
 #[cfg(target_os = "linux")]
 fn open_anonymous(directory_fd: i32, dot: &std::ffi::CStr) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
-    // SAFETY: dot is NUL-terminated and O_TMPFILE creates a new unnamed inode.
+    // SAFETY: dot is NUL-terminated and O_TMPFILE creates a new unnamed inode;
+    // passing mode as c_uint satisfies variadic openat ABI promotion rules.
     let descriptor = unsafe {
-        openat(
+        libc::openat(
             directory_fd,
             dot.as_ptr(),
-            O_WRONLY | O_TMPFILE | O_CLOEXEC,
-            0o600,
+            libc::O_WRONLY | libc::O_TMPFILE | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
         )
     };
     if descriptor < 0 {
@@ -371,23 +343,74 @@ where
     directory.sync_all()
 }
 
+/// Creates, writes, and links private staged temporary files without overwriting.
+///
+/// Accepts an anchored output-directory handle, complete pending artifacts, and
+/// the publication ledger. Returns unit after every file is written and synced
+/// into a private 0600 staged name, linked atomically with no-replace
+/// semantics, its staged name removed, and the directory synced. Any failure
+/// removes every remaining staged name through its RAII guard; already linked
+/// complete files stay listed in `published` and are never truncated or removed.
+#[cfg(target_os = "macos")]
+fn publish_prepared(
+    directory: &std::fs::File,
+    pending: Vec<PendingArtifact>,
+    published: &mut Vec<Artifact>,
+) -> std::io::Result<()> {
+    publish_staged_with(directory, pending, published, open_staged)
+}
+
+/// Creates, writes, and publishes private staged files through an injected opener.
+///
+/// Accepts an anchored output-directory handle, complete pending artifacts,
+/// the publication ledger, and the staged-name opener. Returns unit after every
+/// file is written and synced into a private staged name, linked atomically
+/// with no-replace semantics, its staged name removed, and the directory
+/// synced. Any preparation, link, or cleanup error removes every remaining
+/// staged name through its RAII guard; already linked complete files stay
+/// listed in `published` and are never truncated or removed. Injecting the
+/// opener lets tests verify cleanup on staged preparation failure without
+/// global state.
+#[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+fn publish_staged_with<S>(
+    directory: &std::fs::File,
+    pending: Vec<PendingArtifact>,
+    published: &mut Vec<Artifact>,
+    mut open_staged: S,
+) -> std::io::Result<()>
+where
+    S: FnMut(i32) -> std::io::Result<StagedName>,
+{
+    use std::os::fd::AsRawFd;
+    let directory_fd = directory.as_raw_fd();
+    let mut temporary: Vec<(PreparedFile, Artifact, Vec<u8>)> = Vec::new();
+    for item in pending {
+        let prepared = prepare_staged_with(directory_fd, &item.bytes, &mut open_staged)?;
+        temporary.push((prepared, item.artifact, Vec::new()));
+    }
+    publish_prepared_files(directory_fd, temporary, published)?;
+    directory.sync_all()
+}
+
 /// Publishes prepared artifacts and leaves no staged name behind.
 ///
 /// Accepts the anchored directory descriptor, prepared artifacts with their
 /// complete bytes, and the publication ledger. Returns unit after each file
-/// is linked under its final name with no-replace semantics; anonymous files
-/// use the strongest descriptor linking strategy and staged files link
-/// directly. Every staged name is owned by a guard that removes it on drop,
-/// so an invalid filename on the popped artifact, a failed link, or an
-/// abandoned pending artifact cannot leak a temporary name; artifacts linked
-/// before a failure stay listed in `published`.
-#[cfg(target_os = "linux")]
+/// is linked under its final name with no-replace semantics; on Linux,
+/// anonymous files use the strongest descriptor linking strategy and staged
+/// files link directly, while on macOS all files publish through staged names.
+/// Every staged name is owned by a guard that removes it on drop, so an invalid
+/// filename on the popped artifact, a failed link, or an abandoned pending
+/// artifact cannot leak a temporary name; artifacts linked before a failure
+/// stay listed in `published`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_prepared_files(
     directory_fd: i32,
     prepared: Vec<(PreparedFile, Artifact, Vec<u8>)>,
     published: &mut Vec<Artifact>,
 ) -> std::io::Result<()> {
     let mut items: std::collections::VecDeque<(PreparedFile, Artifact, Vec<u8>)> = prepared.into();
+    #[cfg(target_os = "linux")]
     let mut empty_path_usable = true;
     while let Some((prepared, artifact, bytes)) = items.pop_front() {
         let file_name = artifact.path.file_name().ok_or_else(|| {
@@ -396,6 +419,7 @@ fn publish_prepared_files(
         let name = std::ffi::CString::new(file_name.as_bytes()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename")
         })?;
+        #[cfg(target_os = "linux")]
         match prepared {
             PreparedFile::Anonymous(file) => {
                 publish_one(directory_fd, &file, &bytes, &name, &mut empty_path_usable)?;
@@ -403,6 +427,12 @@ fn publish_prepared_files(
             PreparedFile::Staged(staged) => {
                 staged.publish(&name)?;
             }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (directory_fd, bytes);
+            let PreparedFile::Staged(staged) = prepared;
+            staged.publish(&name)?;
         }
         published.push(artifact);
     }
@@ -439,12 +469,12 @@ fn link_empty_path(
     // SAFETY: both descriptors are valid; the empty path with AT_EMPTY_PATH
     // selects the temporary descriptor; linkat never replaces an existing name.
     let result = unsafe {
-        linkat(
+        libc::linkat(
             file.as_raw_fd(),
             empty.as_ptr(),
             directory_fd,
             name.as_ptr(),
-            AT_EMPTY_PATH,
+            libc::AT_EMPTY_PATH,
         )
     };
     if result != 0 {
@@ -474,12 +504,12 @@ fn link_procfs(
     // directory argument is unused; AT_SYMLINK_FOLLOW resolves the procfs link
     // to the anonymous inode and linkat never replaces an existing name.
     let result = unsafe {
-        linkat(
-            AT_FDCWD,
+        libc::linkat(
+            libc::AT_FDCWD,
             descriptor.as_ptr(),
             directory_fd,
             name.as_ptr(),
-            AT_SYMLINK_FOLLOW,
+            libc::AT_SYMLINK_FOLLOW,
         )
     };
     if result != 0 {
@@ -494,7 +524,7 @@ fn link_procfs(
 /// Accepts no parameters. Returns a NUL-terminated hidden name mixing the
 /// process ID, a monotonic counter, and the current nanosecond clock so
 /// concurrent writers never share a staged name.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn staged_name() -> std::io::Result<std::ffi::CString> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -516,7 +546,7 @@ fn staged_name() -> std::io::Result<std::ffi::CString> {
 /// so no code path — an early return, a failed validation, a failed link, or
 /// an abandoned pending artifact — can leak a temporary name; publication
 /// disarms the guard only after the staged name is gone.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StagedName {
     /// Open 0600 handle to the staged file.
     file: std::fs::File,
@@ -528,7 +558,7 @@ struct StagedName {
     armed: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl StagedName {
     /// Writes and syncs the complete bytes into the staged file.
     ///
@@ -552,7 +582,7 @@ impl StagedName {
         // SAFETY: both descriptors are valid; linkat never replaces an
         // existing name, keeping no-overwrite semantics intact.
         let result = unsafe {
-            linkat(
+            libc::linkat(
                 self.directory_fd,
                 self.name.as_ptr(),
                 self.directory_fd,
@@ -564,7 +594,7 @@ impl StagedName {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: directory_fd is valid and flags 0 remove a non-directory name.
-        let removed = unsafe { unlinkat(self.directory_fd, self.name.as_ptr(), 0) } == 0;
+        let removed = unsafe { libc::unlinkat(self.directory_fd, self.name.as_ptr(), 0) } == 0;
         self.armed = false;
         if !removed {
             return Err(std::io::Error::last_os_error());
@@ -573,14 +603,14 @@ impl StagedName {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for StagedName {
     fn drop(&mut self) {
         if self.armed {
             // SAFETY: directory_fd stays valid for the guard's lifetime and
             // flags 0 remove a non-directory name; removal is best effort
             // because the original failure is the reported error.
-            let _ = unsafe { unlinkat(self.directory_fd, self.name.as_ptr(), 0) };
+            let _ = unsafe { libc::unlinkat(self.directory_fd, self.name.as_ptr(), 0) };
         }
     }
 }
@@ -592,19 +622,19 @@ impl Drop for StagedName {
 /// O_NOFOLLOW creation, so a squatted link is never followed, concurrent
 /// writers never share a staged name, and the staged name is removed whenever
 /// the guard drops without publication.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_staged(directory_fd: i32) -> std::io::Result<StagedName> {
     use std::os::fd::FromRawFd;
     let name = staged_name()?;
     // SAFETY: directory_fd is valid; O_CREAT with O_EXCL and O_NOFOLLOW either
     // creates the staged name once with mode 0600 or fails without following a
-    // squatted link.
+    // squatted link. Passing mode as c_uint satisfies Darwin ARM64 variadic ABI.
     let descriptor = unsafe {
-        openat(
+        libc::openat(
             directory_fd,
             name.as_ptr(),
-            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-            0o600,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
         )
     };
     if descriptor < 0 {
@@ -624,7 +654,7 @@ fn open_staged(directory_fd: i32) -> std::io::Result<StagedName> {
 /// Accepts the anchored directory descriptor, the complete bytes, and the
 /// staged-name opener. Returns the armed staged guard after the bytes are
 /// written and synced; any failure removes the staged name through the guard.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_staged_with<G>(
     directory_fd: i32,
     bytes: &[u8],
@@ -646,7 +676,7 @@ where
 /// no-replace semantics, and the staged name is removed on every path. A write,
 /// link, or cleanup failure is returned; an existing final name fails with
 /// AlreadyExists without changing its bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", test)))]
 fn link_staging(directory_fd: i32, name: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
     let mut staged = open_staged(directory_fd)?;
     staged.write(bytes)?;
@@ -724,13 +754,13 @@ where
     }
 }
 
-/// Publishes complete v2 artifacts into one private no-follow output directory.
+/// Publishes complete v3 artifacts into one private no-follow output directory.
 ///
 /// Accepts a destination directory and fully serialized artifact payloads.
 /// Returns published typed paths on success. Directory, link, serialization,
 /// write, collision, and sync failures return OutputFailure; concurrent or
 /// existing names are never replaced and no named temporary files are leaked.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish(
     directory: &Path,
     pending: Vec<PendingArtifact>,
@@ -754,18 +784,19 @@ fn publish(
     Ok(published)
 }
 
-/// Reports unsupported anonymous publication on non-Linux hosts without writes.
+/// Reports unsupported private artifact publication on unsupported hosts without writes.
 ///
 /// Accepts a directory and pending artifacts. Returns an operational failure;
-/// no destination is created, truncated, or followed. Native Linux publication
-/// is the verified implementation for this task.
-#[cfg(not(target_os = "linux"))]
+/// no destination is created, truncated, or followed. Native Linux and macOS
+/// publication are the verified implementations.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish(
     _directory: &Path,
     _pending: Vec<PendingArtifact>,
 ) -> Result<Vec<Artifact>, OutputFailure> {
     Err(OutputFailure {
-        message: "safe anonymous artifact publication is currently supported on Linux only".into(),
+        message: "safe private artifact publication is currently supported on Linux and macOS only"
+            .into(),
         published: vec![],
     })
 }
@@ -1172,7 +1203,7 @@ mod tests {
     /// Accepts no parameters. Returns unit after one publication and one exact
     /// retry. Wrong bytes, public modes, replaced names, or leftover temporary
     /// names panic; the scratch tree is removed after the assertions.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn publish_is_private_no_overwrite_and_leak_free() {
         let root =
@@ -1372,7 +1403,7 @@ mod tests {
     /// Accepts no parameters. Returns unit after one staged publication and one
     /// colliding retry. Replaced bytes, leaked staged names, or a missing
     /// AlreadyExists rejection panic; no anonymous inode is involved.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn staging_fallback_is_private_no_overwrite_and_clean() {
         use std::os::fd::AsRawFd;
@@ -1700,13 +1731,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Checks a failed second staged preparation removes earlier staged names.
+    ///
+    /// Accepts no parameters. Returns unit after `publish_staged_with` prepares
+    /// the first artifact through a private staged name and fails the second
+    /// staged creation with `EACCES`. A surviving temporary name, unexpected
+    /// error code, or non-empty published list panics; the scratch tree is
+    /// removed after the assertions.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn staged_publication_failure_removes_earlier_staged_names() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!(
+            "staged-publish-fail-{}-{stamp}",
+            std::process::id()
+        ));
+        prepare_directory(&directory).expect("private output created");
+        let handle = open_directory(&directory).expect("output directory opened");
+        let first = Artifact {
+            kind: ArtifactKind::MetadataSummary,
+            path: directory.join("one.md"),
+            source: glassbox_inspect::reports::FactSource::GeneratedArtifact,
+            completeness: Completeness::Exact,
+            width: None,
+            height: None,
+        };
+        let second = Artifact {
+            kind: ArtifactKind::MetadataJson,
+            path: directory.join("two.json"),
+            source: glassbox_inspect::reports::FactSource::GeneratedArtifact,
+            completeness: Completeness::Exact,
+            width: None,
+            height: None,
+        };
+        let mut published = Vec::new();
+        let mut staged_opens = 0;
+        let error = publish_staged_with(
+            &handle,
+            vec![
+                PendingArtifact {
+                    artifact: first,
+                    bytes: b"first".to_vec(),
+                },
+                PendingArtifact {
+                    artifact: second,
+                    bytes: b"second".to_vec(),
+                },
+            ],
+            &mut published,
+            |directory_fd: i32| -> std::io::Result<StagedName> {
+                staged_opens += 1;
+                if staged_opens == 1 {
+                    open_staged(directory_fd)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                }
+            },
+        )
+        .expect_err("the second staged preparation fails");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(published.is_empty());
+        let names: Vec<String> = std::fs::read_dir(&directory)
+            .expect("output directory readable")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "no staged name survives the failed preparation: {names:?}"
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Checks a colliding staged publication cleans both failing and pending names.
+    ///
+    /// Accepts no parameters. Returns unit after `publish_staged_with` prepares
+    /// two staged files where the first collides with a pre-existing filename.
+    /// Replaced bytes, a missing `AlreadyExists` error, or any surviving staged
+    /// temporary file panics; the scratch tree is removed after the assertions.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn staged_publication_cleans_pending_names_after_collision() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!("staged-collision-{}-{stamp}", std::process::id()));
+        prepare_directory(&directory).expect("private output created");
+        let handle = open_directory(&directory).expect("output directory opened");
+        std::fs::write(directory.join("one.md"), b"original").expect("existing name created");
+        let colliding = Artifact {
+            kind: ArtifactKind::MetadataSummary,
+            path: directory.join("one.md"),
+            source: glassbox_inspect::reports::FactSource::GeneratedArtifact,
+            completeness: Completeness::Exact,
+            width: None,
+            height: None,
+        };
+        let pending = Artifact {
+            kind: ArtifactKind::MetadataJson,
+            path: directory.join("two.json"),
+            source: glassbox_inspect::reports::FactSource::GeneratedArtifact,
+            completeness: Completeness::Exact,
+            width: None,
+            height: None,
+        };
+        let mut published = Vec::new();
+        let error = publish_staged_with(
+            &handle,
+            vec![
+                PendingArtifact {
+                    artifact: colliding,
+                    bytes: b"changed".to_vec(),
+                },
+                PendingArtifact {
+                    artifact: pending,
+                    bytes: b"{}".to_vec(),
+                },
+            ],
+            &mut published,
+            open_staged,
+        )
+        .expect_err("an existing name must never be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(published.is_empty());
+        assert_eq!(
+            std::fs::read(directory.join("one.md")).expect("original retained"),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "only the pre-existing name remains"
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// Checks an invalid filename drops the popped staged entry's name.
     ///
     /// Accepts no parameters. Returns unit after handing publish_prepared_files
     /// one staged entry whose artifact path has no final filename. A rejection
     /// other than InvalidInput or a staged name surviving the popped entry
     /// panics; the scratch tree is removed after the assertions.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn invalid_filename_drops_the_popped_staged_name() {
         use std::os::fd::AsRawFd;
@@ -1753,7 +1928,7 @@ mod tests {
     /// the saved `.json` artifact, then verifying a colliding publish downgrades
     /// Exact completeness to Partial while keeping Unavailable unchanged. Any
     /// mismatch or I/O error panics; the scratch tree is removed afterward.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn persist_extract_keeps_unavailable_completeness_consistent_with_saved_json() {
         let root =
