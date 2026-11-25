@@ -19,7 +19,9 @@ name = "litx"
 path = "src/bin/litx.rs"
 
 [features]
-default = []
+default = ["ocria-nano"]
+ocria-nano = ["liteparse/ocria-nano"]
+ocr-serve = ["ocria-nano", "liteparse/ocr-serve"]
 magika = ["glassbox-inspect/magika"]
 ffmpeg-link = ["glassbox-inspect/ffmpeg-link"]
 
