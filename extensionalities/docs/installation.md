@@ -85,3 +85,14 @@ The fixture inspection exits 0 and prints a plain-text summary starting with `Sc
 This project currently provides no published Glassbox packages; build from source.
 Published LiteParse packages install upstream tools, not Glassbox.
 Upstream code, license, and attribution stay in the repository root.
+
+## Optional Magika 2 detector
+
+The `magika` feature pins Magika `2.0.0-rc.0`. This prerelease uses its bundled CPU model through tract.
+Magika needs no ONNX Runtime library and performs no runtime downloads.
+It adds a statistical claim without replacing the verified file identity.
+The claim records the engine and backend. Confidence scores are omitted.
+LiteParse retains OCRia and its `ort` `2.0.0-rc.15` dependency. Tesseract remains enabled.
+OCRia still requires its separate local models and runtime.
+Use `glassbox parse models --help` for upstream model commands. The `ocr-serve` build feature forwards upstream server support.
+These commands retain upstream download behavior when the user explicitly requests model installation.

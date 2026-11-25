@@ -345,10 +345,8 @@ pub(crate) fn detect(path: &Path, report: &mut InspectReport) -> std::io::Result
         detector: "file-format".into(),
     };
     #[cfg(feature = "magika")]
-    if !conclusive {
-        if let Err(error) = magika_fallback(&prefix, report) {
-            report.error("magika", error);
-        }
+    if !conclusive && let Err(error) = magika_fallback(&prefix, report) {
+        report.error("magika", error);
     }
     Ok(())
 }
@@ -383,25 +381,30 @@ pub(crate) fn identify(
 }
 #[cfg(feature = "magika")]
 fn magika_fallback(prefix: &[u8], report: &mut InspectReport) -> crate::xml::Result<()> {
-    let path = std::env::var_os("ORT_DYLIB_PATH")
-        .ok_or("optional Magika requires ORT_DYLIB_PATH; no runtime is downloaded")?;
-    if !Path::new(&path).is_file() {
-        return Err("ORT_DYLIB_PATH is not a regular file".into());
-    }
-    ort::init_from(path)?.commit();
-    let mut session = magika::Builder::default()
-        .with_intra_threads(2)
-        .with_inter_threads(1)
-        .build()?;
-    let found = session.identify_content_sync(prefix)?;
+    // Share prepared CPU plans while each request owns its mutable session.
+    // Magika 2 uses tract and leaves ONNX Runtime exclusively to upstream OCRia.
+    static RUNTIME: std::sync::OnceLock<Result<magika::Runtime, String>> =
+        std::sync::OnceLock::new();
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            magika::Runtime::builder()
+                .with_backend(magika::Backend::Cpu)
+                .with_max_batch(1)
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| format!("optional Magika initialization failed: {error}"))?;
+    let mut session = runtime.session()?;
+    let found = session.identify_content(prefix)?;
     let info = found.info();
     report.claims.push(crate::Claim {
         key: "magika_detection".into(),
         value: format!(
-            "{}; score={}; sampled_bytes={}",
+            "{}; sampled_bytes={}; engine=magika-2.0.0-rc.0; backend={}",
             info.label,
-            found.score(),
-            prefix.len()
+            prefix.len(),
+            runtime.backend_info().implementation()
         ),
         source: "bytes",
     });
