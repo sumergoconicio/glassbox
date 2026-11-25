@@ -472,6 +472,43 @@ class GateTests(unittest.TestCase):
                     accepted = False
             self.assertEqual(accepted, values in valid, values)
 
+    def test_real_workflow_checks_matrix_covers_linux_and_macos_with_caches_and_tessdata(self):
+        """Verify glassbox-ci.yml checks matrix covers Linux and macOS with PDFium caches and OCR setup.
+
+        Accepts only self (GateTests).
+        Returns None after asserting matrix OS legs, PDFium cache paths, and OS-specific
+        TESSDATA_PREFIX/Homebrew configuration inside the checks job.
+        Raises AssertionError or OSError if the workflow file cannot be read or any contract regresses.
+        """
+        source = (ci.ROOT / ".github/workflows/glassbox-ci.yml").read_text(encoding="utf-8")
+        checks_section = source.split("\n  checks:\n", 1)[1].split("\n  gate:\n", 1)[0]
+        env_section, steps_section = checks_section.split("\n    steps:\n", 1)
+
+        matrix_line = next(
+            line.strip() for line in env_section.splitlines() if line.strip().startswith("os:")
+        )
+        raw_oses = matrix_line.split("[", 1)[1].rsplit("]", 1)[0]
+        matrix_oses = [item.strip() for item in raw_oses.split(",") if item.strip()]
+        self.assertEqual(matrix_oses, ["ubuntu-24.04", "ubuntu-24.04-arm", "macos-latest"])
+        self.assertNotIn("TESSDATA_PREFIX:", env_section)
+
+        steps = steps_section.split("\n      - ")
+        linux_step = next(step for step in steps if "if: runner.os == 'Linux'" in step)
+        macos_step = next(step for step in steps if "if: runner.os == 'macOS'" in step)
+        cache_step = next(step for step in steps if "actions/cache@" in step)
+
+        self.assertIn(
+            'echo "TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata" >> "$GITHUB_ENV"',
+            linux_step,
+        )
+        self.assertIn("brew install tesseract leptonica", macos_step)
+        self.assertIn(
+            'echo "TESSDATA_PREFIX=$(brew --prefix)/share/tessdata" >> "$GITHUB_ENV"',
+            macos_step,
+        )
+        self.assertIn("~/.cache/pdfium-rs", cache_step)
+        self.assertIn("~/Library/Caches/pdfium-rs", cache_step)
+
     def test_requires_actual_named_gate_and_every_check_successful(self):
         self.assertFalse(sync.all_green([]))
         self.assertFalse(sync.all_green([{"name": "other", "state": "SUCCESS"}]))

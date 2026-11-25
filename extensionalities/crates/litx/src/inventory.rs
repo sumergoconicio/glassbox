@@ -2,49 +2,48 @@
 //! File: inventory.rs.
 //! Responsibility: Produce deterministic bounded schema v3 JSONL for local files without links or mount crossing.
 
-use glassbox_inspect::Inspector;
-use glassbox_inspect::reports::{
-    Completeness, ConsistencyStatus, Diagnostic, DiagnosticSeverity, DiagnosticStage,
-    InspectOptions, MetadataReport, OperationStatus,
-};
-use serde_json::Value;
+use glassbox_inspect::reports::OperationStatus;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use glassbox_inspect::Inspector;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use glassbox_inspect::reports::{
+    Completeness, ConsistencyStatus, Diagnostic, DiagnosticSeverity, DiagnosticStage,
+    InspectOptions, MetadataReport,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use serde_json::Value;
 
-#[cfg(target_os = "linux")]
-const O_CLOEXEC: i32 = 0x80000;
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_DIRECTORY: i32 = 0x4000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
-const O_DIRECTORY: i32 = 0x10000;
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_NOFOLLOW: i32 = 0x8000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
-const O_NOFOLLOW: i32 = 0x20000;
-#[cfg(target_os = "linux")]
-const O_NONBLOCK: i32 = 0x800;
-// O_PATH is 010000000 octal on every Linux port in scope (asm-generic value).
-#[cfg(target_os = "linux")]
-const O_PATH: i32 = 0x200000;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 /// Maximum directory recursion depth below the inventory root.
 ///
 /// Limits simultaneously open non-tail ancestor descriptors and recursion stack
 /// frames so deep directory trees emit a deterministic diagnostic instead of
 /// risking `EMFILE` or stack overflow.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_DIRECTORY_DEPTH: usize = 256;
 
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn open(path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
-    fn openat(dirfd: i32, path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
-}
+/// Darwin `<sys/stat.h>` file flag marking a cloud-evicted dataless placeholder.
+///
+/// Absent from `libc-0.2.191`, so defined explicitly for `fstatat` checks on
+/// macOS and cross-platform unit tests.
+#[cfg(any(target_os = "macos", test))]
+const SF_DATALESS: u32 = 0x4000_0000;
+
+/// Darwin `<sys/mount.h>` flag bit marking a filesystem mounted locally.
+#[cfg(target_os = "macos")]
+const MACOS_MNT_LOCAL: u32 = libc::MNT_LOCAL as u32;
+#[cfg(all(test, not(target_os = "macos")))]
+const MACOS_MNT_LOCAL: u32 = 0x0000_1000;
 
 /// One Linux mountinfo record used for ancestry and local-filesystem checks.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Mount {
     /// Kernel mount identifier; bind mounts differ even on one st_dev.
@@ -58,12 +57,14 @@ struct Mount {
 }
 
 /// Parsed mount table with longest-mount-point lookup.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default)]
 struct MountTable {
     /// Records in kernel observation order; later overmounts win ties.
     mounts: Vec<Mount>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl MountTable {
     /// Parses Linux mountinfo including octal-escaped paths and bind identities.
     ///
@@ -133,6 +134,7 @@ impl MountTable {
 /// Accepts one escaped mountinfo path field. Returns an owned OS string.
 /// Invalid trailing or non-octal escapes return errors; ordinary spaces and
 /// backslashes encoded by the kernel round-trip exactly.
+#[cfg(any(target_os = "linux", test))]
 fn decode_mount_path(value: &str) -> Result<std::ffi::OsString, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -171,6 +173,7 @@ fn decode_mount_path(value: &str) -> Result<std::ffi::OsString, String> {
 /// Accepts a filesystem type. Returns true only for local block, memory, or
 /// overlay filesystems. Network, FUSE, portal, and unknown types fail closed;
 /// no endpoint or mount is probed.
+#[cfg(any(target_os = "linux", test))]
 fn known_local_filesystem(filesystem: &str) -> bool {
     matches!(
         filesystem,
@@ -188,6 +191,89 @@ fn known_local_filesystem(filesystem: &str) -> bool {
             | "ntfs3"
             | "ufs"
     )
+}
+
+/// Reports whether a macOS `fstatfs` descriptor represents an approved local filesystem.
+///
+/// Accepts Darwin `statfs.f_flags` and the NUL-trimmed `f_fstypename`. Returns
+/// true only when `MNT_LOCAL` is set and the filesystem type is in the explicit
+/// local allowlist (`apfs`, `hfs`, `msdos`, `exfat`, `udf`, `tmpfs`). Network,
+/// FUSE, pseudo-filesystem, and unknown types fail closed without probing any
+/// external volume.
+#[cfg(any(target_os = "macos", test))]
+fn known_local_macos_filesystem(flags: u32, filesystem: &str) -> bool {
+    (flags & MACOS_MNT_LOCAL) != 0
+        && matches!(
+            filesystem,
+            "apfs" | "hfs" | "msdos" | "exfat" | "udf" | "tmpfs"
+        )
+}
+
+/// Reports whether a Darwin `stat.st_flags` word marks a cloud-evicted placeholder.
+///
+/// Accepts Darwin `st_flags`. Returns true when `SF_DATALESS` (`0x4000_0000`)
+/// is set so inventory skips evicted iCloud/FileProvider placeholders before
+/// calling `openat`, avoiding silent network hydration. No I/O occurs.
+#[cfg(any(target_os = "macos", test))]
+fn is_dataless_placeholder(st_flags: u32) -> bool {
+    (st_flags & SF_DATALESS) != 0
+}
+
+/// Queries Darwin filesystem metadata for an already-opened descriptor.
+///
+/// Accepts an open directory or file handle. Returns the kernel `statfs`
+/// record from `fstatfs` without re-resolving any filesystem path. Kernel
+/// errors are returned directly.
+#[cfg(target_os = "macos")]
+fn fstatfs_handle(handle: &std::fs::File) -> std::io::Result<libc::statfs> {
+    use std::os::fd::AsRawFd;
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `handle` is an open descriptor and `fs` is valid writable
+    // storage for `libc::statfs`; `fstatfs` initializes it on return 0.
+    if unsafe { libc::fstatfs(handle.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatfs` succeeded (returned 0) and populated `fs`.
+    Ok(unsafe { fs.assume_init() })
+}
+
+/// Extracts the two-word Darwin filesystem identifier from `libc::fsid_t`.
+///
+/// Accepts a Darwin `libc::fsid_t` value returned by `fstatfs`. Returns its
+/// `[i32; 2]` value words for mount-boundary comparison. Never fails; relies on
+/// the compile-time size assertion matching Darwin's `struct fsid { int32_t val[2]; }`.
+#[cfg(target_os = "macos")]
+fn fsid_value(fsid: libc::fsid_t) -> [i32; 2] {
+    let mut value = [0i32; 2];
+    const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[i32; 2]>());
+    // SAFETY: `libc::fsid_t` is `#[repr(C)]` containing `[i32; 2]` (plus a
+    // zero-sized `__non_exhaustive: ()` marker) with identical size and no
+    // uninitialized padding; copying raw bytes extracts the two Darwin words
+    // without relying on `libc`'s private field or `extra_traits`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&raw const fsid).cast::<u8>(),
+            value.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of::<[i32; 2]>(),
+        );
+    }
+    value
+}
+
+/// Extracts the NUL-terminated filesystem type name from a Darwin `statfs`.
+///
+/// Accepts a `libc::statfs` record. Returns the lossy UTF-8 filesystem type
+/// string (for example, `"apfs"`). Guarantees bounded inspection within the
+/// 16-byte `f_fstypename` buffer even without a trailing NUL.
+#[cfg(target_os = "macos")]
+fn macos_fstype_name(fs: &libc::statfs) -> String {
+    let bytes: Vec<u8> = fs
+        .f_fstypename
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte.to_ne_bytes()[0])
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Produces an absolute lexical path without resolving symbolic links.
@@ -219,14 +305,54 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(normalized)
 }
 
+/// Returns whether any non-symlink ancestor of `output` shares `root`'s Unix inode.
+///
+/// Accepts normalized absolute root and output paths. Returns true when `root`
+/// exists as a non-symlink and `output` or any of its existing non-symlink
+/// parent directories has the same `(st_dev, st_ino)` identity, blocking
+/// case-insensitive APFS aliasing (for example, `./Docs/out` against `./docs`).
+/// Missing paths or symlinks return false; no directory is opened or created.
+#[cfg(unix)]
+fn same_inode_ancestor(root: &Path, output: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return false;
+    };
+    if root_meta.file_type().is_symlink() {
+        return false;
+    }
+    let target = (root_meta.dev(), root_meta.ino());
+    let mut cursor = Some(output);
+    while let Some(dir) = cursor {
+        if let Ok(meta) = std::fs::symlink_metadata(dir)
+            && !meta.file_type().is_symlink()
+            && (meta.dev(), meta.ino()) == target
+        {
+            return true;
+        }
+        cursor = dir.parent();
+    }
+    false
+}
+
 /// Returns whether a proposed artifact directory is inside an inventory root.
 ///
-/// Accepts root and output paths. Returns lexical containment after absolute
-/// normalization, or a conservative true when normalization fails. No path is
-/// opened; callers reject the conflicting invocation before reading inputs.
+/// Accepts root and output paths. Returns true on lexical containment after
+/// absolute normalization, Unix `(st_dev, st_ino)` ancestor aliasing (blocking
+/// case-insensitive APFS paths), or conservative normalization failure. No path
+/// is opened; callers reject the conflicting invocation before reading inputs.
 pub(crate) fn output_inside_root(root: &Path, output: &Path) -> bool {
     match (absolute_lexical(root), absolute_lexical(output)) {
-        (Ok(root), Ok(output)) => output.starts_with(root),
+        (Ok(root), Ok(output)) => {
+            if output.starts_with(&root) {
+                return true;
+            }
+            #[cfg(unix)]
+            if same_inode_ancestor(&root, &output) {
+                return true;
+            }
+            false
+        }
         _ => true,
     }
 }
@@ -236,6 +362,7 @@ pub(crate) fn output_inside_root(root: &Path, output: &Path) -> bool {
 /// Accepts an absolute lexical path. Returns unit when existing components are
 /// non-links. Links and metadata errors are returned; missing suffixes are
 /// reported by the following no-follow directory open.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reject_symlink_components(path: &Path) -> std::io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -261,18 +388,62 @@ fn reject_symlink_components(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Clears the current thread's C `errno` slot before a `readdir` call.
+///
+/// Accepts no parameters. Returns unit after zeroing thread-local `errno` so a
+/// null `readdir` return distinguishes end-of-directory from an OS error.
+/// Never fails; delegates to the platform's libc thread-local accessor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: errno is cleared through the libc thread-local slot exactly
+    // like the standard library, so a null result can be distinguished.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: errno is cleared through Darwin's libc thread-local slot so a
+    // null readdir result can distinguish EOF from an OS error.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+/// Reads the current thread's C `errno` value after a null `readdir` result.
+///
+/// Accepts no parameters. Returns the current `libc::c_int` error code (zero
+/// at end-of-directory). Never fails; reads only the calling thread's slot.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_errno() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    // SAFETY: errno is read only after the null result that may set it.
+    unsafe {
+        *libc::__errno_location()
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: errno is read from Darwin's thread-local slot after null readdir.
+    unsafe {
+        *libc::__error()
+    }
+}
+
 /// Opens a directory without following its final link.
 ///
 /// Accepts an absolute directory path. Returns an anchored directory handle.
 /// Missing paths, non-directories, links, and permission failures are returned
 /// before enumeration.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
     // SAFETY: path is a valid NUL-terminated string and open copies it.
-    let descriptor = unsafe { open(path.as_ptr(), O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) };
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if descriptor < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -287,7 +458,7 @@ fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
 /// required. Returns an owned nonblocking handle and metadata. Replacement
 /// entries of the wrong type, final symlinks, and open/metadata errors are
 /// returned; regular-file hashing retains no borrowed path pointer.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_entry(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
@@ -296,9 +467,12 @@ fn open_entry(
     use std::os::fd::{AsRawFd, FromRawFd};
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
-    let flags = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | if directory { O_DIRECTORY } else { 0 };
+    let flags = libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | libc::O_NONBLOCK
+        | if directory { libc::O_DIRECTORY } else { 0 };
     // SAFETY: parent fd and name remain valid for the duration of openat.
-    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -325,7 +499,7 @@ fn open_entry(
 /// record's name is read through a raw field pointer so short kernel records
 /// never read out of bounds; enumeration errors are returned after the
 /// descriptor is closed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn anchored_names(handle: &std::fs::File) -> std::io::Result<Vec<std::ffi::OsString>> {
     use std::os::fd::AsRawFd;
     let owned = handle.try_clone()?;
@@ -340,15 +514,12 @@ fn anchored_names(handle: &std::fs::File) -> std::io::Result<Vec<std::ffi::OsStr
     std::mem::forget(owned);
     let mut names = Vec::new();
     loop {
-        // SAFETY: errno is cleared through the libc thread-local slot exactly
-        // like the standard library, so a null result can be distinguished.
-        unsafe { *libc::__errno_location() = 0 };
+        clear_errno();
         // SAFETY: stream comes from fdopendir; the returned record stays valid
         // until the next readdir call and remains owned by the stream.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            // SAFETY: errno is read only after the null result that may set it.
-            if unsafe { *libc::__errno_location() } != 0 {
+            if read_errno() != 0 {
                 let error = std::io::Error::last_os_error();
                 // SAFETY: stream ownership ends exactly once on every path.
                 let _ = unsafe { libc::closedir(stream) };
@@ -392,10 +563,10 @@ fn open_entry_metadata(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
     // SAFETY: parent descriptor and NUL-terminated name stay valid for the call.
     let descriptor = unsafe {
-        openat(
+        libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            O_PATH | O_NOFOLLOW | O_CLOEXEC,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if descriptor < 0 {
@@ -406,14 +577,128 @@ fn open_entry_metadata(
     file.metadata()
 }
 
-/// Backpressured inventory traversal state; file reports are produced by shared workers.
-struct Inventory<'a> {
-    /// Absolute no-follow root used for mount and output containment.
-    root: PathBuf,
-    /// Kernel mount identity that every visited entry must retain.
+/// Stats one directory entry relative to an anchored parent without following links.
+///
+/// Accepts a parent directory handle and entry name. Returns the raw Darwin
+/// `libc::stat` record obtained via `fstatat(..., AT_SYMLINK_NOFOLLOW)` without
+/// opening the entry, so FIFOs, devices, sockets, and dataless cloud files are
+/// never opened or hydrated during classification. NUL names and OS errors are
+/// returned directly.
+#[cfg(target_os = "macos")]
+fn entry_stat(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `parent` is an open directory descriptor, `name` is a valid
+    // NUL-terminated string, and `stat` is writable storage for `libc::stat`.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0 and populated `stat`.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// Platform-neutral classification of one directory entry before opening it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum EntryKind {
+    /// Entry is a symbolic link and must never be followed.
+    Symlink,
+    /// Entry is a subdirectory eligible for recursive descent.
+    Directory {
+        #[cfg(target_os = "macos")]
+        dev: u64,
+    },
+    /// Entry is a regular file eligible for inspection unless dataless on macOS.
+    RegularFile {
+        #[cfg(target_os = "macos")]
+        dev: u64,
+        #[cfg(target_os = "macos")]
+        dataless: bool,
+    },
+    /// Entry is a special file (FIFO, socket, device) skipped without opening.
+    Other,
+}
+
+/// Classifies one Linux directory entry through `O_PATH` without opening it.
+///
+/// Accepts an anchored parent handle and entry name. Returns an `EntryKind`
+/// distinguishing symlinks, directories, regular files, and special entries.
+/// `ELOOP` maps to `EntryKind::Symlink`; other OS errors are returned.
+#[cfg(target_os = "linux")]
+fn classify_entry(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<EntryKind> {
+    match open_entry_metadata(parent, name) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                Ok(EntryKind::Symlink)
+            } else if metadata.is_dir() {
+                Ok(EntryKind::Directory {})
+            } else if metadata.is_file() {
+                Ok(EntryKind::RegularFile {})
+            } else {
+                Ok(EntryKind::Other)
+            }
+        }
+        // ELOOP is Linux's link rejection; the O_PATH metadata open already
+        // yields symlink handles, so this only guards unusual kernel ports.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Ok(EntryKind::Symlink),
+        Err(error) => Err(error),
+    }
+}
+
+/// Classifies one macOS directory entry via `fstatat` without opening it.
+///
+/// Accepts an anchored parent handle and entry name. Returns an `EntryKind`
+/// carrying Darwin `st_dev` and `SF_DATALESS` status for pre-open mount and
+/// cloud-placeholder guards. NUL names and `fstatat` errors are returned.
+#[cfg(target_os = "macos")]
+fn classify_entry(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<EntryKind> {
+    let stat = entry_stat(parent, name)?;
+    let dev = stat.st_dev as u64;
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => Ok(EntryKind::Symlink),
+        libc::S_IFDIR => Ok(EntryKind::Directory { dev }),
+        libc::S_IFREG => Ok(EntryKind::RegularFile {
+            dev,
+            dataless: is_dataless_placeholder(stat.st_flags),
+        }),
+        _ => Ok(EntryKind::Other),
+    }
+}
+
+/// Linux root mount context backed by `/proc/self/mountinfo`.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct RootMount {
+    /// Kernel mount identifier that every visited entry must retain.
     root_mount: u64,
     /// Current-process mount snapshot, never a recursive mount scan.
     mounts: MountTable,
+}
+
+/// macOS root mount context backed by anchored `fstatfs` and `fstat` identity.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct RootMount {
+    /// Device number (`st_dev`) of the anchored inventory root.
+    root_dev: u64,
+    /// Darwin filesystem identifier (`statfs.f_fsid`) of the anchored root.
+    root_fsid: [i32; 2],
+}
+
+/// Backpressured inventory traversal state; file reports are produced by shared workers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Inventory<'a> {
+    /// Platform mount identity that every visited entry must retain.
+    mount: RootMount,
     /// Opt-in recursion flag; false lists only immediate regular files.
     recursive: bool,
     /// Deterministic admission sequence shared by success and diagnostics.
@@ -422,22 +707,19 @@ struct Inventory<'a> {
     producer: &'a mut crate::batch::BatchProducer,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<'a> Inventory<'a> {
     /// Creates traversal state without reading file contents.
     ///
-    /// Accepts root/mount context, recursion flag, and bounded batch producer.
+    /// Accepts root mount context, recursion flag, and bounded batch producer.
     /// Returns an empty-sequence enumerator. No directory or native reader runs.
     fn new(
-        root: PathBuf,
-        root_mount: u64,
-        mounts: MountTable,
+        mount: RootMount,
         recursive: bool,
         producer: &'a mut crate::batch::BatchProducer,
     ) -> Self {
         Self {
-            root,
-            root_mount,
-            mounts,
+            mount,
             recursive,
             sequence: 0,
             producer,
@@ -525,18 +807,19 @@ impl<'a> Inventory<'a> {
         )
     }
 
-    /// Checks one path's mount identity against the root before any entry read.
+    /// Checks one Linux path's mount identity against the root before any entry read.
     ///
     /// Accepts a candidate path. Returns Some(true) for root mount, Some(false)
     /// after a skip diagnostic, or None after cancellation. Unknown mounts fail
     /// closed with an operational diagnostic; no candidate subtree is entered.
+    #[cfg(target_os = "linux")]
     fn same_mount(&mut self, path: &Path) -> Result<Option<bool>, String> {
-        match self.mounts.find(path) {
-            Some(mount) if mount.id == self.root_mount => Ok(Some(true)),
+        match self.mount.mounts.find(path) {
+            Some(mount) if mount.id == self.mount.root_mount => Ok(Some(true)),
             Some(mount) => {
                 let detail = format!(
                     "mount ID {} ({}) differs from root mount {}; subtree skipped",
-                    mount.id, mount.filesystem, self.root_mount
+                    mount.id, mount.filesystem, self.mount.root_mount
                 );
                 if !self.error(
                     path,
@@ -562,6 +845,99 @@ impl<'a> Inventory<'a> {
         }
     }
 
+    /// Checks one macOS entry's device number against the root volume.
+    ///
+    /// Accepts a candidate path, observed `st_dev`, and diagnostic scope label
+    /// (`"subtree"` or `"entry"`). Returns Some(true) on match, Some(false)
+    /// after emitting `cross_mount_skipped`, or None on cancellation. Queue
+    /// disconnect errors are returned directly.
+    #[cfg(target_os = "macos")]
+    fn same_mount_device(
+        &mut self,
+        path: &Path,
+        dev: u64,
+        label: &str,
+    ) -> Result<Option<bool>, String> {
+        if dev == self.mount.root_dev {
+            return Ok(Some(true));
+        }
+        let detail = format!(
+            "device {dev} differs from root device {}; {label} skipped",
+            self.mount.root_dev
+        );
+        if !self.error(
+            path,
+            "cross_mount_skipped",
+            detail,
+            OperationStatus::Partial,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(false))
+    }
+
+    /// Re-verifies an opened macOS subdirectory stays on the root mount.
+    ///
+    /// Accepts the subdirectory path, its opened handle, and `fstat` metadata.
+    /// Returns Some(true) when both `st_dev` and `fstatfs.f_fsid` match the
+    /// root, Some(false) after emitting a diagnostic, or None on cancellation.
+    /// Queue disconnect errors are returned directly.
+    #[cfg(target_os = "macos")]
+    fn verify_opened_directory_mount(
+        &mut self,
+        path: &Path,
+        child_handle: &std::fs::File,
+        opened: &std::fs::Metadata,
+    ) -> Result<Option<bool>, String> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(same_dev) = self.same_mount_device(path, opened.dev(), "subtree")? else {
+            return Ok(None);
+        };
+        if !same_dev {
+            return Ok(Some(false));
+        }
+        match fstatfs_handle(child_handle) {
+            Ok(fs) if fsid_value(fs.f_fsid) == self.mount.root_fsid => Ok(Some(true)),
+            Ok(_) => {
+                if !self.error(
+                    path,
+                    "cross_mount_skipped",
+                    "filesystem identifier differs from root mount; subtree skipped",
+                    OperationStatus::Partial,
+                )? {
+                    return Ok(None);
+                }
+                Ok(Some(false))
+            }
+            Err(error) => {
+                if !self.error(
+                    path,
+                    "mount_identity_unavailable",
+                    format!("fstatfs failed for directory: {error}"),
+                    OperationStatus::Failed,
+                )? {
+                    return Ok(None);
+                }
+                Ok(Some(false))
+            }
+        }
+    }
+
+    /// Re-verifies an opened macOS regular file stays on the root device.
+    ///
+    /// Accepts the file path and `fstat` metadata from the opened handle.
+    /// Returns Some(true) on match, Some(false) after emitting
+    /// `cross_mount_skipped`, or None on cancellation. Queue errors return Err.
+    #[cfg(target_os = "macos")]
+    fn verify_opened_file_mount(
+        &mut self,
+        path: &Path,
+        opened: &std::fs::Metadata,
+    ) -> Result<Option<bool>, String> {
+        use std::os::unix::fs::MetadataExt;
+        self.same_mount_device(path, opened.dev(), "entry")
+    }
+
     /// Visits one sorted directory level with bounded production and opt-in recursion.
     ///
     /// Accepts an absolute reporting path, an owned anchored no-follow
@@ -576,7 +952,6 @@ impl<'a> Inventory<'a> {
     /// diagnostic instead of recursing. Read/open failures become ordered
     /// records and later entries continue; names alone are sorted and file
     /// bytes/reports are never accumulated by the traversal.
-    #[cfg(target_os = "linux")]
     fn directory(
         &mut self,
         path: &Path,
@@ -599,15 +974,23 @@ impl<'a> Inventory<'a> {
         let total = names.len();
         for (index, name) in names.into_iter().enumerate() {
             let child = path.join(&name);
-            let metadata = match open_entry_metadata(
-                handle.as_ref().expect("directory handle is open"),
-                &name,
-            ) {
-                Ok(metadata) => metadata,
-                // ELOOP is Linux's link rejection; the O_PATH metadata open
-                // already yields symlink handles, so this only guards unusual
-                // kernel ports and preserves the link skip.
-                Err(error) if error.raw_os_error() == Some(40 /* ELOOP */) => {
+            let kind =
+                match classify_entry(handle.as_ref().expect("directory handle is open"), &name) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        if !self.error(
+                            &child,
+                            "entry_metadata_failed",
+                            error,
+                            OperationStatus::Failed,
+                        )? {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                };
+            match kind {
+                EntryKind::Symlink => {
                     if !self.error(
                         &child,
                         "symlink_skipped",
@@ -616,110 +999,163 @@ impl<'a> Inventory<'a> {
                     )? {
                         return Ok(false);
                     }
-                    continue;
                 }
-                Err(error) => {
-                    if !self.error(
-                        &child,
-                        "entry_metadata_failed",
-                        error,
-                        OperationStatus::Failed,
-                    )? {
+                EntryKind::Other => {}
+                EntryKind::Directory {
+                    #[cfg(target_os = "macos")]
+                    dev,
+                } => {
+                    if !self.recursive {
+                        continue;
+                    }
+                    #[cfg(target_os = "linux")]
+                    let Some(same_mount) = self.same_mount(&child)? else {
                         return Ok(false);
-                    }
-                    continue;
-                }
-            };
-            if metadata.file_type().is_symlink() {
-                if !self.error(
-                    &child,
-                    "symlink_skipped",
-                    "symbolic links are never followed",
-                    OperationStatus::Partial,
-                )? {
-                    return Ok(false);
-                }
-                continue;
-            }
-            if metadata.is_dir() {
-                if !self.recursive {
-                    continue;
-                }
-                let Some(same_mount) = self.same_mount(&child)? else {
-                    return Ok(false);
-                };
-                if !same_mount {
-                    continue;
-                }
-                if depth >= MAX_DIRECTORY_DEPTH {
-                    let detail = format!(
-                        "directory recursion depth exceeds maximum of {MAX_DIRECTORY_DEPTH}; subtree skipped"
-                    );
-                    if !self.error(
-                        &child,
-                        "directory_depth_exceeded",
-                        detail,
-                        OperationStatus::Partial,
-                    )? {
+                    };
+                    #[cfg(target_os = "macos")]
+                    let Some(same_mount) = self.same_mount_device(&child, dev, "subtree")? else {
                         return Ok(false);
+                    };
+                    if !same_mount {
+                        continue;
                     }
-                    continue;
-                }
-                match open_entry(
-                    handle.as_ref().expect("directory handle is open"),
-                    &name,
-                    true,
-                ) {
-                    Ok((child_handle, _)) => {
-                        if index + 1 == total {
-                            drop(handle.take());
-                        }
-                        if !self.directory(&child, child_handle, depth + 1)? {
-                            return Ok(false);
-                        }
-                    }
-                    Err(error) => {
+                    if depth >= MAX_DIRECTORY_DEPTH {
+                        let detail = format!(
+                            "directory recursion depth exceeds maximum of {MAX_DIRECTORY_DEPTH}; subtree skipped"
+                        );
                         if !self.error(
                             &child,
-                            "directory_open_failed",
-                            error,
-                            OperationStatus::Failed,
+                            "directory_depth_exceeded",
+                            detail,
+                            OperationStatus::Partial,
                         )? {
                             return Ok(false);
                         }
+                        continue;
+                    }
+                    match open_entry(
+                        handle.as_ref().expect("directory handle is open"),
+                        &name,
+                        true,
+                    ) {
+                        Ok((child_handle, opened)) => {
+                            #[cfg(target_os = "linux")]
+                            let _ = opened;
+                            #[cfg(target_os = "macos")]
+                            {
+                                let Some(same_mount) = self.verify_opened_directory_mount(
+                                    &child,
+                                    &child_handle,
+                                    &opened,
+                                )?
+                                else {
+                                    return Ok(false);
+                                };
+                                if !same_mount {
+                                    continue;
+                                }
+                            }
+                            if index + 1 == total {
+                                drop(handle.take());
+                            }
+                            if !self.directory(&child, child_handle, depth + 1)? {
+                                return Ok(false);
+                            }
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                            if !self.error(
+                                &child,
+                                "symlink_skipped",
+                                "symbolic links are never followed",
+                                OperationStatus::Partial,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
+                        Err(error) => {
+                            if !self.error(
+                                &child,
+                                "directory_open_failed",
+                                error,
+                                OperationStatus::Failed,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
                     }
                 }
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-            let Some(same_mount) = self.same_mount(&child)? else {
-                return Ok(false);
-            };
-            if !same_mount {
-                continue;
-            }
-            match open_entry(
-                handle.as_ref().expect("directory handle is open"),
-                &name,
-                false,
-            ) {
-                Ok((file, opened)) => {
-                    #[cfg(unix)]
-                    let expected = {
-                        use std::os::unix::fs::MetadataExt;
-                        Some(format!("{:x}:{:x}", opened.dev(), opened.ino()))
+                EntryKind::RegularFile {
+                    #[cfg(target_os = "macos")]
+                    dev,
+                    #[cfg(target_os = "macos")]
+                    dataless,
+                } => {
+                    #[cfg(target_os = "macos")]
+                    if dataless {
+                        if !self.error(
+                            &child,
+                            "cloud_placeholder_skipped",
+                            "cloud-evicted dataless placeholder skipped without hydrating",
+                            OperationStatus::Partial,
+                        )? {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    #[cfg(target_os = "linux")]
+                    let Some(same_mount) = self.same_mount(&child)? else {
+                        return Ok(false);
                     };
-                    #[cfg(not(unix))]
-                    let expected = None;
-                    if !self.file(&child, expected.as_deref(), Some(file))? {
+                    #[cfg(target_os = "macos")]
+                    let Some(same_mount) = self.same_mount_device(&child, dev, "entry")? else {
                         return Ok(false);
+                    };
+                    if !same_mount {
+                        continue;
                     }
-                }
-                Err(error) => {
-                    if !self.error(&child, "file_open_failed", error, OperationStatus::Failed)? {
-                        return Ok(false);
+                    match open_entry(
+                        handle.as_ref().expect("directory handle is open"),
+                        &name,
+                        false,
+                    ) {
+                        Ok((file, opened)) => {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let Some(same_mount) =
+                                    self.verify_opened_file_mount(&child, &opened)?
+                                else {
+                                    return Ok(false);
+                                };
+                                if !same_mount {
+                                    continue;
+                                }
+                            }
+                            use std::os::unix::fs::MetadataExt;
+                            let expected = format!("{:x}:{:x}", opened.dev(), opened.ino());
+                            if !self.file(&child, Some(&expected), Some(file))? {
+                                return Ok(false);
+                            }
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                            if !self.error(
+                                &child,
+                                "symlink_skipped",
+                                "symbolic links are never followed",
+                                OperationStatus::Partial,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
+                        Err(error) => {
+                            if !self.error(
+                                &child,
+                                "file_open_failed",
+                                error,
+                                OperationStatus::Failed,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
                     }
                 }
             }
@@ -728,7 +1164,7 @@ impl<'a> Inventory<'a> {
     }
 }
 
-/// Produces safe inventory requests while retaining the current mount snapshot.
+/// Produces safe Linux inventory requests while retaining the current mount snapshot.
 ///
 /// Accepts root, recursion flag, and bounded producer. Returns unit after full
 /// traversal or cancellation. Unsafe roots and mountinfo errors become one failed
@@ -745,13 +1181,7 @@ fn produce(
     }) {
         Ok(root) => root,
         Err(error) => {
-            let mut inventory = Inventory::new(
-                root.to_path_buf(),
-                0,
-                MountTable::default(),
-                recursive,
-                producer,
-            );
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
             inventory.error(
                 root,
                 "inventory_root_rejected",
@@ -764,7 +1194,7 @@ fn produce(
     let mounts = match MountTable::current() {
         Ok(mounts) => mounts,
         Err(error) => {
-            let mut inventory = Inventory::new(root, 0, MountTable::default(), recursive, producer);
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
             inventory.error(
                 Path::new(""),
                 "mountinfo_unavailable",
@@ -775,20 +1205,17 @@ fn produce(
         }
     };
     let root_record = mounts.find(&root).cloned();
-    let mut inventory = Inventory::new(
-        root,
-        root_record.as_ref().map_or(0, |mount| mount.id),
+    let mount = RootMount {
+        root_mount: root_record.as_ref().map_or(0, |mount| mount.id),
         mounts,
-        recursive,
-        producer,
-    );
+    };
+    let mut inventory = Inventory::new(mount, recursive, producer);
     match root_record {
         Some(mount) if !known_local_filesystem(&mount.filesystem) => {
             let detail = format!(
                 "inventory root filesystem '{}' is not an approved local filesystem",
                 mount.filesystem
             );
-            let root = inventory.root.clone();
             inventory.error(
                 &root,
                 "non_local_root_rejected",
@@ -797,7 +1224,6 @@ fn produce(
             )?;
         }
         None => {
-            let root = inventory.root.clone();
             inventory.error(
                 &root,
                 "mount_identity_unavailable",
@@ -805,13 +1231,11 @@ fn produce(
                 OperationStatus::Failed,
             )?;
         }
-        Some(_) => match open_directory(&inventory.root) {
+        Some(_) => match open_directory(&root) {
             Ok(handle) => {
-                let root = inventory.root.clone();
                 inventory.directory(&root, handle, 0)?;
             }
             Err(error) => {
-                let root = inventory.root.clone();
                 inventory.error(
                     &root,
                     "directory_open_failed",
@@ -824,13 +1248,104 @@ fn produce(
     Ok(())
 }
 
+/// Produces safe macOS inventory requests anchored to an `fstatfs`-verified local root.
+///
+/// Accepts root, recursion flag, and bounded producer. Returns unit after full
+/// traversal or cancellation. Rejects symlink components before opening the root
+/// via `open_directory`, verifies local filesystem status through `fstatfs` on
+/// the opened descriptor before enumerating any entries, and turns validation or
+/// open errors into one failed record; producer disconnect errors return Err.
+#[cfg(target_os = "macos")]
+fn produce(
+    root: &Path,
+    recursive: bool,
+    producer: &mut crate::batch::BatchProducer,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let root = match absolute_lexical(root).and_then(|root| {
+        reject_symlink_components(&root)?;
+        Ok(root)
+    }) {
+        Ok(root) => root,
+        Err(error) => {
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
+            inventory.error(
+                root,
+                "inventory_root_rejected",
+                error,
+                OperationStatus::Failed,
+            )?;
+            return Ok(());
+        }
+    };
+    let handle = match open_directory(&root) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
+            inventory.error(
+                &root,
+                "directory_open_failed",
+                error,
+                OperationStatus::Failed,
+            )?;
+            return Ok(());
+        }
+    };
+    let fs = match fstatfs_handle(&handle) {
+        Ok(fs) => fs,
+        Err(error) => {
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
+            inventory.error(
+                &root,
+                "mount_identity_unavailable",
+                format!("fstatfs failed for inventory root: {error}"),
+                OperationStatus::Failed,
+            )?;
+            return Ok(());
+        }
+    };
+    let root_meta = match handle.metadata() {
+        Ok(meta) => meta,
+        Err(error) => {
+            let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
+            inventory.error(
+                &root,
+                "mount_identity_unavailable",
+                format!("fstat failed for inventory root: {error}"),
+                OperationStatus::Failed,
+            )?;
+            return Ok(());
+        }
+    };
+    let filesystem = macos_fstype_name(&fs);
+    if !known_local_macos_filesystem(fs.f_flags, &filesystem) {
+        let detail =
+            format!("inventory root filesystem '{filesystem}' is not an approved local filesystem");
+        let mut inventory = Inventory::new(RootMount::default(), recursive, producer);
+        inventory.error(
+            &root,
+            "non_local_root_rejected",
+            detail,
+            OperationStatus::Failed,
+        )?;
+        return Ok(());
+    }
+    let mount = RootMount {
+        root_dev: root_meta.dev(),
+        root_fsid: fsid_value(fs.f_fsid),
+    };
+    let mut inventory = Inventory::new(mount, recursive, producer);
+    inventory.directory(&root, handle, 0)?;
+    Ok(())
+}
+
 /// Runs deterministic ordered inventory with bounded shared file/OCR workers.
 ///
 /// Accepts root, recursion flag, positive jobs, optional external artifact
 /// directory, `full_hash` override, `verbose` provenance flag, and JSONL
 /// writer. Returns aggregate status after all schema v3 responses flush and
 /// workers join. Output/input transport errors are returned directly.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn run<W: Write>(
     root: &Path,
     recursive: bool,
@@ -875,8 +1390,8 @@ pub(crate) fn run<W: Write>(
 /// Accepts root, recursion flag, jobs, artifact directory, `full_hash`
 /// override, `verbose` flag, and output writer. Returns an I/O unsupported
 /// error; no paths, mounts, network endpoints, or output files are accessed on
-/// non-Linux hosts.
-#[cfg(not(target_os = "linux"))]
+/// unsupported hosts.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn run<W: Write>(
     _root: &Path,
     _recursive: bool,
@@ -888,7 +1403,7 @@ pub(crate) fn run<W: Write>(
 ) -> std::io::Result<OperationStatus> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "mount-safe directory inventory currently requires Linux mountinfo",
+        "mount-safe directory inventory currently requires Linux or macOS",
     ))
 }
 #[cfg(test)]
@@ -909,8 +1424,10 @@ mod tests {
         let root = table.find(Path::new("/tmp/source")).unwrap();
         let bind = table.find(Path::new("/tmp/space bind")).unwrap();
         assert_eq!(root.id, 35);
+        assert_eq!(root.filesystem, "ext4");
         assert_eq!(bind.id, 100);
         assert_eq!(bind.parent_id, 35);
+        assert_eq!(bind.filesystem, "ext4");
         assert_ne!(root.id, bind.id);
     }
 
@@ -957,8 +1474,103 @@ mod tests {
              37 35 259:2 /data /data rw - ext4 /dev/root rw\n",
         )
         .unwrap();
-        assert_eq!(table.find(Path::new("/data/file")).unwrap().id, 37);
+        let file_mount = table.find(Path::new("/data/file")).unwrap();
+        assert_eq!(file_mount.id, 37);
+        assert_eq!(file_mount.filesystem, "ext4");
         assert_eq!(table.find(Path::new("/data")).unwrap().id, 37);
+    }
+
+    /// Checks macOS local-filesystem allowlist enforces `MNT_LOCAL` and known types.
+    ///
+    /// Accepts no parameters. Returns unit after checking approved local types,
+    /// cleared `MNT_LOCAL` flags, and rejected network, FUSE, pseudo, and
+    /// unknown filesystem names. Unexpected acceptance or rejection panics.
+    #[test]
+    fn macos_local_filesystem_allowlist_requires_mnt_local_and_known_type() {
+        for filesystem in ["apfs", "hfs", "msdos", "exfat", "udf", "tmpfs"] {
+            assert!(
+                known_local_macos_filesystem(MACOS_MNT_LOCAL, filesystem),
+                "expected local allowlist acceptance for {filesystem}"
+            );
+            assert!(
+                !known_local_macos_filesystem(0, filesystem),
+                "cleared MNT_LOCAL must reject {filesystem}"
+            );
+        }
+        assert!(known_local_macos_filesystem(
+            MACOS_MNT_LOCAL | 0x0000_0001,
+            "apfs"
+        ));
+        for filesystem in [
+            "smbfs", "nfs", "afpfs", "webdav", "macfuse", "osxfuse", "fusefs", "lifs", "devfs",
+            "autofs", "synthfs", "nullfs", "unknown",
+        ] {
+            assert!(
+                !known_local_macos_filesystem(MACOS_MNT_LOCAL, filesystem),
+                "non-allowlisted filesystem must fail closed: {filesystem}"
+            );
+        }
+    }
+
+    /// Checks Darwin `SF_DATALESS` placeholder detection on raw `st_flags`.
+    ///
+    /// Accepts no parameters. Returns unit after checking zero, non-dataless,
+    /// exact `SF_DATALESS`, and combined flag words. Misclassification panics;
+    /// no filesystem I/O occurs.
+    #[test]
+    fn dataless_placeholder_flag_is_detected() {
+        assert!(!is_dataless_placeholder(0));
+        assert!(!is_dataless_placeholder(0x0000_0001));
+        assert!(is_dataless_placeholder(0x4000_0000));
+        assert!(is_dataless_placeholder(0x4000_0001));
+    }
+
+    /// Checks `output_inside_root` lexical and Unix `(st_dev, st_ino)` containment.
+    ///
+    /// Accepts no parameters. Returns unit after checking nested existing,
+    /// nested non-existent, sibling, and case-alias paths under a scratch
+    /// directory. Incorrect containment results panic; the scratch tree is
+    /// removed afterward.
+    #[cfg(unix)]
+    #[test]
+    fn output_inside_root_checks_lexical_and_unix_inode_ancestors() {
+        use std::os::unix::fs::MetadataExt;
+        let base_parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let base = base_parent.join(format!("inside-root-{}-{stamp}", std::process::id()));
+        let root_dir = base.join("docs");
+        let nested_existing = root_dir.join("out");
+        let sibling_dir = base.join("other");
+        std::fs::create_dir_all(&nested_existing).expect("nested directory created");
+        std::fs::create_dir_all(&sibling_dir).expect("sibling directory created");
+        let base = std::fs::canonicalize(&base).expect("base directory canonicalized");
+        let root_dir = base.join("docs");
+        let nested_existing = root_dir.join("out");
+        let nested_missing = root_dir.join("missing/nested");
+        let sibling_dir = base.join("other");
+
+        assert!(output_inside_root(&root_dir, &root_dir));
+        assert!(output_inside_root(&root_dir, &nested_existing));
+        assert!(output_inside_root(&root_dir, &nested_missing));
+        assert!(!output_inside_root(&root_dir, &sibling_dir));
+
+        assert!(same_inode_ancestor(&root_dir, &root_dir));
+        assert!(same_inode_ancestor(&root_dir, &nested_existing));
+        assert!(same_inode_ancestor(&root_dir, &nested_missing));
+        assert!(!same_inode_ancestor(&root_dir, &sibling_dir));
+
+        let upper_root = base.join("DOCS");
+        let upper_out = upper_root.join("new-out");
+        let root_meta = std::fs::symlink_metadata(&root_dir).expect("root metadata");
+        let case_insensitive = std::fs::symlink_metadata(&upper_root)
+            .map(|meta| (meta.dev(), meta.ino()) == (root_meta.dev(), root_meta.ino()))
+            .unwrap_or(false);
+        assert_eq!(output_inside_root(&root_dir, &upper_out), case_insensitive);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Checks anchored enumeration reads every name through the open handle.
@@ -967,7 +1579,7 @@ mod tests {
     /// directory containing nested, spaced, and linked entries. A missing
     /// entry, a leaked "." or ".." record, or a path-based read panic fails
     /// the anchored-traversal contract; the scratch tree is removed after.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn anchored_enumeration_reports_all_names_without_dot_entries() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
@@ -1003,29 +1615,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Checks enumeration returns short and non-UTF-8 names without overreads.
+    /// Checks enumeration returns short and NAME_MAX names without overreads.
     ///
     /// Accepts no parameters. Returns unit after enumerating one scratch
-    /// directory holding a one-byte name (the shortest kernel record), a
-    /// 255-byte NAME_MAX name (the longest record), and a non-UTF-8 name.
-    /// A missing name or a mis-decoded byte sequence fails the raw d_name
-    /// access contract; the scratch tree is removed after the assertions.
-    #[cfg(target_os = "linux")]
+    /// directory holding a one-byte name (the shortest kernel record) and a
+    /// 255-byte NAME_MAX name (the longest record). A missing or truncated
+    /// name fails the raw d_name access contract; the scratch tree is removed
+    /// after the assertions.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn anchored_enumeration_reads_short_and_non_utf8_names() {
-        use std::os::unix::ffi::OsStrExt;
+    fn anchored_enumeration_reads_short_and_long_names() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock is after the UNIX epoch")
             .as_nanos();
-        let directory = root.join(format!("anchored-bytes-{}-{stamp}", std::process::id()));
+        let directory = root.join(format!("anchored-len-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("scratch directory created");
         std::fs::write(directory.join("a"), b"short").expect("short name created");
         let long_name = "x".repeat(255);
         std::fs::write(directory.join(&long_name), b"long").expect("long name created");
-        let raw_name = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'z']);
-        std::fs::write(directory.join(raw_name), b"bytes").expect("non-UTF-8 name created");
         let handle = open_directory(&directory).expect("scratch directory opened");
         let names = anchored_names(&handle).expect("anchored enumeration succeeds");
         drop(handle);
@@ -1036,13 +1645,40 @@ mod tests {
             vec![
                 std::ffi::OsString::from("a"),
                 std::ffi::OsString::from(long_name),
-                std::ffi::OsString::from_vec(vec![0xff, 0xfe, b'z']),
             ]
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Counts open file descriptors resolving to one absolute path.
+    /// Checks Linux enumeration preserves arbitrary non-UTF-8 byte filenames.
+    ///
+    /// Accepts no parameters. Returns unit after enumerating one scratch
+    /// directory holding a raw non-UTF-8 filename (`[0xff, 0xfe, b'z']`). A
+    /// mis-decoded byte sequence fails the raw d_name contract; gated to Linux
+    /// because macOS APFS rejects non-UTF-8 filenames at creation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anchored_enumeration_reads_non_utf8_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!("anchored-bytes-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory created");
+        let raw_name = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'z']);
+        std::fs::write(directory.join(raw_name), b"bytes").expect("non-UTF-8 name created");
+        let handle = open_directory(&directory).expect("scratch directory opened");
+        let names = anchored_names(&handle).expect("anchored enumeration succeeds");
+        drop(handle);
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from_vec(vec![0xff, 0xfe, b'z'])]
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Counts open file descriptors resolving to one absolute path on Linux.
     ///
     /// Accepts a canonical absolute path. Returns the number of currently open
     /// descriptors pointing at it, read from procfs; a missing procfs mount
@@ -1065,6 +1701,42 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Counts open file descriptors resolving to one absolute path on macOS.
+    ///
+    /// Accepts a canonical absolute path. Returns the number of currently open
+    /// descriptors whose `fcntl(fd, F_GETPATH, ...)` result equals `path`,
+    /// scanning numeric descriptor entries in `/dev/fd`. Unreadable entries or
+    /// non-vnode descriptors are skipped without failing the caller.
+    #[cfg(target_os = "macos")]
+    fn count_descriptors_for(path: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            let mut buf = [0u8; libc::MAXPATHLEN as usize];
+            // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most
+            // `MAXPATHLEN` bytes into `buf` when returning != -1.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr().cast::<libc::c_char>()) }
+                == -1
+            {
+                continue;
+            }
+            let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+            if Path::new(std::ffi::OsStr::from_bytes(&buf[..len])) == path {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Checks a failed enumeration closes its duplicate and keeps the caller's
     /// handle, and that a successful enumeration releases the stream.
     ///
@@ -1073,7 +1745,7 @@ mod tests {
     /// duplicated descriptor, a closed caller handle, or a stream left open
     /// after success fails the descriptor-ownership contract; the scratch
     /// tree is removed after the assertions.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn anchored_enumeration_owns_duplicate_on_fdopendir_failure() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
@@ -1116,10 +1788,10 @@ mod tests {
     /// Checks tail recursion drops parent directory handles while pinning regular files.
     ///
     /// Accepts no parameters. Returns unit after traversing a single-child
-    /// directory chain through `produce` and inspecting `/proc/self/fd` inside
+    /// directory chain through `produce` and inspecting open descriptors inside
     /// the worker. Retained parent directory descriptors or an unpinned regular
     /// file fail the assertions; the scratch tree is removed afterward.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn tail_recursion_drops_parent_directory_fds_and_pins_regular_file() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
@@ -1176,7 +1848,7 @@ mod tests {
                     );
                     assert!(
                         count_descriptors_for(&canonical_leaf) >= 1,
-                        "pinned regular file must remain open in /proc/self/fd during worker execution"
+                        "pinned regular file must remain open during worker execution"
                     );
                     drop(request.pinned_file.take());
                     assert_eq!(
@@ -1206,7 +1878,7 @@ mod tests {
     /// files and one deeper subdirectory. Missing leaf files, traversed depth
     /// beyond the cap, wrong ordering, or wrong error code fail the assertions;
     /// the scratch tree is removed afterward.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn recursion_enforces_max_directory_depth_in_sorted_order() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");

@@ -1411,8 +1411,18 @@ mod tests {
         pdf
     }
 
+    /// Resolves the host temporary directory without symlinked ancestor components.
+    ///
+    /// Accepts no arguments. Returns the canonical temporary directory path (for
+    /// example `/private/var/folders/...` on macOS where `/var` is a symlink),
+    /// falling back to `std::env::temp_dir()` if canonicalization fails.
+    fn canonical_temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        std::fs::canonicalize(&dir).unwrap_or(dir)
+    }
+
     fn write_temp_pdf(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!(
+        let directory = canonical_temp_dir().join(format!(
             "litx-pdf-caps-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1671,7 +1681,7 @@ mod tests {
         // every still-queued probe is abandoned, never left pending.
         let fixture =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/native.pdf");
-        let directory = std::env::temp_dir().join(format!(
+        let directory = canonical_temp_dir().join(format!(
             "litx-pdf-ocr-stop-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1736,7 +1746,7 @@ mod tests {
         // plus an OCR'd scan exceeds the 32-byte test seam.
         let fixture =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/native.pdf");
-        let directory = std::env::temp_dir().join(format!(
+        let directory = canonical_temp_dir().join(format!(
             "litx-pdf-ocr-cap-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1938,7 +1948,7 @@ mod tests {
     fn metadata_thumbnail_raster_is_capped_for_huge_pages() {
         let bytes = synthetic_pdf_sized(30_000.0, 30_000.0, &[PageSpec::Empty]);
         let path = write_temp_pdf("huge-page.pdf", &bytes);
-        let directory = std::env::temp_dir().join(format!(
+        let directory = canonical_temp_dir().join(format!(
             "litx-pdf-thumb-cap-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
