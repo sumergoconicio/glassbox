@@ -61,52 +61,44 @@ fn litx(args: &[&str]) -> Command {
 
 /// Asserts canonical extraction keeps its static Parquet deferral.
 ///
-/// Accepts a v2 extraction report. Returns unit after checking empty content,
+/// Accepts a v3 extraction report. Returns unit after checking empty content,
 /// absent footer profile, and one static diagnostic. Any row preview panics.
 fn assert_extract_deferred(report: &Value) {
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["kind"], "extract");
+    assert_eq!(report["status"], "unsupported");
     assert_eq!(report["metadata"]["status"], "unsupported");
-    let errors = report["metadata"]["diagnostics"].as_array().unwrap();
+    let errors = report["diagnostics"].as_array().unwrap();
     assert_eq!(errors.len(), 1, "one static diagnostic: {errors:?}");
     assert_eq!(errors[0]["stage"], "metadata");
     assert_eq!(errors[0]["message"], DEFERRAL);
-    assert!(report["metadata"]["parquet"].is_null());
-    assert!(report["metadata"]["dataset"].is_null());
+    assert!(report["metadata"].get("parquet").is_none());
+    assert!(report["metadata"].get("dataset").is_none());
     assert_eq!(report["content"]["units"], serde_json::json!([]));
     assert_eq!(report["selection"]["omitted"], "unsupported");
+    assert_eq!(report["metadata"]["format"]["type"], "tabular_data");
     assert_eq!(
-        report["metadata"]["format"]["detected_mime"],
+        report["metadata"]["format"]["mime"],
         "application/vnd.apache.parquet"
     );
 }
 
-/// Asserts v2 Parquet inspection identifies bytes without footer or row parsing.
+/// Asserts v3 Parquet inspection identifies bytes without footer or row parsing.
 ///
 /// Accepts a metadata JSON report. Returns unit after checking schema, support,
 /// complete status, diagnostic, digest, and absence of legacy body/profile keys.
 fn assert_metadata_deferred(report: &Value) {
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["kind"], "inspect");
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["format"]["type"], "tabular_data");
+    assert_eq!(report["format"]["mime"], "application/vnd.apache.parquet");
+    assert_eq!(report["readiness"]["extractable"], "identification_only");
     assert_eq!(
-        report["metadata"]["format"]["detected_mime"],
-        "application/vnd.apache.parquet"
-    );
-    assert_eq!(
-        report["metadata"]["extraction_support"],
-        "identification_only"
-    );
-    assert_eq!(report["metadata"]["status"], "complete");
-    assert_eq!(
-        report["metadata"]["diagnostics"][0]["code"],
+        report["diagnostics"][0]["code"],
         "parquet_identification_only"
     );
-    assert_eq!(
-        report["metadata"]["digest"]["digest"]
-            .as_str()
-            .unwrap()
-            .len(),
-        64
-    );
+    assert_eq!(report["file"]["sha256"].as_str().unwrap().len(), 64);
     assert!(report.get("parquet").is_none());
     assert!(report.get("dataset").is_none());
     assert!(report.get("text").is_none());
@@ -184,10 +176,8 @@ fn parquet_batch_recovers_across_valid_malformed_and_text_inputs() {
     assert_eq!(responses.len(), 3);
     assert_metadata_deferred(&responses[0]["report"]);
     assert_metadata_deferred(&responses[1]["report"]);
-    assert_eq!(responses[2]["report"]["metadata"]["status"], "complete");
-    assert_eq!(
-        responses[2]["report"]["metadata"]["counts"][0]["unit"],
-        "logical_line"
-    );
+    assert_eq!(responses[2]["report"]["schema_version"], 3);
+    assert_eq!(responses[2]["report"]["status"], "complete");
+    assert_eq!(responses[2]["report"]["structure"]["counts"]["lines"], 1);
     assert!(responses[2]["report"].get("text").is_none());
 }

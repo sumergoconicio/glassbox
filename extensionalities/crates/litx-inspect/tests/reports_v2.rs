@@ -31,6 +31,7 @@ fn metadata_fixture() -> DocumentMetadata {
         digest: DigestReport {
             algorithm: DigestAlgorithm::Sha256,
             digest: Some("a".repeat(64)),
+            fingerprint: None,
             bytes_hashed: QualifiedCount {
                 unit: NativeUnit::Byte,
                 value: Some(4_096),
@@ -52,6 +53,7 @@ fn metadata_fixture() -> DocumentMetadata {
             name: "account_id".to_owned(),
             source: FactSource::NativeStructure,
         }],
+        xml_namespaces: std::collections::BTreeMap::new(),
         embedded_metadata: vec![SourcedMetadata {
             field: EmbeddedMetadataField::Title,
             value: "Synthetic metadata fixture".to_owned(),
@@ -108,14 +110,19 @@ fn extract_fixture() -> ExtractReport {
         }),
     };
     ExtractReport {
-        schema_version: REPORT_SCHEMA_VERSION,
+        schema_version: LEGACY_REPORT_SCHEMA_VERSION,
         kind: ReportKind::Extract,
+        status: OperationStatus::Complete,
+        diagnostics: Vec::new(),
         metadata: metadata_fixture(),
         content: ExtractedContent {
+            headers: Vec::new(),
             units: vec![ContentUnit {
                 unit_index: 1,
                 unit: NativeUnit::PhysicalPage,
                 source_part: Some("page-1".to_owned()),
+                label: None,
+                marker_index: None,
                 text: Some("SENTINEL_BODY SENTINEL_OCR".to_owned()),
                 rows: vec![ContentRow {
                     row_index: 1,
@@ -178,14 +185,14 @@ fn assert_forbidden_keys(value: &Value, forbidden: &[&str]) {
     }
 }
 
-/// Verifies exact v2 markers and conservative default fact states.
+/// Verifies exact schema version markers and conservative default fact states.
 ///
 /// Accepts no parameters. Returns `()` after checking inspect and extract defaults.
 /// Panics if markers, unknown states, or unavailable optional facts differ.
 #[test]
 fn default_reports_emit_exact_markers_and_qualified_unknowns() {
     let inspect = serde_json::to_value(MetadataReport::default()).unwrap();
-    assert_eq!(inspect["schema_version"], 2);
+    assert_eq!(inspect["schema_version"], LEGACY_REPORT_SCHEMA_VERSION);
     assert_eq!(inspect["kind"], "inspect");
     assert_eq!(inspect["metadata"]["status"], "unknown");
     assert_eq!(inspect["metadata"]["completeness"], "unavailable");
@@ -205,7 +212,7 @@ fn default_reports_emit_exact_markers_and_qualified_unknowns() {
     assert_eq!(inspect["metadata"]["extraction_support"], "unknown");
 
     let extract = serde_json::to_value(ExtractReport::default()).unwrap();
-    assert_eq!(extract["schema_version"], 2);
+    assert_eq!(extract["schema_version"], LEGACY_REPORT_SCHEMA_VERSION);
     assert_eq!(extract["kind"], "extract");
     assert_eq!(extract["content"]["units"], serde_json::json!([]));
     assert_eq!(extract["selection"]["requested"]["mode"], "all");
@@ -295,7 +302,7 @@ fn metadata_report_excludes_body_rows_ocr_and_legacy_payloads() {
 fn extract_report_separates_content_provenance_completeness_and_selection() {
     let report = extract_fixture();
     let value = serde_json::to_value(&report).unwrap();
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], LEGACY_REPORT_SCHEMA_VERSION);
     assert_eq!(value["kind"], "extract");
     assert_eq!(
         value["content"]["units"][0]["text"],

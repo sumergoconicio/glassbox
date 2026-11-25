@@ -85,4 +85,14 @@ fn pretty_directory_inspect_is_rejected_as_a_usage_error() {
     );
     let text = run(&["inspect", root.to_str().unwrap(), "--format", "text"]);
     assert_eq!(text.status.code(), Some(64));
+
+    let single_json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(single_json["schema_version"], 3);
+    let no_markers_inspect = run(&[
+        "inspect",
+        root.join("a.txt").to_str().unwrap(),
+        "--no-markers",
+    ]);
+    assert_eq!(no_markers_inspect.status.code(), Some(64));
+    assert!(no_markers_inspect.stdout.is_empty());
 }

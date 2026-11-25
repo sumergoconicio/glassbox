@@ -5,7 +5,7 @@ Build it with Cargo inside a checkout of the Glassbox repository.
 
 ## Prerequisites
 
-- A current stable Rust toolchain with Rust 2024 support.
+- A current stable Rust toolchain. The shared build directory requires Cargo 1.91 or later.
 - A C/C++ compiler, linker, and CMake.
 - Tesseract and Leptonica development files.
 - Tesseract language data for the languages you OCR.
@@ -39,7 +39,7 @@ The recipe captures the real cache paths before changing `HOME`.
 It creates the build `HOME` if needed; it never deletes existing caches.
 The build downloads dependencies, including PDFium.
 This command builds `glassbox` without building the `litx` compatibility executable.
-Reuse the same target directory for local builds on the same platform.
+The repository Cargo config shares compiled dependencies and intermediates under `target/` for upstream LiteParse, Glassbox, and spikes inside the checkout. Final Glassbox executables stay under `extensionalities/target/`.
 See [Local build cleanup](automation.md#local-build-cleanup) for isolated verification runs.
 
 This recipe follows the setup used for the current local ARM64 builds.
@@ -78,7 +78,7 @@ Artifact saving and directory inventory are Linux-only.
 
 `--help` lists `parse`, `inspect`, `extract`, and `defaults`.
 `defaults` prints the upstream library default configuration as JSON.
-The fixture inspection exits 0 and prints a summary starting with `# Glassbox metadata inspection`.
+The fixture inspection exits 0 and prints a plain-text summary starting with `Schema: 3`.
 
 ## Distribution
 

@@ -63,13 +63,15 @@ pub(crate) fn render(
 
 /// Reads a bounded CSV/TSV preview and selects native preview rows.
 ///
-/// Accepts a source path, report, and extraction controls. Returns unit after
-/// at most five retained data rows. Invalid CSV, byte/column caps, and invalid
-/// selections become reader diagnostics; a sixth row only marks more source data.
+/// Accepts a source path, report, and extraction controls. Opens the source
+/// with [`crate::hashing::open_no_follow`] and returns unit after at most five
+/// retained data rows. Open failures, invalid CSV, byte/column caps, and
+/// invalid selections become reader diagnostics; a sixth row only marks more
+/// source data.
 pub(crate) fn csv(path: &Path, report: &mut InspectReport, options: &InspectOptions) {
     let result = (|| -> xml::Result<()> {
         const MAX_BYTES: u64 = 1 << 20;
-        let file = std::fs::File::open(path)?;
+        let file = crate::hashing::open_no_follow(path)?;
         let delimiter = if report.format.extension == "tsv" {
             b'\t'
         } else {
@@ -125,6 +127,14 @@ pub(crate) fn csv(path: &Path, report: &mut InspectReport, options: &InspectOpti
             if preview.has_more {
                 report.native_available.completeness = crate::reports::Completeness::Partial;
             }
+            report.native_headers = preview
+                .headers
+                .iter()
+                .map(|header| {
+                    preview.values_truncated |= header.chars().count() > 512;
+                    header.chars().take(512).collect()
+                })
+                .collect();
             let rows = preview.rows.clone();
             let selected: Vec<Vec<Value>> = rows
                 .iter()

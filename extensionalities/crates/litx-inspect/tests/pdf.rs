@@ -1,6 +1,6 @@
-// Module: glassbox-inspect integration tests.
-// File: pdf.rs.
-// Responsibility: Exercise PDF inspection and extraction behavior without changing reader behavior.
+//! Module: glassbox-inspect integration tests.
+//! File: pdf.rs.
+//! Responsibility: Exercise PDF inspection and extraction behavior, including `/PageLabels` propagation.
 use glassbox_inspect::reports::{ExtractOptions, OcrOptions, OperationStatus};
 use glassbox_inspect::{InspectOptions, extract, extract_transitional as inspect};
 use std::path::PathBuf;
@@ -626,10 +626,10 @@ fn pdf_extract_with_invalid_ocr_language_keeps_native_text_partial() {
             ..ExtractOptions::default()
         },
     );
-    assert_eq!(extracted.metadata.status, OperationStatus::Partial);
+    assert_eq!(extracted.status, OperationStatus::Partial);
+    assert_eq!(extracted.metadata.status, OperationStatus::Complete);
     assert!(
         extracted
-            .metadata
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "pdf_ocr"
@@ -637,7 +637,7 @@ fn pdf_extract_with_invalid_ocr_language_keeps_native_text_partial() {
                     .message
                     .contains("invalid local OCR language model name")),
         "{:#?}",
-        extracted.metadata.diagnostics
+        extracted.diagnostics
     );
     assert_eq!(extracted.content.units.len(), 1);
     let unit = &extracted.content.units[0];
@@ -681,13 +681,13 @@ fn pdf_ocr_alias_language_inits_and_reports_the_canonical_model() {
     );
     assert!(
         extracted
-            .metadata
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code != "pdf_ocr"),
         "{:#?}",
-        extracted.metadata.diagnostics
+        extracted.diagnostics
     );
+    assert_eq!(extracted.status, OperationStatus::Complete);
     assert_eq!(extracted.metadata.status, OperationStatus::Complete);
     let languages: Vec<&str> = extracted
         .content
@@ -709,4 +709,70 @@ fn pdf_ocr_alias_language_inits_and_reports_the_canonical_model() {
         "{:#?}",
         extracted.content.units
     );
+}
+
+/// Verifies `extract` copies PDF `/PageLabels` printed labels onto `ContentUnit.label`
+/// and leaves `label` as `None` when the catalog defines no `/PageLabels` tree.
+#[test]
+fn pdf_extract_populates_page_labels_from_catalog() {
+    let directory = scratch("page-labels");
+    let labeled = directory.join("labeled.pdf");
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [ 0 << /S /r /St 4 >> 1 << /S /D /St 1 >> ] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Length 44 >>\nstream\nBT /F1 18 Tf 50 700 Td (Roman page iv) Tj ET\nendstream".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        b"<< /Length 45 >>\nstream\nBT /F1 18 Tf 50 700 Td (Decimal page 1) Tj ET\nendstream".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>".to_vec(),
+    ];
+    let mut raw = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = vec![0usize];
+    for (idx, obj) in objects.iter().enumerate() {
+        offsets.push(raw.len());
+        raw.extend(format!("{} 0 obj\n", idx + 1).into_bytes());
+        raw.extend(obj);
+        raw.extend(b"\nendobj\n");
+    }
+    let xref = raw.len();
+    raw.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).into_bytes());
+    for offset in &offsets[1..] {
+        raw.extend(format!("{offset:010} 00000 n \n").into_bytes());
+    }
+    raw.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len()
+        )
+        .into_bytes(),
+    );
+    std::fs::write(&labeled, &raw).unwrap();
+
+    let report = extract(
+        &labeled,
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: false,
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert_eq!(report.status, OperationStatus::Complete);
+    assert_eq!(report.metadata.status, OperationStatus::Complete);
+    assert_eq!(report.content.units.len(), 2);
+    assert_eq!(report.content.units[0].label.as_deref(), Some("iv"));
+    assert_eq!(report.content.units[1].label.as_deref(), Some("1"));
+
+    let unlabeled = extract(
+        &fixture("native.pdf"),
+        &ExtractOptions {
+            ocr: OcrOptions {
+                enabled: false,
+                ..OcrOptions::default()
+            },
+            ..ExtractOptions::default()
+        },
+    );
+    assert!(unlabeled.content.units.iter().all(|u| u.label.is_none()));
 }

@@ -153,6 +153,7 @@ pub(crate) fn xlsx(
     }
     let mut budget = Budget::default();
     let mut work = WorkBudget::default();
+    let mut remaining_preview_cells = crate::markdown::MAX_WORKBOOK_PREVIEW_CELLS;
     let mut work_capped = false;
     let mut attempted_sheets = 0usize;
     for (index, sheet) in sheets.iter().take(sheet_limit).enumerate() {
@@ -184,8 +185,8 @@ pub(crate) fn xlsx(
                 } else {
                     report.text.chars
                 };
-                // Only previewed rows buffer cell text, bounded by push_bounded.
-                let previewing = preview_index < 6 && !markdown.is_truncated();
+                // Only previewed rows buffer cell text, bounded by push_bounded_row.
+                let previewing = markdown.can_buffer_row();
                 let mut row_values: Vec<(usize, Cow<'_, str>)> = Vec::new();
                 let row_number = row_number(row, previous_row)?;
                 if row_number <= previous_row {
@@ -193,6 +194,7 @@ pub(crate) fn xlsx(
                 }
                 previous_row = row_number;
                 let mut col = 0;
+                let mut has_row_content = false;
                 for cell in row.children().filter(|n| n.is(S, "c")) {
                     let (cell_row, column) = cell
                         .attr("r")
@@ -260,18 +262,23 @@ pub(crate) fn xlsx(
                     // shared strings cannot wrap or panic the per-sheet
                     // counter on narrow `usize` targets (wasm32).
                     accumulate(&mut chars, value.chars().count(), 1);
+                    if !value.is_empty() || formula {
+                        has_row_content = true;
+                    }
                     if col > 1 {
                         report.append_text("\t", text_cap);
                     }
                     report.append_text(&value, text_cap);
-                    if previewing {
+                    if previewing && col <= crate::markdown::MAX_PREVIEW_COLS {
                         row_values.push((col, value));
                     }
                 }
                 report.append_text("\n", text_cap);
-                // Always inform SheetRows: rows skipped past the six-row preview
-                // cutoff must mark more_rows so the sheet reports truncation.
-                markdown.push_bounded(&row_values, 1, options.max_chars);
+                if has_row_content {
+                    // Always inform SheetRows: rows skipped past the six-row preview
+                    // cutoff must mark more_rows so the sheet reports truncation.
+                    markdown.push_bounded_row(row_number, &row_values, 1, options.max_chars);
+                }
             }
             for merge in root.descendants(S, "mergeCell") {
                 let range = merge.attr("ref").ok_or("merge missing reference")?;
@@ -290,36 +297,15 @@ pub(crate) fn xlsx(
                 options,
             );
             let mut sheet = grid.finish();
-            markdown.write(&mut sheet, report, options);
+            let row_numbers =
+                markdown.write(&mut sheet, report, options, &mut remaining_preview_cells);
             if selection_plan.is_some() {
-                let rows = sheet
-                    .preview_rows
-                    .iter()
-                    .enumerate()
-                    .map(|(row_index, row)| crate::reports::ContentRow {
-                        row_index: row_index as u64 + 1,
-                        values: row.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let text = sheet
-                    .preview_rows
-                    .iter()
-                    .map(|row| row.join("\t"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut unit = crate::selection::dataset_unit(
-                    index as u64 + 1,
-                    crate::reports::NativeUnit::Worksheet,
-                    Some(target.clone()),
-                    text,
-                    rows,
-                );
-                unit.completeness = if sheet.preview_truncated {
-                    crate::reports::Completeness::Partial
-                } else {
-                    crate::reports::Completeness::Exact
-                };
-                report.native_units.push(unit);
+                report.native_units.push(crate::selection::worksheet_unit(
+                    index,
+                    target.clone(),
+                    &mut sheet,
+                    row_numbers,
+                ));
             }
             report.sheets.push(sheet);
             Ok(())

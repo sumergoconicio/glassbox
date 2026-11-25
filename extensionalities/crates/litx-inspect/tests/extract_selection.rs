@@ -137,6 +137,7 @@ fn text_full_request_preserves_all_logical_lines() {
         "zero\none\ntwo\nthree\nfour\nfive\nsix",
     );
     let report = extract(&path, &options(NativeSelection::All));
+    assert_eq!(report.status, OperationStatus::Complete);
     assert_eq!(report.metadata.status, OperationStatus::Complete);
     assert_eq!(report.selection.available.value, Some(7));
     assert_eq!(
@@ -161,11 +162,13 @@ fn text_first_n_and_ranges_have_exact_coverage() {
     let path = input("selection", "lines.txt", "0\n1\n2\n3\n4\n5\n6\n");
     let first = extract(&path, &options(parse_pages("5").unwrap()));
     assert_eq!(first.selection.returned_indices, [1, 2, 3, 4, 5]);
+    assert_eq!(first.status, OperationStatus::Complete);
     assert_eq!(first.metadata.status, OperationStatus::Complete);
     assert_eq!(first.completeness, Completeness::Partial);
     assert_eq!(first.selection.omitted, OmissionStatus::Selection);
 
     let beyond = extract(&path, &options(parse_pages("99").unwrap()));
+    assert_eq!(beyond.status, OperationStatus::Complete);
     assert_eq!(beyond.metadata.status, OperationStatus::Complete);
     assert_eq!(
         beyond.selection.returned_indices,
@@ -184,6 +187,7 @@ fn text_first_n_and_ranges_have_exact_coverage() {
             .collect::<Vec<_>>(),
         ["1", "2", "3", "5"]
     );
+    assert_eq!(ranges.status, OperationStatus::Complete);
     assert_eq!(ranges.metadata.status, OperationStatus::Complete);
     assert_eq!(ranges.completeness, Completeness::Partial);
     assert_eq!(ranges.selection.omitted, OmissionStatus::Selection);
@@ -202,12 +206,12 @@ fn selectors_reject_invalid_and_wholly_unavailable_indices() {
             ranges: vec![NativeRange { start: 3, end: 4 }],
         }),
     );
-    assert_eq!(report.metadata.status, OperationStatus::Failed);
+    assert_eq!(report.status, OperationStatus::Failed);
+    assert_eq!(report.metadata.status, OperationStatus::Complete);
     assert!(report.content.units.is_empty());
     assert_eq!(report.completeness, Completeness::Unavailable);
     assert!(
         report
-            .metadata
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("outside the available count"))
@@ -225,7 +229,8 @@ fn content_limits_are_partial_and_explicit() {
             ..options(NativeSelection::All)
         },
     );
-    assert_eq!(chars.metadata.status, OperationStatus::Partial);
+    assert_eq!(chars.status, OperationStatus::Partial);
+    assert_eq!(chars.metadata.status, OperationStatus::Complete);
     assert_eq!(chars.selection.omitted, OmissionStatus::SafetyLimit);
     assert_eq!(chars.content.units[0].text.as_deref(), Some("alpha b"));
 
@@ -236,6 +241,8 @@ fn content_limits_are_partial_and_explicit() {
             ..options(NativeSelection::All)
         },
     );
+    assert_eq!(tokens.status, OperationStatus::Partial);
+    assert_eq!(tokens.metadata.status, OperationStatus::Complete);
     assert_eq!(tokens.selection.omitted, OmissionStatus::SafetyLimit);
     assert_eq!(tokens.content.units[0].text.as_deref(), Some("alpha beta"));
 }
@@ -244,6 +251,7 @@ fn content_limits_are_partial_and_explicit() {
 #[test]
 fn epub_spine_items_keep_independent_expected_text() {
     let report = selected("native.epub", NativeSelection::All);
+    assert_eq!(report.status, OperationStatus::Complete);
     assert_eq!(report.metadata.status, OperationStatus::Complete);
     assert_eq!(report.selection.available.value, Some(2));
     assert_eq!(
@@ -267,6 +275,7 @@ fn epub_spine_items_keep_independent_expected_text() {
 #[test]
 fn mobi_decoded_record_is_not_relabelled_as_a_chapter() {
     let report = selected("native.mobi", NativeSelection::All);
+    assert_eq!(report.status, OperationStatus::Complete);
     assert_eq!(report.metadata.status, OperationStatus::Complete);
     assert_eq!(
         report.selection.unit,
@@ -326,6 +335,7 @@ fn open_document_blocks_and_slides_match_native_oracles() {
 #[test]
 fn pdf_ranges_select_physical_pages() {
     let full = selected("native.pdf", NativeSelection::All);
+    assert_eq!(full.status, OperationStatus::Complete);
     assert_eq!(full.metadata.status, OperationStatus::Complete);
     assert_eq!(full.selection.available.value, Some(2));
     assert!(
@@ -353,7 +363,8 @@ fn csv_preview_ranges_preserve_rows_and_values() {
     let report = extract(&path, &options(parse_pages("2-4,3").unwrap()));
     assert_eq!(report.selection.available.value, Some(5));
     assert_eq!(report.selection.returned_indices, [2, 3, 4]);
-    assert_eq!(report.metadata.status, OperationStatus::Partial);
+    assert_eq!(report.status, OperationStatus::Partial);
+    assert_eq!(report.metadata.status, OperationStatus::Complete);
     assert_eq!(report.selection.omitted, OmissionStatus::SafetyLimit);
     assert_eq!(report.content.units[0].text.as_deref(), Some("beta\t2"));
     assert_eq!(report.content.units[0].rows[0].values, ["beta", "2"]);
@@ -396,6 +407,7 @@ fn public_pdf_ocr_emits_native_layout_provenance() {
     let path = directory.join("scan.pdf");
     scanned_pdf(&path);
     let report = extract(&path, &ExtractOptions::default());
+    assert_eq!(report.status, OperationStatus::Complete);
     assert_eq!(report.metadata.status, OperationStatus::Complete);
     let scanned = &report.content.units[0];
     assert!(

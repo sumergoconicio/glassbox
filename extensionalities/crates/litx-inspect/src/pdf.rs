@@ -548,9 +548,11 @@ fn ocr_raster_bound(width_pt: f32, height_pt: f32, max_long_edge: u32) -> Result
 ///
 /// Accepts owned PDF bytes, a destination report, v2-mapped legacy controls,
 /// and the worker-owned OCR session with its active file lease.
-/// Returns unit after native extraction, optional local OCR, and projection. Open,
-/// selection, extraction, model, staging, recognition, and merge failures retain
-/// available native content and become diagnostics. No model download is attempted.
+/// Returns unit after native extraction, optional local OCR, and projection,
+/// preserving any non-empty PDF `/PageLabels` printed label on each page unit.
+/// Open, selection, extraction, model, staging, recognition, and merge failures
+/// retain available native content and become diagnostics. No model download is
+/// attempted.
 fn extract_v2(
     bytes: Vec<u8>,
     report: &mut InspectReport,
@@ -818,6 +820,7 @@ fn extract_v2(
             page.text,
             origin,
         );
+        unit.label = page.page_label.filter(|label| !label.trim().is_empty());
         if matches!(
             origin,
             crate::reports::ContentOrigin::Ocr | crate::reports::ContentOrigin::Mixed

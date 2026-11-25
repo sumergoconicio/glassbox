@@ -1,6 +1,6 @@
 //! Module: glassbox-inspect versioned report contracts.
 //! File: reports.rs.
-//! Responsibility: Define typed v2 inspection and extraction models without coupling metadata to body extraction.
+//! Responsibility: Define typed inspection and extraction models without coupling metadata to body extraction.
 //!
 //! The crate-root legacy options and report remain operational while readers migrate.
 //! No adapter projects a legacy body-producing report into [`MetadataReport`]: such a
@@ -9,8 +9,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Current public report schema version.
-pub const REPORT_SCHEMA_VERSION: u8 = 2;
+/// Current public canonical schema v3 wire version (used by `InspectReportV3` and `ExtractReportV3`).
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
+/// Legacy v2 wire version used when serializing [`MetadataReport`] and [`ExtractReport`] directly.
+pub const LEGACY_REPORT_SCHEMA_VERSION: u32 = 2;
 /// Default maximum thumbnail edge in pixels.
 pub const DEFAULT_THUMBNAIL_MAX_EDGE: u32 = 320;
 /// Approved default OCR raster long edge in pixels for later extraction readers.
@@ -58,6 +60,7 @@ pub enum NativeUnit {
     DocumentBlock,
     Paragraph,
     Table,
+    PageBreak,
     SpineItem,
     MobiTextRecord,
     LogicalLine,
@@ -140,11 +143,23 @@ pub enum SnapshotGuarantee {
     NotImmutable,
 }
 
+/// Domain-separated sampled file fingerprint used above the full-hash size threshold.
+///
+/// Fingerprints are comparable only against other fingerprints with the same
+/// `scheme` and never substitute for a full-file `sha256` digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SampledFingerprint {
+    pub scheme: String,
+    pub value: String,
+}
+
 /// Streamed digest facts and their relationship to the observed source identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DigestReport {
     pub algorithm: DigestAlgorithm,
     pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<SampledFingerprint>,
     pub bytes_hashed: QualifiedCount,
     pub consistency: ConsistencyStatus,
     pub source_identity: ConsistencyStatus,
@@ -401,6 +416,9 @@ pub struct DocumentMetadata {
     pub digest: DigestReport,
     pub counts: Vec<QualifiedCount>,
     pub schema_identifiers: Vec<SchemaIdentifier>,
+    /// Namespace prefix-to-URI map (`ns0`, `ns1`, ...) for XML schema paths; omitted when empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub xml_namespaces: std::collections::BTreeMap<String, String>,
     pub embedded_metadata: Vec<SourcedMetadata>,
     pub text_layer: TextLayerStatus,
     pub ocr_recommended: OcrRecommendation,
@@ -420,22 +438,24 @@ pub struct DocumentMetadata {
     pub provenance: Vec<MetadataProvenance>,
 }
 
-/// Metadata-only v2 report; it has no legacy report, body, rows, or OCR output field.
+/// Metadata-only report; it has no legacy report, body, rows, or OCR output field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetadataReport {
-    pub schema_version: u8,
+    pub schema_version: u32,
     pub kind: ReportKind,
     pub metadata: DocumentMetadata,
 }
 
 impl Default for MetadataReport {
-    /// Creates an inspect-marked v2 report whose facts start unknown or unavailable.
+    /// Creates an inspect-marked legacy-envelope report whose facts start unknown or unavailable.
     ///
-    /// Accepts no parameters. Returns a metadata-only report with schema version 2.
+    /// Accepts no parameters. Returns a metadata-only report stamped with
+    /// [`LEGACY_REPORT_SCHEMA_VERSION`] (`2`) for its `metadata`-wrapper layout;
+    /// project with [`MetadataReport::to_v3`] to obtain canonical schema v3 (`3`).
     /// This constructor performs no I/O and has no failure states.
     fn default() -> Self {
         Self {
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: LEGACY_REPORT_SCHEMA_VERSION,
             kind: ReportKind::Inspect,
             metadata: DocumentMetadata::default(),
         }
@@ -620,6 +640,13 @@ pub struct ContentUnit {
     pub unit_index: u64,
     pub unit: NativeUnit,
     pub source_part: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional one-based source-order ordinal for typed structural markers
+    /// (such as document tables and explicit page breaks) preserved across
+    /// partial native-unit selections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_index: Option<u64>,
     pub text: Option<String>,
     pub rows: Vec<ContentRow>,
     pub provenance: Vec<ExtractionProvenance>,
@@ -629,16 +656,27 @@ pub struct ContentUnit {
 /// Explicit extracted payload kept separate from [`DocumentMetadata`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ExtractedContent {
+    /// Budgeted column headers for row-stream tabular extractions (such as CSV/TSV).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
     pub units: Vec<ContentUnit>,
 }
 
-/// Extraction v2 report with content, provenance, source coverage, and selection.
-/// Top-level completeness describes returned source coverage, independently of
-/// whether the requested operation in metadata.status completed.
+/// Extraction report with content, provenance, source coverage, and selection.
+/// Top-level `status` and `diagnostics` describe the extraction operation
+/// independently of the embedded standalone inspection result in `metadata`.
+/// Top-level `completeness` describes returned source coverage, independently of
+/// whether the requested operation in `status` completed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractReport {
-    pub schema_version: u8,
+    pub schema_version: u32,
     pub kind: ReportKind,
+    /// Extraction operation outcome, kept independent of `metadata.status`.
+    #[serde(default)]
+    pub status: OperationStatus,
+    /// Extraction-stage diagnostics (selection, limits, reader/OCR, and artifact errors).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     pub metadata: DocumentMetadata,
     pub content: ExtractedContent,
     pub provenance: Vec<ExtractionProvenance>,
@@ -646,15 +684,35 @@ pub struct ExtractReport {
     pub selection: SelectionReport,
 }
 
-impl Default for ExtractReport {
-    /// Creates an extract-marked v2 report with empty content and unavailable facts.
+impl ExtractReport {
+    /// Returns the effective extraction operation status, falling back to
+    /// `metadata.status` only for legacy deserialized reports whose top-level
+    /// `status` defaulted to [`OperationStatus::Unknown`].
     ///
-    /// Accepts no parameters. Returns schema version 2 and an all-unit unknown selection.
+    /// Accepts `&self`. Returns the resolved [`OperationStatus`]. Performs no
+    /// I/O and cannot fail.
+    pub fn extraction_status(&self) -> OperationStatus {
+        if self.status == OperationStatus::Unknown {
+            self.metadata.status
+        } else {
+            self.status
+        }
+    }
+}
+
+impl Default for ExtractReport {
+    /// Creates an extract-marked legacy-envelope report with empty content and unavailable facts.
+    ///
+    /// Accepts no parameters. Returns [`LEGACY_REPORT_SCHEMA_VERSION`] (`2`) for the
+    /// legacy `metadata`-wrapper layout and an all-unit unknown selection; project with
+    /// [`ExtractReport::to_v3`] to obtain canonical schema v3 (`3`).
     /// This constructor performs no extraction or I/O and has no failure states.
     fn default() -> Self {
         Self {
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: LEGACY_REPORT_SCHEMA_VERSION,
             kind: ReportKind::Extract,
+            status: OperationStatus::Unknown,
+            diagnostics: Vec::new(),
             metadata: DocumentMetadata::default(),
             content: ExtractedContent::default(),
             provenance: Vec::new(),

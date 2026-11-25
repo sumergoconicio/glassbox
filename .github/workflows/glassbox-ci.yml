@@ -69,6 +69,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_TARGET_DIR: ${{ github.workspace }}/extensionalities/target/ci
+      CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/extensionalities/target/ci
       TESSDATA_PREFIX: /usr/share/tesseract-ocr/5/tessdata
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

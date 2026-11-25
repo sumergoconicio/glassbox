@@ -2,17 +2,17 @@
 
 Glassbox provides local parsing, metadata inspection, and content extraction.
 
-Use these guides for the unified Glassbox CLI.
-The `--help` output of your installed build is authoritative for that build.
+Use these guides for the unified `glassbox` CLI.
+The `--help` output of your build is the authoritative reference for that build.
 
-- [Installation](installation.md) — build from source, prerequisites, platforms, verification.
-- [CLI reference and parsing](cli.md) — every downstream command and flag, upstream `parse`, migrations.
-- [Metadata inspection](inspect.md) — metadata-only reports, thumbnails, directory inventories.
-- [Content extraction](extract.md) — native-unit selection, OCR, saved artifacts.
-- [Formats and limits](formats.md) — per-format behavior and safety boundaries.
-- [Automation and directory inventories](automation.md) — batch JSONL, saved artifacts, CI, upstream sync, and local build cleanup.
-- [Reports and programmatic use](reports.md) — v2 report schema, exit statuses, provenance fields.
-- [OCR and troubleshooting](ocr-and-troubleshooting.md) — language data, OCR behavior, failure modes.
+- [Installation](installation.md) — build from source, prerequisites, platforms, and build verification.
+- [CLI reference and parsing](cli.md) — downstream commands, flags, upstream `parse`, and migration notes.
+- [Metadata inspection](inspect.md) — schema v3 inspection reports, 23 format types, sampled fingerprints, and thumbnails.
+- [Content extraction](extract.md) — native-unit selection, `bodymatter:v1` Markdown markers, OCR, and caps.
+- [Formats and limits](formats.md) — format families, support matrix, and fixed safety caps.
+- [Automation and directory inventories](automation.md) — batch JSONL, directory scans, saved artifacts, CI, sync, and build cleanup.
+- [Reports and programmatic use](reports.md) — schema v3 JSON contracts, Rust API, and migrations.
+- [OCR and troubleshooting](ocr-and-troubleshooting.md) — language models, OCR behavior, and common failures.
 
-Start with [Installation](installation.md), then the [CLI reference](cli.md).
-The repository [README](../README.md) stays the quick entry point.
+Start with [Installation](installation.md), then read the [CLI reference](cli.md).
+The downstream [README](../README.md) stays the quick entry point.

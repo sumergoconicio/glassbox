@@ -216,6 +216,8 @@ impl Grid {
     pub fn new(name: String, index: usize) -> Self {
         Self {
             sheet: Sheet {
+                first_row: None,
+                first_row_truncated: false,
                 preview_rows: vec![],
                 preview_truncated: false,
                 headers_preview: vec![],

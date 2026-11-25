@@ -4,8 +4,8 @@
 
 Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse-extended` so upstream `liteparse` syncs and merges stay clean:
 
-- Keep all fork-specific source, manifests, lockfile, fixtures, development records (`dev/` and `dev/PRDs/`), and test/audit scratch (`sandbox/` and `target/`) exclusively inside `extensionalities/`.
-- Never place `dev/`, `PRDs/`, `sandbox/`, or downstream artifacts in the upstream repository root or upstream crate directories.
+- Keep all fork-specific source, manifests, lockfile, fixtures, development records (`dev/` and `dev/PRDs/`), and test/audit scratch (`sandbox/` and `target/`) inside `extensionalities/`. The shared Cargo intermediate directory is the repository's ignored `../target/`.
+- Keep `dev/`, `PRDs/`, `sandbox/`, and downstream final artifacts inside `extensionalities/`.
 - This is an independent Cargo workspace. Do not register its crates in the upstream root workspace.
 - Use the upstream `liteparse` public library through the path dependency. Do not patch its CLI or other upstream-owned files.
 - Build and check with the explicit `extensionalities/Cargo.toml` manifest; commit this workspace's `Cargo.lock`.
@@ -23,8 +23,8 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 - Keep non-code development documentation under [`dev/`](dev/README.md), not beside the Cargo workspace files. This `AGENTS.md` remains at the downstream root as the agent entrypoint.
 - Public user documentation lives under [`docs/`](docs/README.md). Development records stay under `dev/`.
 - [`README.md`](README.md) is the public Glassbox guide. Keep `../README.md` unchanged as upstream documentation.
-- Current Glassbox behavior follows the v2 contracts in [`dev/docs/settling-in-interfaces.md`](dev/docs/settling-in-interfaces.md). Inspection is metadata-only; extraction selects native units.
-- Group each feature's phases in its own `dev/PRDs/YYYYMMDD_<feature-slug>/` folder. The inspection/extraction work is [`20261117_litx-inspect-extract`](dev/PRDs/20261117_litx-inspect-extract/README.md), XML profiling is [`20261118_xml-structure-profile`](dev/PRDs/20261118_xml-structure-profile/README.md), and the current unification work is [`20261121_settling_in`](dev/PRDs/20261121_settling_in/spec.md).
+- Current Glassbox behavior follows the v3 contracts in [`docs/reports.md`](docs/reports.md) and [`20261123_inspect-extract-outputs`](dev/PRDs/20261123_inspect-extract-outputs/spec.md). Inspection is metadata-only; extraction selects native units and emits `bodymatter:v1` Markdown markers. Historical v2 contracts remain in [`dev/docs/settling-in-interfaces.md`](dev/docs/settling-in-interfaces.md).
+- Group each feature's phases in its own `dev/PRDs/YYYYMMDD_<feature-slug>/` folder. Prior work covers [`20261117_litx-inspect-extract`](dev/PRDs/20261117_litx-inspect-extract/README.md), [`20261118_xml-structure-profile`](dev/PRDs/20261118_xml-structure-profile/README.md), and v2 unification [`20261121_settling_in`](dev/PRDs/20261121_settling_in/spec.md); the current v3 inspect/extract outputs work is [`20261123_inspect-extract-outputs`](dev/PRDs/20261123_inspect-extract-outputs/spec.md).
 - Keep temporary audit harnesses, dogfood probes, and scratch test fixtures inside [`sandbox/`](sandbox/) (gitignored by `extensionalities/.gitignore`), not in the upstream root or `/tmp`. Clean temporary scratch inputs after runs.
 - Keep code, Cargo manifests/lockfile, scripts, and executable test fixtures in their existing locations. Text fixtures such as `fixtures/hello.txt` are test data, not development documentation.
 - Preserve historical reports and their approvals, limitations, verification claims, and receipts. Moving a report does not make its historical checks current or grant audit clearance.
@@ -32,7 +32,8 @@ Treat `extensionalities/` as a standalone downstream mini-repo inside `liteparse
 
 ## Local build cleanup
 
-- Before a build or verification campaign, reuse an appropriate Cargo target where isolation rules permit. For a local Glassbox-only build, use `--bin glassbox`. Keep the `litx` target in source for compatibility checks.
+- Use the shared Cargo intermediate directory in `../target/` for routine upstream, downstream, and spike builds. Cargo keeps final artifacts in each workspace's target directory. For a local Glassbox-only build, use `--bin glassbox`.
+- Set both `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the isolated path for clean-build measurements and verification that requires isolation.
 - For isolated runs, record the exact disposable paths under `target/` or `sandbox/` before starting. Keep logs, results, and audit evidence separate from disposable build trees.
 - Check for stale build trees before a new campaign, after a run ends or stops, and under disk pressure. Sri grants standing approval to clean verified stale Cargo build trees under `target/` without asking again. For other paths, list exact targets and obtain approval before removal. No scheduler is required.
 - Before cleanup, confirm each path is local, inside this workspace, ignored by Git, and free of active builds, symlinked path components, and nested mounts. Preserve current release binaries, shared caches in use, fixtures, and audit evidence. Do not treat arbitrary old or ignored files as stale build trees.
@@ -78,21 +79,29 @@ After changing managed records, run `--write-index --route` for that feature. Th
 
 The migrated inspection/extraction reports are historical evidence linked from a retrospective **draft** intent. No historical design/spec approval, task completion, or independent audit verdict has been fabricated. The pending read-only audit may proceed under its explicit user brief; the migration does not authorize new implementation.
 
+The guide before the shared Cargo build directory is preserved in [`20261124-AGENTS.before-shared-cargo-build-dir.md`](dev/instruction-history/20261124-AGENTS.before-shared-cargo-build-dir.md).
+Its SHA-256 is `86b0938998358314e21a3f21a0f06dc1086661c0cbab4695e3eff9f42340ff45`.
+
 ## Upstream-sync ignore guard
 
-User-authorized upstream-file exceptions are the ignore rule and these GitHub-required entry files:
+User-authorized upstream-file exceptions cover the ignore rule, the shared Cargo config, and the GitHub entry files:
 
 - `../.gitignore`: preserve `/extensionalities/dev/`.
+- `../.cargo/config.toml`: share Cargo intermediates for routine builds.
+- `../.github/README.md`: Glassbox GitHub landing page.
 - `../.github/workflows/glassbox-ci.yml`: downstream checks.
 - `../.github/workflows/glassbox-upstream-sync.yml`: checked upstream synchronization.
 
 Keep workflow implementation and tests under `scripts/`; keep the root README unchanged.
-The sync preserves exact downstream and workflow trees and mirrors upstream-owned paths elsewhere.
+The sync preserves exact downstream and workflow trees and the protected root files. It mirrors upstream-owned paths elsewhere.
 Automatic merging requires every reported check to succeed and enforced, strict required checks on `main`.
 Publication, live activation, credential installation, and billing changes require separate authorization.
 
 The pre-automation guide is preserved in [`20261121-AGENTS.before-ci-automation.md`](dev/instruction-history/20261121-AGENTS.before-ci-automation.md).
 Its SHA-256 is `7e7b23fea299cb8df936dfd96f66a87efc3755c0af8e96b74f2a9a646f0d005a`.
+
+The guide before the GitHub landing page is preserved in [`20261123-AGENTS.before-github-readme.md`](dev/instruction-history/20261123-AGENTS.before-github-readme.md).
+Its SHA-256 is `d7da2b7cd13da0d0e235b0c35509294431858658786c6d2bfcfb57372928f266`.
 
 - Check that exact rule after upstream pulls, merges, rebases, or other syncs, and before staging development records.
 - If a sync removes it, restore only that rule while preserving the other upstream ignore entries.
@@ -120,3 +129,6 @@ Its SHA-256 is `603911a38e2cb8cebe49b4274f4b73eb126777cd9f87b0f2b3364f0442f97ebf
 
 The guide before settling-in documentation is preserved in [`20261122-AGENTS.before-settling-in.md`](dev/instruction-history/20261122-AGENTS.before-settling-in.md).
 Its SHA-256 is `92ae9c00167b064b99278d17b7e2bbe2d644719303090b628a292bcd7e1d54be`.
+
+The guide before v3 documentation parity is preserved in [`20261124-AGENTS.before-v3-doc-parity.md`](dev/instruction-history/20261124-AGENTS.before-v3-doc-parity.md).
+Its SHA-256 is `18efdee80e0d4b0bd368bd93735da2c880c0b530cc78e6755c1dc8e37bef30cc`.

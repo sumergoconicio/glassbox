@@ -1,10 +1,10 @@
-// Module: glassbox-cli private artifact publication.
-// File: output.rs.
-// Responsibility: Save v2 metadata and content artifacts through no-overwrite, no-follow, complete-file publication.
+//! Module: glassbox-cli private artifact publication.
+//! File: output.rs.
+//! Responsibility: Save schema v3 metadata and extraction artifacts through no-overwrite, no-follow, complete-file publication.
 
 use glassbox_inspect::reports::{
     Artifact, ArtifactKind, Completeness, Diagnostic, DiagnosticSeverity, DiagnosticStage,
-    DocumentMetadata, ExtractReport, MetadataReport, OperationStatus,
+    DigestReport, DocumentMetadata, ExtractReport, MetadataReport, OperationStatus,
 };
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -669,6 +669,42 @@ fn publish_one(
     name: &std::ffi::CStr,
     empty_path_usable: &mut bool,
 ) -> std::io::Result<()> {
+    publish_one_with_procfs(
+        directory_fd,
+        file,
+        bytes,
+        name,
+        empty_path_usable,
+        link_procfs,
+        link_staging,
+    )
+}
+
+/// Links one prepared artifact through injected procfs and staging linkers.
+///
+/// Accepts the anchored directory descriptor, anonymous temporary handle,
+/// complete bytes, final name, shared `AT_EMPTY_PATH` usability flag, a procfs
+/// linker closure, and a staging fallback linker closure. Returns unit after
+/// the artifact appears under the final name. When `empty_path_usable` is true,
+/// `AT_EMPTY_PATH` is tried first; otherwise or after missing-privilege denial,
+/// `procfs_link` runs. `AlreadyExists` from `procfs_link` short-circuits
+/// immediately without invoking `staging_link`; any other `procfs_link` error
+/// falls back to `staging_link` and preserves both error causes if staging also
+/// fails.
+#[cfg(target_os = "linux")]
+fn publish_one_with_procfs<F, G>(
+    directory_fd: i32,
+    file: &std::fs::File,
+    bytes: &[u8],
+    name: &std::ffi::CStr,
+    empty_path_usable: &mut bool,
+    mut procfs_link: F,
+    mut staging_link: G,
+) -> std::io::Result<()>
+where
+    F: FnMut(&std::fs::File, i32, &std::ffi::CStr) -> std::io::Result<()>,
+    G: FnMut(i32, &std::ffi::CStr, &[u8]) -> std::io::Result<()>,
+{
     if *empty_path_usable {
         match link_empty_path(file, directory_fd, name) {
             Ok(()) => return Ok(()),
@@ -676,9 +712,10 @@ fn publish_one(
             Err(error) => return Err(error),
         }
     }
-    match link_procfs(file, directory_fd, name) {
+    match procfs_link(file, directory_fd, name) {
         Ok(()) => Ok(()),
-        Err(procfs) => link_staging(directory_fd, name, bytes).map_err(|staged| {
+        Err(procfs) if procfs.kind() == std::io::ErrorKind::AlreadyExists => Err(procfs),
+        Err(procfs) => staging_link(directory_fd, name, bytes).map_err(|staged| {
             std::io::Error::new(
                 staged.kind(),
                 format!("descriptor link unavailable (procfs: {procfs}; staged: {staged})"),
@@ -761,21 +798,29 @@ fn artifact_stem(identity: &glassbox_inspect::reports::SourceIdentity, sequence:
     format!("{basename}-{sequence:06}")
 }
 
-/// Selects a trusted digest prefix or explicit no-hash artifact identity.
+/// Selects a trusted digest prefix, sampled fingerprint stem, or `unhashed` fallback.
 ///
-/// Accepts shared document metadata. Returns the first twelve hexadecimal
-/// digest characters when consistent, otherwise `nohash`. No source bytes are
-/// read and no new digest is computed.
-fn digest_prefix(metadata: &DocumentMetadata) -> String {
-    metadata
-        .digest
-        .digest
-        .as_deref()
-        .filter(|_| {
-            metadata.digest.consistency == glassbox_inspect::reports::ConsistencyStatus::Consistent
-        })
-        .map(|digest| digest[..12].to_owned())
-        .unwrap_or_else(|| "nohash".to_owned())
+/// Accepts a [`DigestReport`]. Returns the first twelve characters of the full
+/// SHA-256 hex digest when consistent and non-empty, `fp-<first 12 chars>` when
+/// consistent with a sampled fingerprint, or `"unhashed"` on hash failure,
+/// missing digest/fingerprint, or concurrent source mutation. Performs no I/O
+/// and cannot panic.
+fn digest_prefix(digest: &DigestReport) -> String {
+    if digest.consistency != glassbox_inspect::reports::ConsistencyStatus::Consistent {
+        return "unhashed".to_owned();
+    }
+    if let Some(hex) = digest.digest.as_deref().filter(|hex| !hex.is_empty()) {
+        return hex.chars().take(12).collect();
+    }
+    if let Some(fingerprint) = digest
+        .fingerprint
+        .as_ref()
+        .filter(|fp| !fp.value.is_empty())
+    {
+        let prefix: String = fingerprint.value.chars().take(12).collect();
+        return format!("fp-{prefix}");
+    }
+    "unhashed".to_owned()
 }
 
 /// Adds artifact outcomes and converts publication errors into failed reports.
@@ -811,15 +856,22 @@ fn finish_publication(
     }
 }
 
-/// Persists a content-free summary and identical v2 metadata JSON report.
+/// Persists a content-free v3 summary and identical v3 metadata JSON report.
 ///
-/// Accepts a mutable metadata report, output directory, and deterministic item
-/// sequence. Returns unit after artifact publication and typed report updates.
-/// Collisions, unsafe directories, encoding, and I/O failures become artifact
-/// diagnostics and failed status; no existing file is overwritten.
-pub(crate) fn persist_metadata(report: &mut MetadataReport, directory: &Path, sequence: usize) {
+/// Accepts a mutable metadata report, output directory, deterministic item
+/// sequence, and `verbose` flag (controlling whether reader provenance is
+/// included in the saved `.json` and `.md` artifacts). Returns unit after
+/// artifact publication and typed report updates. Collisions, unsafe
+/// directories, encoding, and I/O failures become artifact diagnostics and
+/// failed status; no existing file is overwritten.
+pub(crate) fn persist_metadata(
+    report: &mut MetadataReport,
+    directory: &Path,
+    sequence: usize,
+    verbose: bool,
+) {
     let stem = artifact_stem(&report.metadata.identity, sequence);
-    let stem = format!("{}-{}", stem, digest_prefix(&report.metadata));
+    let stem = format!("{}-{}", stem, digest_prefix(&report.metadata.digest));
     let directory = absolute_lexical(directory).unwrap_or_else(|_| directory.to_path_buf());
     let summary_path = directory.join(format!("{stem}.md"));
     let json_path = directory.join(format!("{stem}.json"));
@@ -844,7 +896,8 @@ pub(crate) fn persist_metadata(report: &mut MetadataReport, directory: &Path, se
         .metadata
         .artifacts
         .extend([summary_artifact.clone(), json_artifact.clone()]);
-    let result = serde_json::to_vec(report)
+    let v3_report = report.to_v3(verbose);
+    let result = serde_json::to_vec(&v3_report)
         .map_err(|error| failure("serialize metadata report", vec![], error))
         .and_then(|json| {
             publish(
@@ -852,7 +905,8 @@ pub(crate) fn persist_metadata(report: &mut MetadataReport, directory: &Path, se
                 vec![
                     PendingArtifact {
                         artifact: summary_artifact,
-                        bytes: glassbox_inspect::metadata::summary(report).into_bytes(),
+                        bytes: glassbox_inspect::metadata::summary_markdown(report, verbose)
+                            .into_bytes(),
                     },
                     PendingArtifact {
                         artifact: json_artifact,
@@ -869,15 +923,64 @@ pub(crate) fn persist_metadata(report: &mut MetadataReport, directory: &Path, se
     );
 }
 
-/// Persists selected Markdown content and identical canonical v2 extraction JSON.
+/// Adds extraction artifact outcomes and records publication errors on the
+/// top-level extraction report without mutating the nested inspection metadata.
 ///
-/// Accepts a mutable extraction report, output directory, and deterministic
-/// item sequence. Returns unit after complete-file publication. Collisions,
-/// unsafe directories, serialization, and I/O failures become artifact errors;
-/// existing paths and prior successful artifacts are never truncated.
-pub(crate) fn persist_extract(report: &mut ExtractReport, directory: &Path, sequence: usize) {
+/// Accepts a mutable [`ExtractReport`], the artifact insertion point,
+/// publication result, and operation-specific error code. Returns unit after
+/// retaining only actually published paths. On failure, records the artifact
+/// error in `report.diagnostics`, sets `report.status = OperationStatus::Failed`,
+/// and degrades `report.completeness` from `Exact` to `Partial` while preserving
+/// `Unavailable` and keeping `report.metadata.status` and `report.metadata.diagnostics`
+/// untouched.
+fn finish_extract_publication(
+    report: &mut ExtractReport,
+    inserted_at: usize,
+    result: Result<Vec<Artifact>, OutputFailure>,
+    code: &str,
+) {
+    match result {
+        Ok(published) => {
+            report.metadata.artifacts.truncate(inserted_at);
+            report.metadata.artifacts.extend(published);
+        }
+        Err(error) => {
+            report.metadata.artifacts.truncate(inserted_at);
+            report.metadata.artifacts.extend(error.published);
+            report.diagnostics.push(Diagnostic {
+                stage: DiagnosticStage::Artifact,
+                severity: DiagnosticSeverity::Error,
+                code: code.to_owned(),
+                message: error.message,
+                unit_index: None,
+            });
+            report.status = OperationStatus::Failed;
+            if report.completeness != Completeness::Unavailable {
+                report.completeness = Completeness::Partial;
+            }
+        }
+    }
+}
+
+/// Persists selected Markdown content and identical canonical v3 extraction JSON.
+///
+/// Accepts a mutable extraction report, output directory, deterministic item
+/// sequence, `verbose` flag (controlling provenance in the saved `.json`), and
+/// `include_markers` (`true` to emit `bodymatter:v1` structure comments in the
+/// saved `.md`, `false` for `--no-markers`). Returns unit after complete-file
+/// publication. Collisions, unsafe directories, serialization, and I/O failures
+/// become top-level extraction artifact errors without mutating the nested
+/// inspection status; existing paths and prior successful artifacts are never
+/// truncated.
+pub(crate) fn persist_extract(
+    report: &mut ExtractReport,
+    directory: &Path,
+    sequence: usize,
+    verbose: bool,
+    include_markers: bool,
+) {
     let stem = artifact_stem(&report.metadata.identity, sequence);
-    let stem = format!("{}-{}", stem, digest_prefix(&report.metadata));
+    let stem = format!("{}-{}", stem, digest_prefix(&report.metadata.digest));
     let directory = absolute_lexical(directory).unwrap_or_else(|_| directory.to_path_buf());
     let markdown_path = directory.join(format!("{stem}.md"));
     let json_path = directory.join(format!("{stem}.json"));
@@ -902,7 +1005,8 @@ pub(crate) fn persist_extract(report: &mut ExtractReport, directory: &Path, sequ
         .metadata
         .artifacts
         .extend([markdown_artifact.clone(), json_artifact.clone()]);
-    let result = serde_json::to_vec(report)
+    let v3_report = report.to_v3(verbose);
+    let result = serde_json::to_vec(&v3_report)
         .map_err(|error| failure("serialize extraction report", vec![], error))
         .and_then(|json| {
             publish(
@@ -910,7 +1014,11 @@ pub(crate) fn persist_extract(report: &mut ExtractReport, directory: &Path, sequ
                 vec![
                     PendingArtifact {
                         artifact: markdown_artifact,
-                        bytes: glassbox_inspect::selection::render_markdown(report).into_bytes(),
+                        bytes: glassbox_inspect::selection::render_markdown_with_options(
+                            report,
+                            include_markers,
+                        )
+                        .into_bytes(),
                     },
                     PendingArtifact {
                         artifact: json_artifact,
@@ -919,20 +1027,52 @@ pub(crate) fn persist_extract(report: &mut ExtractReport, directory: &Path, sequ
                 ],
             )
         });
-    finish_publication(
-        &mut report.metadata,
-        inserted_at,
-        result,
-        "extraction_output_failed",
-    );
-    if report.metadata.status == OperationStatus::Failed {
-        report.completeness = Completeness::Partial;
-    }
+    finish_extract_publication(report, inserted_at, result, "extraction_output_failed");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks digest_prefix selects full SHA-256, `fp-` sampled fingerprint, or `unhashed`.
+    ///
+    /// Accepts no parameters. Returns unit after checking consistent full-hash,
+    /// consistent sampled fingerprint, source-changed mutation, and missing
+    /// digest/fingerprint states. Performs no I/O.
+    #[test]
+    fn digest_prefix_distinguishes_sha256_sampled_fingerprint_and_unhashed() {
+        use glassbox_inspect::reports::{ConsistencyStatus, SampledFingerprint};
+        let full = DigestReport {
+            digest: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            consistency: ConsistencyStatus::Consistent,
+            ..DigestReport::default()
+        };
+        assert_eq!(digest_prefix(&full), "0123456789ab");
+
+        let sampled = DigestReport {
+            digest: None,
+            fingerprint: Some(SampledFingerprint {
+                scheme: "glassbox-sampled-sha256/v1".to_owned(),
+                value: "fedcba9876543210fedcba9876543210".to_owned(),
+            }),
+            consistency: ConsistencyStatus::Consistent,
+            ..DigestReport::default()
+        };
+        assert_eq!(digest_prefix(&sampled), "fp-fedcba987654");
+
+        let changed = DigestReport {
+            digest: Some("0123456789abcdef".to_owned()),
+            consistency: ConsistencyStatus::SourceChanged,
+            ..DigestReport::default()
+        };
+        assert_eq!(digest_prefix(&changed), "unhashed");
+
+        let empty = DigestReport {
+            consistency: ConsistencyStatus::Consistent,
+            ..DigestReport::default()
+        };
+        assert_eq!(digest_prefix(&empty), "unhashed");
+    }
 
     /// Checks that concurrent creators converge on one private real directory.
     #[test]
@@ -1123,16 +1263,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Checks the procfs fallback links anonymous files as an ordinary user.
+    /// Checks whether a `link_procfs` error indicates a sandbox restricting `/proc/self/fd` linking.
+    ///
+    /// Accepts a raw `std::io::Error` returned by `link_procfs`. Returns `true`
+    /// for `NotFound`, `PermissionDenied`, or `Unsupported` (e.g., restricted
+    /// mount namespaces or seccomp sandboxes without `/proc/self/fd` linking);
+    /// returns `false` for all other errors. Performs no I/O and cannot panic.
+    #[cfg(target_os = "linux")]
+    fn procfs_link_restricted(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::Unsupported
+        )
+    }
+
+    /// Checks the procfs fallback links anonymous files privately, or falls back to staging cleanly.
     ///
     /// Accepts no parameters. Returns unit after linking one anonymous
-    /// temporary exclusively through `/proc/self/fd`. A link failure, changed
-    /// bytes, or a public mode panics; this is the publication path Linux below
-    /// 6.10 takes after the kernel denies AT_EMPTY_PATH.
+    /// temporary through `/proc/self/fd` on bare-metal Linux, or verifying that
+    /// `publish_one` / `publish_prepared` cleanly falls back to `link_staging`
+    /// when a restricted sandbox blocks `/proc/self/fd` linking or `O_TMPFILE`.
+    /// Unexpected errors, changed bytes, leftover temp names, or a non-0600
+    /// mode panic.
     #[cfg(target_os = "linux")]
     #[test]
     fn procfs_fallback_links_anonymous_files_privately() {
-        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::fd::AsRawFd;
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
         let stamp = std::time::SystemTime::now()
@@ -1143,24 +1301,50 @@ mod tests {
         prepare_directory(&directory).expect("private output created");
         let handle = open_directory(&directory).expect("output directory opened");
         let dot = std::ffi::CString::new(".").unwrap();
-        // SAFETY: dot is NUL-terminated and O_TMPFILE creates a new unnamed inode.
-        let descriptor = unsafe {
-            openat(
-                handle.as_raw_fd(),
-                dot.as_ptr(),
-                1 | O_TMPFILE | O_CLOEXEC,
-                0o600,
-            )
-        };
-        assert!(descriptor >= 0, "temporary inode created");
-        // SAFETY: this test owns the newly returned unique descriptor.
-        let mut temporary = unsafe { std::fs::File::from_raw_fd(descriptor) };
-        temporary.write_all(b"fallback").expect("bytes written");
-        temporary.sync_all().expect("bytes synced");
         let name = std::ffi::CString::new("one.md").unwrap();
-        link_procfs(&temporary, handle.as_raw_fd(), &name)
-            .expect("ordinary-user procfs link succeeds");
-        drop(temporary);
+        match open_anonymous(handle.as_raw_fd(), &dot) {
+            Ok(mut temporary) => {
+                temporary.write_all(b"fallback").expect("bytes written");
+                temporary.sync_all().expect("bytes synced");
+                match link_procfs(&temporary, handle.as_raw_fd(), &name) {
+                    Ok(()) => {}
+                    Err(error) if procfs_link_restricted(&error) => {
+                        let mut empty_path_usable = false;
+                        publish_one(
+                            handle.as_raw_fd(),
+                            &temporary,
+                            b"fallback",
+                            &name,
+                            &mut empty_path_usable,
+                        )
+                        .expect("publish_one falls back to link_staging when procfs is restricted");
+                    }
+                    Err(error) => panic!("unexpected procfs link failure: {error}"),
+                }
+                drop(temporary);
+            }
+            Err(error) if anonymous_creation_unsupported(&error) => {
+                let mut published = Vec::new();
+                publish_prepared(
+                    &handle,
+                    vec![PendingArtifact {
+                        artifact: Artifact {
+                            kind: ArtifactKind::MetadataSummary,
+                            path: directory.join("one.md"),
+                            source: glassbox_inspect::reports::FactSource::GeneratedArtifact,
+                            completeness: Completeness::Exact,
+                            width: None,
+                            height: None,
+                        },
+                        bytes: b"fallback".to_vec(),
+                    }],
+                    &mut published,
+                )
+                .expect("publish_prepared falls back to staged publication");
+                assert_eq!(published.len(), 1);
+            }
+            Err(error) => panic!("unexpected anonymous temporary failure: {error}"),
+        }
         drop(handle);
         assert_eq!(
             std::fs::read(directory.join("one.md")).expect("linked file readable"),
@@ -1174,6 +1358,11 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "only the final name remains"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1553,6 +1742,190 @@ mod tests {
             0,
             "the popped staged name is removed by its guard"
         );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Checks persist_extract preserves Unavailable completeness across stdout and saved JSON.
+    ///
+    /// Accepts no parameters. Returns unit after publishing an already-failed
+    /// Unavailable extraction report and asserting the in-memory report matches
+    /// the saved `.json` artifact, then verifying a colliding publish downgrades
+    /// Exact completeness to Partial while keeping Unavailable unchanged. Any
+    /// mismatch or I/O error panics; the scratch tree is removed afterward.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persist_extract_keeps_unavailable_completeness_consistent_with_saved_json() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!("persist-unavail-{}-{stamp}", std::process::id()));
+
+        let mut failed_report = ExtractReport::default();
+        failed_report.metadata.identity.path = PathBuf::from("broken.bin");
+        failed_report.status = OperationStatus::Failed;
+        failed_report.metadata.status = OperationStatus::Failed;
+        failed_report.completeness = Completeness::Unavailable;
+
+        persist_extract(&mut failed_report, &directory, 1, false, true);
+        assert_eq!(failed_report.completeness, Completeness::Unavailable);
+        let json_artifact = failed_report
+            .metadata
+            .artifacts
+            .iter()
+            .find(|item| item.kind == ArtifactKind::ExtractionJson)
+            .expect("extraction json artifact published");
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&json_artifact.path).expect("saved json readable"),
+        )
+        .expect("saved json parses");
+        let stdout_value =
+            serde_json::to_value(failed_report.to_v3(false)).expect("stdout report serializes");
+        assert_eq!(saved["completeness"], "unavailable");
+        assert_eq!(stdout_value["completeness"], saved["completeness"]);
+
+        // Re-publishing at the same sequence/stem collides; Exact degrades to Partial,
+        // extraction status fails, nested inspection status remains Complete, and
+        // Unavailable remains Unavailable.
+        let mut colliding_exact = ExtractReport::default();
+        colliding_exact.metadata.identity.path = PathBuf::from("broken.bin");
+        colliding_exact.status = OperationStatus::Complete;
+        colliding_exact.metadata.status = OperationStatus::Complete;
+        colliding_exact.completeness = Completeness::Exact;
+        persist_extract(&mut colliding_exact, &directory, 1, false, true);
+        assert_eq!(colliding_exact.status, OperationStatus::Failed);
+        assert_eq!(colliding_exact.metadata.status, OperationStatus::Complete);
+        assert!(colliding_exact.metadata.diagnostics.is_empty());
+        assert!(
+            colliding_exact
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "extraction_output_failed")
+        );
+        assert_eq!(colliding_exact.completeness, Completeness::Partial);
+
+        let mut colliding_unavailable = ExtractReport::default();
+        colliding_unavailable.metadata.identity.path = PathBuf::from("broken.bin");
+        colliding_unavailable.status = OperationStatus::Failed;
+        colliding_unavailable.metadata.status = OperationStatus::Failed;
+        colliding_unavailable.completeness = Completeness::Unavailable;
+        persist_extract(&mut colliding_unavailable, &directory, 1, false, true);
+        assert_eq!(
+            colliding_unavailable.completeness,
+            Completeness::Unavailable
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Checks publish_one short-circuits AlreadyExists from link_procfs without staging fallback.
+    ///
+    /// Accepts no parameters. Returns unit after deterministically verifying via
+    /// `publish_one_with_procfs` that `AlreadyExists` never invokes
+    /// `link_staging`, plus running a guarded live probe when the host supports
+    /// anonymous `O_TMPFILE` creation and `/proc/self/fd` linking. Falling back
+    /// to `link_staging` on `AlreadyExists`, losing `AlreadyExists`, or mutating
+    /// the existing file panics; the scratch tree is removed afterward.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_one_short_circuits_procfs_already_exists() {
+        use std::os::fd::AsRawFd;
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/output-tests");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let directory = root.join(format!("procfs-exists-{}-{stamp}", std::process::id()));
+        prepare_directory(&directory).expect("private output created");
+        let handle = open_directory(&directory).expect("output directory opened");
+        std::fs::write(directory.join("existing.json"), b"keep").expect("existing file created");
+        let dot = std::ffi::CString::new(".").expect("dot cstring");
+        let name = std::ffi::CString::new("existing.json").expect("filename cstring");
+
+        // Deterministic unit test independent of sandbox `/proc/self/fd` restrictions.
+        let mut empty_path_usable = false;
+        let mut staging_called = false;
+        let synthetic = publish_one_with_procfs(
+            handle.as_raw_fd(),
+            &handle,
+            b"new",
+            &name,
+            &mut empty_path_usable,
+            |_, _, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "synthetic procfs collision",
+                ))
+            },
+            |_, _, _| {
+                staging_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("procfs AlreadyExists must short-circuit");
+        assert_eq!(synthetic.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            !staging_called,
+            "link_staging must never run after procfs AlreadyExists"
+        );
+        assert!(
+            !synthetic
+                .to_string()
+                .contains("descriptor link unavailable"),
+            "procfs AlreadyExists must not wrap staging error: {synthetic}"
+        );
+
+        // Guarded live kernel probe when `O_TMPFILE` is available on this host.
+        if let Ok(mut probe) = open_anonymous(handle.as_raw_fd(), &dot) {
+            probe.write_all(b"probe").expect("probe write succeeds");
+            let probe_name = std::ffi::CString::new("probe.tmp").expect("probe cstring");
+            match link_procfs(&probe, handle.as_raw_fd(), &probe_name) {
+                Ok(()) => {
+                    drop(probe);
+                    let _ = std::fs::remove_file(directory.join("probe.tmp"));
+                    let mut anonymous =
+                        open_anonymous(handle.as_raw_fd(), &dot).expect("anonymous file opened");
+                    anonymous
+                        .write_all(b"new")
+                        .expect("anonymous write succeeds");
+                    let mut empty_path_usable = false;
+                    let error = publish_one(
+                        handle.as_raw_fd(),
+                        &anonymous,
+                        b"new",
+                        &name,
+                        &mut empty_path_usable,
+                    )
+                    .expect_err("collision must return AlreadyExists");
+                    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                    assert!(
+                        !error.to_string().contains("descriptor link unavailable"),
+                        "procfs AlreadyExists must not fall back to link_staging: {error}"
+                    );
+                }
+                Err(probe_error) if procfs_link_restricted(&probe_error) => {
+                    let mut empty_path_usable = false;
+                    let error = publish_one(
+                        handle.as_raw_fd(),
+                        &probe,
+                        b"new",
+                        &name,
+                        &mut empty_path_usable,
+                    )
+                    .expect_err("staged fallback collision must still return AlreadyExists");
+                    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                }
+                Err(probe_error) => panic!("unexpected live procfs probe failure: {probe_error}"),
+            }
+            assert_eq!(
+                std::fs::read(directory.join("existing.json")).expect("original retained"),
+                b"keep"
+            );
+        }
         drop(handle);
         let _ = std::fs::remove_dir_all(&directory);
     }

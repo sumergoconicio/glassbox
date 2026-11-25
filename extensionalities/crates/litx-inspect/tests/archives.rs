@@ -642,8 +642,14 @@ fn generic_zip_and_cbz_support_agrees_with_extraction() {
             &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
         );
         assert_eq!(
-            extracted.metadata.status,
+            extracted.status,
             glassbox_inspect::reports::OperationStatus::Unsupported,
+            "{:?}",
+            path
+        );
+        assert_eq!(
+            extracted.metadata.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
             "{:?}",
             path
         );
@@ -679,10 +685,104 @@ fn epub_and_office_packages_keep_supported_extraction() {
             &v2_extract_options(glassbox_inspect::reports::NativeSelection::All),
         );
         assert_eq!(
+            extracted.status,
+            glassbox_inspect::reports::OperationStatus::Complete,
+            "{name}: {extracted:#?}"
+        );
+        assert_eq!(
             extracted.metadata.status,
             glassbox_inspect::reports::OperationStatus::Complete,
             "{name}: {extracted:#?}"
         );
         assert_eq!(extracted.content.units.len(), expected_units, "{name}");
     }
+}
+
+/// Verifies generic ZIPs renamed `.cbz` or `.pages` identify as generic ZIPs with disagreement.
+///
+/// Accepts no parameters. Returns unit after inspecting stored ZIP archives
+/// containing only `readme.txt` under `generic.cbz` and `generic.pages` via
+/// `extract_transitional`. Panics if bucket, byte basis, disagreement, or
+/// diagnostic stages diverge from the generic ZIP fallback contract.
+#[test]
+fn generic_zip_named_cbz_or_pages_identifies_as_generic_zip_without_reader_errors() {
+    for filename in ["generic.cbz", "generic.pages"] {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tests")
+            .join(format!(
+                "archive-generic-{filename}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(filename);
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        writer
+            .start_file(
+                "readme.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(b"plain zip entry").unwrap();
+        writer.finish().unwrap();
+
+        let report = inspect(&path, &InspectOptions::default());
+        assert_eq!(report.format.bucket, "Archives", "{filename}");
+        assert_eq!(report.format.basis, "bytes", "{filename}");
+        assert!(report.format.disagreement, "{filename}");
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| matches!(e.stage, "comic" | "comic_page" | "iwork_preview")),
+            "{filename}: {:?}",
+            report.errors
+        );
+    }
+}
+
+/// Verifies a valid DOCX renamed `.pages` short-circuits before iWork preview inspection.
+///
+/// Accepts no parameters. Returns unit after copying `notes.docx` to
+/// `spoof.pages` and inspecting it via `extract_transitional`. Panics if format
+/// bucket, extension disagreement, extracted DOCX text, or diagnostic stages
+/// diverge.
+#[test]
+fn spoofed_docx_named_pages_short_circuits_before_iwork_reader() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tests")
+        .join(format!(
+            "archive-spoof-docx-pages-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("spoof.pages");
+    std::fs::copy(fixture("notes.docx"), &path).unwrap();
+
+    let report = inspect(&path, &InspectOptions::default());
+    assert_eq!(report.format.bucket, "Office Docs");
+    assert_eq!(report.format.basis, "bytes");
+    assert!(report.format.disagreement);
+    assert!(
+        report
+            .text
+            .content
+            .contains("This is a native text layer with an ampersand & evidence."),
+        "expected DOCX text, got: {:?}",
+        report.text.content
+    );
+    assert!(
+        !report
+            .errors
+            .iter()
+            .any(|e| matches!(e.stage, "comic" | "comic_page" | "iwork_preview")),
+        "unexpected specialized archive error: {:?}",
+        report.errors
+    );
 }
