@@ -263,12 +263,22 @@ impl OpenAiAsrBackend {
                         .map(str::to_string);
 
                     if (200..300).contains(&status_code) {
-                        let body = read_bounded_success_body(
+                        let body = match read_bounded_success_body(
                             response,
                             MAX_ASR_RESPONSE_BYTES,
                             api_key.as_deref(),
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err(AsrError::Http {
+                                retryable: true, ..
+                            }) if attempt < MAX_TRANSIENT_RETRIES => {
+                                tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
                         return match self.config.protocol {
                             OpenAiProtocol::Transcriptions => parse_transcription_response(
                                 content_type.as_deref(),
@@ -1597,5 +1607,102 @@ mod tests {
             .await
             .expect_err("invalid UTF-8 must fail");
         assert!(matches!(err, AsrError::Decode(ref msg) if msg.contains("UTF-8")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_200_mid_stream_transport_error_retries_once_and_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated-200 listener");
+        let addr = listener.local_addr().expect("truncated-200 addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&hits);
+
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _req = read_http_request(&mut stream).await;
+                if attempt == 0 {
+                    // Truncated chunked 200 OK: closes abruptly mid-stream before final 0\r\n\r\n.
+                    let truncated = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n{\"text\":\"part";
+                    let _ = stream.write_all(truncated).await;
+                    let _ = stream.shutdown().await;
+                } else {
+                    let body = r#"{"text":"recovered after mid-stream drop"}"#;
+                    let ok_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(ok_resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+
+        let cfg = OpenAiAsrConfig::new(format!("http://{addr}/v1"), "whisper-1");
+        let mut backend = OpenAiAsrBackend::with_env_lookup(cfg, |_| None).expect("backend");
+
+        let transcript = backend
+            .transcribe_window(&sample_window(0, 1_000), None)
+            .expect("mid-stream transport error on 200 OK must retry once and succeed");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "mid-stream 200 OK failure must perform exactly one transient retry"
+        );
+        assert_eq!(transcript.text, "recovered after mid-stream drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_200_repeated_mid_stream_transport_error_fails_after_single_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind repeated truncated-200 listener");
+        let addr = listener.local_addr().expect("repeated truncated-200 addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&hits);
+
+        tokio::spawn(async move {
+            // Accept up to 3 connections to confirm retry count stays bounded at 1 + MAX_TRANSIENT_RETRIES.
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _req = read_http_request(&mut stream).await;
+                let truncated = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n{\"text\":\"part";
+                let _ = stream.write_all(truncated).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let cfg = OpenAiAsrConfig::new(format!("http://{addr}/v1"), "whisper-1");
+        let mut backend = OpenAiAsrBackend::with_env_lookup(cfg, |_| None).expect("backend");
+
+        let err = backend
+            .transcribe_window(&sample_window(0, 1_000), None)
+            .expect_err("repeated mid-stream transport failure must error after single retry");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1 + MAX_TRANSIENT_RETRIES,
+            "repeated mid-stream 200 OK failure must stop after MAX_TRANSIENT_RETRIES"
+        );
+        match err {
+            AsrError::Http {
+                status, retryable, ..
+            } => {
+                assert_eq!(status, Some(200));
+                assert!(retryable);
+            }
+            other => {
+                panic!("expected retryable Http error on repeated mid-stream drop, got {other:?}")
+            }
+        }
     }
 }

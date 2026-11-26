@@ -147,6 +147,7 @@ Setting both `GLASSBOX_ASR_URL` and `GLASSBOX_ASR_MODEL_DIR` without `--asr-back
 | `GLASSBOX_ASR_MODEL_DIR` | Local Whisper ONNX model directory path. |
 | `GLASSBOX_ASR_DEVICE` | Local Whisper ONNX execution device (`cpu` or `cuda`). |
 | `GLASSBOX_FFMPEG`, `GLASSBOX_FFPROBE` | Override `ffmpeg` and `ffprobe` executable paths. |
+| `GLASSBOX_FFMPEG_IO_TIMEOUT_SECS` | Idle-read timeout in seconds for piped FFmpeg audio streams. Default `30`, clamped to `1..=600`. |
 | `ORT_DYLIB_PATH` | Override the ONNX Runtime shared library path (`libonnxruntime.so` or `libonnxruntime.dylib`). |
 
 ## Exit statuses
