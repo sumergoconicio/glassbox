@@ -923,8 +923,10 @@ mod tests {
         );
 
         let decoded: Vec<i16> = wav[44..]
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| i16::from_le_bytes(c))
             .collect();
         assert_eq!(decoded[0], 0);
         assert_eq!(decoded[1], i16::MAX);

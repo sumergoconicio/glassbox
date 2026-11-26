@@ -826,8 +826,8 @@ fn decode_f32le_bytes(bytes: &[u8]) -> Result<Vec<f32>, MediaError> {
         ));
     }
     let mut pcm = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for &chunk in bytes.as_chunks::<4>().0 {
+        let sample = f32::from_le_bytes(chunk);
         if !sample.is_finite() {
             return Err(MediaError::DecodeFailed(
                 "FFmpeg emitted non-finite f32 PCM sample".to_string(),
@@ -978,8 +978,8 @@ impl<'a, W: Write + Seek> SequentialPcmSlicer<'a, W> {
         self.total_samples += fresh_samples.len();
 
         let mut pcm = Vec::with_capacity(self.bytes.len() / 4);
-        for chunk in self.bytes[..kept_bytes].chunks_exact(4) {
-            pcm.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for &chunk in self.bytes[..kept_bytes].as_chunks::<4>().0 {
+            pcm.push(f32::from_le_bytes(chunk));
         }
         pcm.extend_from_slice(&fresh_samples);
 

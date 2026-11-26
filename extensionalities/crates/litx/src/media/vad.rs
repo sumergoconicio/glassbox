@@ -506,8 +506,8 @@ pub fn extract_short_speech(reader: &mut dyn Read) -> Result<ShortSpeechResult, 
         }
 
         let aligned_len = ((n - offset) / 4) * 4;
-        for chunk in read_buf[offset..offset + aligned_len].chunks_exact(4) {
-            let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for &chunk in read_buf[offset..offset + aligned_len].as_chunks::<4>().0 {
+            let sample = f32::from_le_bytes(chunk);
             if !sample.is_finite() {
                 return Err(MediaError::DecodeFailed(
                     "audio stream contains non-finite f32 PCM sample".to_string(),
