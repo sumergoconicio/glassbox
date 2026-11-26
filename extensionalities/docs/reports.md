@@ -1,8 +1,11 @@
 ---
 title: "Reports and programmatic use"
-type: doc
-content-type: API Reference
-parent: docs/README.md
+type: "documentation"
+content_type: "API Reference"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH9J3719VX2989Q1VKD"
+tags: ["reports", "programmatic", "separates", "downstream", "liteparse", "upstream", "examples", "placeholders", "row", "values"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # Reports and programmatic use
@@ -125,9 +128,21 @@ Key extract fields:
 - `selection.returned_indices`: exact one-based source positions of returned units.
 - `completeness`: source coverage of the report (`partial` for a subset even when `status` is `complete`).
 - `content.units[].label`: optional printed PDF page label from `/PageLabels`, omitted when absent.
+- `content.units[].start_ms`, `content.units[].end_ms`: optional inclusive start and exclusive end milliseconds for `time_interval` (`NativeUnit::TimeInterval`) ASR units, omitted for non-media units. `content.units` holds stitched display text paired with each window's raw `start_ms` and `end_ms` timestamps.
 - Top-level `diagnostics` and `artifacts` are omitted when empty; top-level `provenance` is omitted unless `--verbose` is set.
+- `artifacts[].kind`: `thumbnail`, `metadata_json`, `metadata_summary`, `extraction_json`, `markdown_content`, `contact_sheet`, or `audio_extract`.
 
 Every diagnostic record contains `stage`, `severity`, `code`, `message`, and optional `unit_index`.
+Media-pipeline failures and warnings use `stage: "media"` (`DiagnosticStage::Media`).
+
+### Media extraction receipts (`media`)
+
+`ExtractReportV3` adds an optional top-level `media` object only when at least one media stage produces a receipt.
+When empty or absent, `media` is omitted so non-media v3 JSON reports stay byte-identical.
+
+- `media.contact_sheet`: `output`, `duration_seconds`, `columns`, `rows`, `tiles`, `mode`, `preset`, `format`, `width_px`, `height_px`, `cell_width_px`, `cell_height_px`, `seek_seconds`, `reused_tiles`, `linear_seek_tiles`, and optional `every_seconds`.
+- `media.asr`: `mode`, `backend`, `model`, `provider`, optional `protocol`, optional `language`, `duration_ms`, `sampled_ranges_ms`, `windows_attempted`, and `windows_succeeded`.
+- `media.audio_extract`: `path`, `format`, and `duration_ms`.
 
 ## Migration from v2 and legacy shapes
 
@@ -176,11 +191,12 @@ Main public modules and symbols:
 - `inspect(path, options) -> MetadataReport` and `inspect_with_policy(path, options, HashPolicy) -> MetadataReport`.
 - `extract(path, options) -> ExtractReport` and `extract_with_policy(path, options, HashPolicy) -> ExtractReport`.
 - `Inspector::with_budget(&SessionBudget)`, `Inspector::with_shared_budget(SharedWorkBudget)`, `Inspector::with_full_hash(bool)`, and `Inspector::with_hash_policy(HashPolicy)`.
-- `reports` module: `REPORT_SCHEMA_VERSION` (`3`), `LEGACY_REPORT_SCHEMA_VERSION` (`2`), `InspectOptions`, and `ExtractOptions`.
+- `reports` module: `REPORT_SCHEMA_VERSION` (`3`), `LEGACY_REPORT_SCHEMA_VERSION` (`2`), `InspectOptions`, `ExtractOptions`, `MediaReceipt`, `ContactSheetReceipt`, `AsrReceipt`, and `AudioExtractReceipt`.
 - `reports_v3` module: `InspectReportV3`, `ExtractReportV3`, `REPORT_SCHEMA_VERSION_V3` (`3`), `inspect_to_v3`, `extract_to_v3`, `normalize_metadata_date`, and `ALL_FORMAT_TYPES`.
 - `hashing` module: `HashPolicy`, `DEFAULT_FULL_HASH_MAX_BYTES`, `SAMPLED_FINGERPRINT_SCHEME`, and `hash_file_with_policy`.
-- `bodymatter` module: `BodymatterMarker`, `format_marker`, `escape_attr`, `sanitize_body`, `escape_table_cell`, and `render_gfm_table`.
-- `selection` module: `parse_pages`, `render_text`, `render_markdown`, and `render_markdown_with_options(report, include_markers)`.
+- `bodymatter` module: `BodymatterMarker` (including `Time`), `format_marker`, `escape_attr`, `sanitize_body`, `escape_table_cell`, and `render_gfm_table`.
+- `transcript_markdown` module: `GLASSBOX_TRANSCRIPT_SCHEMA` (`"glassbox:v1"`), `TranscriptRenderOptions`, `render_transcript_markdown`, and `generate_ulid`.
+- `selection` module: `parse_pages`, `render_text`, `render_markdown`, `render_markdown_with_options(report, include_markers)`, and `render_markdown_full(report, include_markers, include_frontmatter)`.
 - `metadata` module: `summary`, `summary_markdown(report, verbose)`, and `summary_text(report, verbose)`.
 
 ## Build from source

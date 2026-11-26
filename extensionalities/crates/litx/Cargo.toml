@@ -19,17 +19,26 @@ name = "litx"
 path = "src/bin/litx.rs"
 
 [features]
-default = ["ocria-nano"]
+default = ["ocria-nano", "whisper-onnx"]
 ocria-nano = ["liteparse/ocria-nano"]
 ocr-serve = ["ocria-nano", "liteparse/ocr-serve"]
+whisper-onnx = ["dep:ort", "dep:rustfft"]
+whisper-onnx-cuda = ["whisper-onnx", "ort/cuda"]
 magika = ["glassbox-inspect/magika"]
 ffmpeg-link = ["glassbox-inspect/ffmpeg-link"]
 
 [dependencies]
 glassbox-inspect = { path = "../litx-inspect" }
 liteparse = { path = "../../../crates/liteparse", features = ["tesseract"] }
+base64 = "0.22"
 clap = { version = "4.5.55", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "multipart", "rustls"] }
+rustfft = { version = "6", optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+url = "2"
 web-time = "1.1.0"

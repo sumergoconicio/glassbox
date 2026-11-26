@@ -1,8 +1,11 @@
 ---
 title: "Automation and directory inventories"
-type: doc
-content-type: Runbook
-parent: docs/README.md
+type: "documentation"
+content_type: "Runbook"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH84ZF509VHFNJB9PZT"
+tags: ["automation", "directory", "inventories", "scripted", "flows", "optional", "duplicated", "error", "carrying", "carries"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # Automation and directory inventories

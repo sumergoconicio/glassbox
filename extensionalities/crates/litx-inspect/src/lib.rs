@@ -40,6 +40,7 @@ mod tables;
 mod tabular;
 mod text;
 mod thumbnail;
+pub mod transcript_markdown;
 mod xml;
 mod xml_profile;
 pub use djvu::{DjvuAnalysis, DjvuPageSignal};

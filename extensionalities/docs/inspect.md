@@ -1,8 +1,11 @@
 ---
 title: "Metadata inspection"
-type: doc
-content-type: Runbook
-parent: docs/README.md
+type: "documentation"
+content_type: "Runbook"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH87VDMX2AY8PF3JAYG"
+tags: ["metadata", "inspection", "exposing", "subject", "keywords", "serializes", "properties", "advice", "hop", "routing"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # Metadata inspection
@@ -165,6 +168,7 @@ Handle inspection reports with the same care as the source files.
 ## Content flags are rejected
 
 `glassbox inspect` rejects extraction flags: `--identify`, `--max-pages`, `--max-tokens`, `--max-chars`, `--probe-ocr`, `--no-ocr`, `--ocr-language`, `--packet`, and `--no-markers`.
+It also rejects media extraction flags (`--imagegrid`, `--every-seconds`, `--quality`, `--performance`, `--imagegrid-format`, `--asr`, `--asr-*`, `--extract-audio`, `--no-frontmatter`); see [CLI migrations](cli.md#migrations).
 Each rejection exits 64 and prints the equivalent `glassbox extract` command.
 Place `--` before a path to end option parsing.
 Use `glassbox inspect -- --no-markers` to inspect a file whose name starts with a flag.

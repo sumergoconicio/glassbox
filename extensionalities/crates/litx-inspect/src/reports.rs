@@ -74,6 +74,7 @@ pub enum NativeUnit {
     DerivedPreviewUnit,
     Byte,
     PdfObject(PdfObjectKind),
+    TimeInterval,
     #[default]
     Unknown,
 }
@@ -330,6 +331,7 @@ pub enum DiagnosticStage {
     Selection,
     Extraction,
     Ocr,
+    Media,
     Artifact,
     Internal,
 }
@@ -362,6 +364,8 @@ pub enum ArtifactKind {
     MetadataSummary,
     ExtractionJson,
     MarkdownContent,
+    ContactSheet,
+    AudioExtract,
 }
 
 /// A requested or generated artifact with source and dimensional metadata.
@@ -647,10 +651,116 @@ pub struct ContentUnit {
     /// partial native-unit selections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker_index: Option<u64>,
+    /// Optional inclusive start timestamp in milliseconds for [`NativeUnit::TimeInterval`] units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
+    /// Optional exclusive end timestamp in milliseconds for [`NativeUnit::TimeInterval`] units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<u64>,
     pub text: Option<String>,
     pub rows: Vec<ContentRow>,
     pub provenance: Vec<ExtractionProvenance>,
     pub completeness: Completeness,
+}
+
+/// Typed receipt describing a generated video contact-sheet image artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContactSheetReceipt {
+    /// Destination path where the contact sheet image was published.
+    pub output: PathBuf,
+    /// Probed motion-video duration in seconds.
+    pub duration_seconds: f64,
+    /// Number of tile columns in the sheet grid.
+    pub columns: u32,
+    /// Number of tile rows in the sheet grid.
+    pub rows: u32,
+    /// Total number of sampled tiles composited onto the sheet.
+    pub tiles: u32,
+    /// Scheduling mode (`"default"`, `"adaptive"`, or `"custom"`).
+    pub mode: String,
+    /// Resolution preset (`"quality"` or `"performance"`).
+    pub preset: String,
+    /// Encoded image format (`"jpg"` or `"png"`).
+    pub format: String,
+    /// Total composited sheet width in pixels.
+    pub width_px: u32,
+    /// Total composited sheet height in pixels.
+    pub height_px: u32,
+    /// Individual tile cell width in pixels.
+    pub cell_width_px: u32,
+    /// Individual tile cell height in pixels.
+    pub cell_height_px: u32,
+    /// Chronological seek timestamps in seconds for every tile.
+    pub seek_seconds: Vec<f64>,
+    /// Count of tiles populated by reusing an earlier frame after seek fallback.
+    pub reused_tiles: u32,
+    /// Count of tiles decoded via linear output-seek fallback after input-seek failure.
+    pub linear_seek_tiles: u32,
+    /// Explicit interval in seconds when `mode == "custom"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_seconds: Option<f64>,
+}
+
+/// Typed receipt describing an automatic speech recognition (ASR) extraction pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsrReceipt {
+    /// Sampling mode (`"short"`, `"adaptive"`, or `"full"`).
+    pub mode: String,
+    /// Resolved ASR backend identifier (`"openai"` or `"whisper-onnx"`).
+    pub backend: String,
+    /// Model identifier or local model directory label used for transcription.
+    pub model: String,
+    /// Actual execution provider or endpoint label (for example `"cpu"`, `"cuda"`, or endpoint name/URL host).
+    pub provider: String,
+    /// Optional HTTP protocol (`"transcriptions"` or `"chat"`) for OpenAI-compatible endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Optional BCP-47 / ISO language hint supplied to or detected by ASR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Probed source media duration in milliseconds.
+    pub duration_ms: u64,
+    /// Transcribed `[start_ms, end_ms]` interval spans in ascending order.
+    pub sampled_ranges_ms: Vec<[u64; 2]>,
+    /// Number of scheduled audio windows attempted.
+    pub windows_attempted: u64,
+    /// Number of scheduled audio windows transcribed without error.
+    pub windows_succeeded: u64,
+}
+
+/// Typed receipt describing an extracted standalone or teed audio artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioExtractReceipt {
+    /// Destination path where the extracted audio file was published.
+    pub path: PathBuf,
+    /// Encoded audio format (`"wav"`, `"flac"`, `"m4a"`, or `"opus"`).
+    pub format: String,
+    /// Duration of the extracted audio track in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Typed media-extraction receipts attached only when media stages ran.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MediaReceipt {
+    /// Video contact-sheet receipt when `--imagegrid` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_sheet: Option<ContactSheetReceipt>,
+    /// ASR transcription receipt when `--asr` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr: Option<AsrReceipt>,
+    /// Audio-track extraction receipt when `--extract-audio` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_extract: Option<AudioExtractReceipt>,
+}
+
+impl MediaReceipt {
+    /// Reports whether every media sub-receipt is absent.
+    ///
+    /// Accepts `&self`. Returns `true` when `contact_sheet`, `asr`, and
+    /// `audio_extract` are all `None`. Performs no I/O and cannot fail.
+    pub fn is_empty(&self) -> bool {
+        self.contact_sheet.is_none() && self.asr.is_none() && self.audio_extract.is_none()
+    }
 }
 
 /// Explicit extracted payload kept separate from [`DocumentMetadata`].
@@ -682,6 +792,10 @@ pub struct ExtractReport {
     pub provenance: Vec<ExtractionProvenance>,
     pub completeness: Completeness,
     pub selection: SelectionReport,
+    /// Optional media-extraction receipts (`contact_sheet`, `asr`, `audio_extract`);
+    /// omitted for non-media document extractions so existing JSON stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaReceipt>,
 }
 
 impl ExtractReport {
@@ -718,6 +832,7 @@ impl Default for ExtractReport {
             provenance: Vec::new(),
             completeness: Completeness::Unavailable,
             selection: SelectionReport::default(),
+            media: None,
         }
     }
 }

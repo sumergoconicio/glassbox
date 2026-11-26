@@ -1,13 +1,14 @@
-//! Integration tests for `glassbox_inspect::bodymatter` (`V-IO-05`).
-//!
-//! Verifies deterministic `bodymatter:v1` marker serialization, lossless XML
-//! round-trip decoding via `quick_xml::Reader`, `--` absence inside HTML
-//! comment payloads, anti-forgery `<!--` neutralization in body text and table
-//! cells, minimal line-leading Markdown escaping, and GFM table formatting.
+//! Module: glassbox-inspect `bodymatter:v1` integration tests (`V-IO-05`, `V-MED-01`).
+//! File: bodymatter.rs.
+//! Responsibility: Verify deterministic `bodymatter:v1` marker serialization
+//! (including `<time>` intervals), lossless XML round-trip decoding via
+//! `quick_xml::Reader`, `--` absence inside HTML comment payloads, anti-forgery
+//! `<!--` neutralization in body text and table cells, minimal line-leading
+//! Markdown escaping, and GFM table formatting.
 
 use glassbox_inspect::bodymatter::{
     BODYMATTER_PREFIX, BodymatterMarker, escape_attr, escape_table_cell, format_marker,
-    render_gfm_table, sanitize_body,
+    format_time_ms, render_gfm_table, sanitize_body,
 };
 use glassbox_inspect::reports::ContentRow;
 use quick_xml::{Reader, XmlVersion, events::Event};
@@ -289,6 +290,24 @@ fn all_marker_variants_emit_deterministic_xml_and_round_trip() {
             expected_line: r#"<!-- bodymatter:v1 <page number="5000000000" origin="native"/> -->"#,
             expected_tag: "page",
             expected_attrs: &[("number", "5000000000"), ("origin", "native")],
+        },
+        MarkerCase {
+            marker: BodymatterMarker::Time {
+                start_ms: 0,
+                end_ms: 30_000,
+            },
+            expected_line: r#"<!-- bodymatter:v1 <time start="00:00:00.000" end="00:00:30.000"/> -->"#,
+            expected_tag: "time",
+            expected_attrs: &[("start", "00:00:00.000"), ("end", "00:00:30.000")],
+        },
+        MarkerCase {
+            marker: BodymatterMarker::Time {
+                start_ms: 360_000_000,
+                end_ms: 360_030_500,
+            },
+            expected_line: r#"<!-- bodymatter:v1 <time start="100:00:00.000" end="100:00:30.500"/> -->"#,
+            expected_tag: "time",
+            expected_attrs: &[("start", "100:00:00.000"), ("end", "100:00:30.500")],
         },
     ];
 
@@ -919,4 +938,76 @@ fn escape_table_cell_neutralizes_unicode_line_terminators_and_forbidden_controls
         assert!(!line.chars().any(|ch| ch <= '\u{001F}'));
         assert_eq!(count_unescaped_pipes(line), 3);
     }
+}
+
+/// Verifies `BodymatterMarker::Time` and `format_time_ms` formatting, `hours >= 100`
+/// support, validated construction, and non-panicking `end > start` clamping (`V-MED-01`).
+///
+/// Accepts no parameters. Returns unit after checking millisecond formatting,
+/// constructor rejection of empty/inverted ranges, and XML round-trip validity
+/// for normal, 100+ hour, clamped, and saturated `u64::MAX` bounds. Panics if
+/// any marker deviates from `HH:MM:SS.mmm` or emits `end <= start`.
+#[test]
+fn time_markers_format_hh_mm_ss_mmm_handle_100_plus_hours_and_enforce_end_gt_start() {
+    assert_eq!(format_time_ms(0), "00:00:00.000");
+    assert_eq!(format_time_ms(1), "00:00:00.001");
+    assert_eq!(format_time_ms(59_999), "00:00:59.999");
+    assert_eq!(format_time_ms(3_661_042), "01:01:01.042");
+    assert_eq!(format_time_ms(359_999_999), "99:59:59.999");
+    assert_eq!(format_time_ms(360_000_000), "100:00:00.000");
+    assert_eq!(format_time_ms(444_065_987), "123:21:05.987");
+
+    // Validated constructor rejects empty or inverted intervals.
+    assert_eq!(BodymatterMarker::time(0, 0), None);
+    assert_eq!(BodymatterMarker::time(5_000, 5_000), None);
+    assert_eq!(BodymatterMarker::time(5_000, 4_999), None);
+    assert_eq!(
+        BodymatterMarker::time(1_250, 31_250),
+        Some(BodymatterMarker::Time {
+            start_ms: 1_250,
+            end_ms: 31_250,
+        })
+    );
+
+    // Non-increasing direct struct inputs clamp safely without panicking and stay XML-valid.
+    let equal = format_marker(&BodymatterMarker::Time {
+        start_ms: 1_000,
+        end_ms: 1_000,
+    });
+    assert_eq!(
+        equal,
+        r#"<!-- bodymatter:v1 <time start="00:00:01.000" end="00:00:01.001"/> -->"#
+    );
+    let (tag, attrs) = parse_marker_line(&equal);
+    assert_eq!(tag, "time");
+    assert_eq!(
+        attrs,
+        vec![
+            ("start".into(), "00:00:01.000".into()),
+            ("end".into(), "00:00:01.001".into()),
+        ]
+    );
+
+    let inverted = format_marker(&BodymatterMarker::Time {
+        start_ms: 900_000,
+        end_ms: 12_000,
+    });
+    assert_eq!(
+        inverted,
+        r#"<!-- bodymatter:v1 <time start="00:15:00.000" end="00:15:00.001"/> -->"#
+    );
+    let _ = parse_marker_line(&inverted);
+
+    let saturated = format_marker(&BodymatterMarker::Time {
+        start_ms: u64::MAX,
+        end_ms: u64::MAX,
+    });
+    let (tag, attrs) = parse_marker_line(&saturated);
+    assert_eq!(tag, "time");
+    assert_eq!(attrs[0].0, "start");
+    assert_eq!(attrs[1].0, "end");
+    assert_ne!(
+        attrs[0].1, attrs[1].1,
+        "saturated Time marker must still satisfy end > start"
+    );
 }

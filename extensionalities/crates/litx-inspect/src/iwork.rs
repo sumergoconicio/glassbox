@@ -193,6 +193,8 @@ pub(crate) fn inspect(
                         source_part: Some(name.into()),
                         label: None,
                         marker_index: None,
+                        start_ms: None,
+                        end_ms: None,
                         text: Some(bounded_preview_text),
                         rows: Vec::new(),
                         provenance: vec![ExtractionProvenance {

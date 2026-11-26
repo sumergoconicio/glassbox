@@ -792,6 +792,8 @@ fn docx_units(
                 source_part: Some(format!("{part}#body/{number}")),
                 label: None,
                 marker_index: None,
+                start_ms: None,
+                end_ms: None,
                 text: None,
                 rows: Vec::new(),
                 provenance: vec![crate::reports::ExtractionProvenance {

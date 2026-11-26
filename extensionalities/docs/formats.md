@@ -1,8 +1,11 @@
 ---
 title: "Formats and limits"
-type: doc
-content-type: Guide
-parent: docs/README.md
+type: "documentation"
+content_type: "Guide"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH859QZ4H83EXA9HRA7"
+tags: ["formats", "limits", "identifies", "implies", "lists", "classifies", "overrides", "doc", "inconclusive", "longest"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # Formats and limits
@@ -69,7 +72,12 @@ Valid aliases within the same family (such as `.jpg`/`.jpeg` or `.azw3`/MOBI) do
 | Apple iWork (Pages, Numbers, Key) | Embedded previews | Preview only | Derived preview | No complete native decoder |
 | DjVu (`djvu`, `djv`) | Identification | Identification only | None | No text, image, OCR, or page-count extraction |
 | Parquet | Footer identification | Identification only | None | Extraction is deferred |
+| Audio (`mp3`, `m4a`, `aac`, `flac`, `wav`, `ogg`, `opus`, `aiff`) | Metadata-only identification | Opt-in (`--asr`, `--extract-audio`) via FFmpeg | Time interval (`<time>`) | Requires FFmpeg; `--asr` needs an ASR backend; `--extract-audio` requires `--output-dir` |
+| Video (`mp4`, `mkv`, `mov`, `avi`, `webm`, `m4v`, `mpeg`) | Metadata-only identification | Opt-in (`--imagegrid`, `--asr`, `--extract-audio`) via FFmpeg | Time interval (`<time>`) for `--asr` | `--imagegrid` requires motion video and `-o` or `--output-dir` (250-tile custom cap); `--asr` and `--extract-audio` require an audio track |
 | Other formats | Identification | Not supported | None | Report marks `status: "unsupported"` |
+
+For audio and video files, `glassbox inspect` stays metadata-only and never spawns FFmpeg, contact sheets, or ASR.
+Plain `glassbox extract FILE` without media flags also skips FFmpeg; pass `--imagegrid`, `--asr`, or `--extract-audio` to opt in. See [Content extraction](extract.md#media-extraction).
 
 Plain text splits lines at `\n` and strips an immediately preceding `\r`.
 A trailing newline does not add an empty unit; a final line without `\n` still counts.
@@ -119,6 +127,7 @@ All reader caps are fixed; no flag raises them:
 - Plain text: 16 MiB read window, 65,536 emitted selected units.
 - DOCX and PPTX: 65,536 characters per unit; Word tables nest at most 16 levels.
 - JSON and XML schema paths: 1 MiB cumulative retained bytes.
+- Media extraction: 250-tile custom `--imagegrid` cap, 600-second lead-in VAD scan cap for `--asr short`, and 15 s / 30 s per-call FFmpeg subprocess timeouts.
 
 Every cap hit discloses the omission through a diagnostic, truncation marker, or partial status.
 
