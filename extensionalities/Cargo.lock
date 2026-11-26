@@ -1359,12 +1359,19 @@ dependencies = [
 name = "glassbox-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "glassbox-inspect",
+ "image",
  "libc",
  "liteparse",
+ "ort",
+ "reqwest 0.13.5",
+ "rustfft",
+ "serde",
  "serde_json",
  "tokio",
+ "url",
  "web-time",
 ]
 

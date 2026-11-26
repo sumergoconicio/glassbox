@@ -4,12 +4,12 @@
     "read": "entries are keyed by immediate filename; children point to immediate subfolder atlas.json files. Recurse only within the requested scope.",
     "fields": "Common fields describe identity, title, artifact type, content role, Atlas tags, domains, systems, classification, source URL, size and hashes.",
     "ownership": "extensions keys identify owning workflows. Each owner defines its own extension schema. Preserve other owners and reject conflicting common metadata on co-owned files.",
-    "identity": "document_id is stable when supplied and may be null before enrichment. sha256 hashes source bytes and does not define identity.",
+    "identity": "id is stable when supplied and may be null before enrichment. sha256 hashes source bytes and does not define identity.",
     "taxonomy": "taxonomy is keyed by owner namespace. Each value carries that workflow vocabulary and decision context.",
-    "query": "Use atlas_json.py list, search or get with --root. Optional recursive scope follows child atlas pointers. Filters use type, content-type, domain, system and owner workflow.",
+    "query": "Use atlas_json.py list, search or get with --root. Optional recursive scope follows child atlas pointers. Filters use type, content_type, domain, system and owner workflow.",
     "write": "Use caller-owned projection plus Atlas make_entry/build/stage and Store transactions. Never hand-edit hashes or remove files without authorization."
   },
-  "schema": "chai.atlas/v1",
+  "schema": "chai.atlas/v2",
   "folder_id": "folder-16977703cb6c4857a4de9c72c1fe7bae",
   "taxonomy": {
     "docs": {
@@ -31,10 +31,8 @@
   ],
   "entries": {
     "README.md": {
-      "document_id": null,
       "title": "Glassbox",
-      "type": "doc",
-      "content-type": "Other",
+      "type": "documentation",
       "tags": [
         "glassbox",
         "inspects",
@@ -198,7 +196,9 @@
           "path_base": "collection-root",
           "collection_root": "."
         }
-      }
+      },
+      "id": null,
+      "content_type": "Other"
     }
   },
   "extensions": {

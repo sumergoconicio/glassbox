@@ -56,6 +56,42 @@ pub enum BodymatterMarker<'a> {
         /// One-based count of explicit page breaks in source order.
         number: u64,
     },
+    /// Timed media transcript interval (`start` inclusive, `end` exclusive, in
+    /// milliseconds from media start).
+    Time {
+        /// Inclusive interval start timestamp in milliseconds.
+        start_ms: u64,
+        /// Exclusive interval end timestamp in milliseconds (must exceed `start_ms`).
+        end_ms: u64,
+    },
+}
+
+impl BodymatterMarker<'_> {
+    /// Constructs a validated [`BodymatterMarker::Time`] when `end_ms > start_ms`.
+    ///
+    /// Accepts inclusive `start_ms` and exclusive `end_ms` offsets in milliseconds
+    /// from media start. Returns `Some(BodymatterMarker::Time { start_ms, end_ms })`
+    /// when `end_ms > start_ms`, or `None` for empty or inverted intervals.
+    /// Performs no I/O and cannot fail.
+    pub fn time(start_ms: u64, end_ms: u64) -> Option<Self> {
+        (end_ms > start_ms).then_some(Self::Time { start_ms, end_ms })
+    }
+}
+
+/// Formats a millisecond offset as `HH:MM:SS.mmm` with at least two hour digits.
+///
+/// Accepts an offset in milliseconds from media start. Returns a zero-padded
+/// timestamp (`HH:MM:SS.mmm`) where hours expand naturally beyond two digits
+/// when `hours >= 100` (for example `100:00:00.000`). Performs no I/O and
+/// cannot fail.
+pub fn format_time_ms(ms: u64) -> String {
+    let millis = ms % 1_000;
+    let total_seconds = ms / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 /// Formats one structural marker as a single-line `bodymatter:v1` HTML comment.
@@ -65,7 +101,11 @@ pub enum BodymatterMarker<'a> {
 /// `<!-- bodymatter:v1 <ELEMENT ATTR="VALUE" .../> -->` with deterministic
 /// attribute order, no trailing newline, and XML-safe attributes guaranteed not
 /// to contain `--` or line breaks. Empty optional string attributes (`label`,
-/// `name`, `href`) are omitted. This function performs no I/O and cannot fail.
+/// `name`, `href`) are omitted. For [`BodymatterMarker::Time`], `end_ms > start_ms`
+/// is always enforced by clamping non-increasing intervals (`end_ms <= start_ms`)
+/// to `(start_ms, start_ms + 1)` (or `(u64::MAX - 1, u64::MAX)` at saturation)
+/// so formatting never panics or emits an empty/inverted interval. This function
+/// performs no I/O and cannot fail.
 pub fn format_marker(marker: &BodymatterMarker<'_>) -> String {
     let mut out = String::with_capacity(64);
     out.push_str("<!-- ");
@@ -115,6 +155,21 @@ pub fn format_marker(marker: &BodymatterMarker<'_>) -> String {
         }
         BodymatterMarker::PageBreak { number } => {
             let _ = write!(out, "page-break number=\"{number}\"");
+        }
+        BodymatterMarker::Time { start_ms, end_ms } => {
+            let (clamped_start, clamped_end) = if *end_ms > *start_ms {
+                (*start_ms, *end_ms)
+            } else if *start_ms < u64::MAX {
+                (*start_ms, *start_ms + 1)
+            } else {
+                (u64::MAX - 1, u64::MAX)
+            };
+            let _ = write!(
+                out,
+                "time start=\"{}\" end=\"{}\"",
+                format_time_ms(clamped_start),
+                format_time_ms(clamped_end)
+            );
         }
     }
     out.push_str("/> -->");

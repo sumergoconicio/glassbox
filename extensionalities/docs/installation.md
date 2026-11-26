@@ -1,3 +1,10 @@
+---
+schema: "chai.metadata/v2"
+id: "01M8A8KCH8ZRM84SE24T1C5X0E"
+type: "documentation"
+title: "Installation"
+tags: ["installation", "ships", "rust", "stable", "toolchain", "linker", "leptonica", "languages", "inherited", "contributing"]
+---
 # Installation
 
 Glassbox ships from source.

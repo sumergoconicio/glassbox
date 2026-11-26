@@ -1,3 +1,10 @@
+---
+schema: "chai.metadata/v2"
+id: "01M8A8KCH8CGBADTAZR9N6G7K9"
+type: "documentation"
+title: "Glassbox user documentation"
+tags: ["glassbox", "documentation", "guides", "unified", "output", "authoritative", "prerequisites", "platforms", "parse", "commands"]
+---
 # Glassbox user documentation
 
 Glassbox provides local parsing, metadata inspection, and content extraction.

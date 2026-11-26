@@ -4,12 +4,12 @@
     "read": "entries are keyed by immediate filename; children point to immediate subfolder atlas.json files. Recurse only within the requested scope.",
     "fields": "Common fields describe identity, title, artifact type, content role, Atlas tags, domains, systems, classification, source URL, size and hashes.",
     "ownership": "extensions keys identify owning workflows. Each owner defines its own extension schema. Preserve other owners and reject conflicting common metadata on co-owned files.",
-    "identity": "document_id is stable when supplied and may be null before enrichment. sha256 hashes source bytes and does not define identity.",
+    "identity": "id is stable when supplied and may be null before enrichment. sha256 hashes source bytes and does not define identity.",
     "taxonomy": "taxonomy is keyed by owner namespace. Each value carries that workflow vocabulary and decision context.",
-    "query": "Use atlas_json.py list, search or get with --root. Optional recursive scope follows child atlas pointers. Filters use type, content-type, domain, system and owner workflow.",
+    "query": "Use atlas_json.py list, search or get with --root. Optional recursive scope follows child atlas pointers. Filters use type, content_type, domain, system and owner workflow.",
     "write": "Use caller-owned projection plus Atlas make_entry/build/stage and Store transactions. Never hand-edit hashes or remove files without authorization."
   },
-  "schema": "chai.atlas/v1",
+  "schema": "chai.atlas/v2",
   "folder_id": "folder-5cc4d287de634111843194bfdc998c58",
   "taxonomy": {
     "docs": {
@@ -27,32 +27,47 @@
   "children": [],
   "entries": {
     "README.md": {
-      "document_id": null,
+      "id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "title": "Glassbox user documentation",
-      "type": "doc",
-      "content-type": "Other",
+      "type": "documentation",
+      "content_type": "Other",
       "tags": [
         "glassbox",
         "documentation",
         "guides",
         "unified",
         "output",
-        "installed",
         "authoritative",
         "prerequisites",
-        "downstream",
-        "command"
+        "platforms",
+        "parse",
+        "commands"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "glassbox",
+          "documentation",
+          "guides",
+          "unified",
+          "output",
+          "authoritative",
+          "prerequisites",
+          "platforms",
+          "parse",
+          "commands"
+        ]
       },
       "filename": "README.md",
       "url": "./README.md",
-      "sha256": "3faf7e6aab7b2ee1e398fa6e1adad38c729961f6e73fb190649c5c616684bccb",
-      "size": 1188,
-      "body_sha256": "3faf7e6aab7b2ee1e398fa6e1adad38c729961f6e73fb190649c5c616684bccb",
+      "sha256": "878ba1b1e1d263bb5664c3df4ed2c51a1ed7dd30ca1f9f2edb64f6c7d017834b",
+      "size": 1550,
+      "body_sha256": "173cce83ccbf84135f68a613572dbce6c01521b576453653813f5a470be4a0ca",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -73,37 +88,67 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "glassbox",
+            "documentation",
+            "guides",
+            "unified",
+            "output",
+            "authoritative",
+            "prerequisites",
+            "platforms",
+            "parse",
+            "commands"
+          ]
         }
       }
     },
     "automation.md": {
-      "document_id": null,
+      "id": "01M8A8KCH84ZF509VHFNJB9PZT",
       "title": "Automation and directory inventories",
-      "type": "doc",
-      "content-type": "Runbook",
+      "type": "documentation",
+      "content_type": "Runbook",
       "tags": [
         "automation",
         "directory",
         "inventories",
         "scripted",
         "flows",
+        "optional",
+        "duplicated",
         "error",
-        "stream",
-        "adds",
-        "carries",
-        "format"
+        "carrying",
+        "carries"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "automation",
+          "directory",
+          "inventories",
+          "scripted",
+          "flows",
+          "optional",
+          "duplicated",
+          "error",
+          "carrying",
+          "carries"
+        ]
       },
       "filename": "automation.md",
       "url": "./automation.md",
-      "sha256": "3e24d1c212bf97be41d53cb1fcb7a28eab9106e85517907da33cc9f6b438eac3",
-      "size": 13303,
-      "body_sha256": "ddc2ba30110fab0a5ac85253f07ef0515f95ede6bbeadba28621b263e6b5d6ff",
+      "sha256": "391169aecee7db8ac5db323d0c55f165cfcf7268932f048a909c38038db1ac08",
+      "size": 12980,
+      "body_sha256": "147acf0130c6d92f9b59906d83738510c10d323fd8e7d864bca848f5aa5cf080",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -208,37 +253,66 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "automation",
+            "directory",
+            "inventories",
+            "scripted",
+            "flows",
+            "optional",
+            "duplicated",
+            "error",
+            "carrying",
+            "carries"
+          ]
         }
       }
     },
     "cli.md": {
-      "document_id": null,
+      "id": "01M8A8KCH8J8GPJAW1JN0BTZ9S",
       "title": "CLI reference and parsing",
-      "type": "doc",
-      "content-type": "Other",
+      "type": "documentation",
+      "content_type": "Other",
       "tags": [
         "cli",
         "reference",
         "parsing",
-        "executable",
         "args",
         "liteparse",
         "runtime",
         "authoritative",
         "library",
-        "configuration"
+        "configuration",
+        "complex"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "cli",
+          "reference",
+          "parsing",
+          "args",
+          "liteparse",
+          "runtime",
+          "authoritative",
+          "library",
+          "configuration",
+          "complex"
+        ]
       },
       "filename": "cli.md",
       "url": "./cli.md",
-      "sha256": "40107153daadb85e2c76e678fa1a5142315164a55dfd49583082313102454e3d",
-      "size": 6079,
-      "body_sha256": "40107153daadb85e2c76e678fa1a5142315164a55dfd49583082313102454e3d",
+      "sha256": "cbe73291cb3e8ae0df54b6c9ffe6cf9e6052f6be82640066d5775a525f10ac42",
+      "size": 7126,
+      "body_sha256": "896c7897ed972d3fec1b6ea17f4d562d0c992fffaa2809cde2313f43b4654630",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -308,37 +382,67 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "cli",
+            "reference",
+            "parsing",
+            "args",
+            "liteparse",
+            "runtime",
+            "authoritative",
+            "library",
+            "configuration",
+            "complex"
+          ]
         }
       }
     },
     "extract.md": {
-      "document_id": null,
+      "id": "01M8A8KCH86QGN3TZXSRA2YETW",
       "title": "Content extraction",
-      "type": "doc",
-      "content-type": "Runbook",
+      "type": "documentation",
+      "content_type": "Runbook",
       "tags": [
         "content",
         "extraction",
-        "slide",
-        "block",
-        "row",
-        "defines",
-        "carries",
-        "selects",
+        "requests",
         "ascend",
-        "overlapping"
+        "overlapping",
+        "ranges",
+        "merge",
+        "sorted",
+        "count",
+        "wholly"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "content",
+          "extraction",
+          "requests",
+          "ascend",
+          "overlapping",
+          "ranges",
+          "merge",
+          "sorted",
+          "count",
+          "wholly"
+        ]
       },
       "filename": "extract.md",
       "url": "./extract.md",
-      "sha256": "e4726efd6a027cad496d1620163278a931e6731d83146010f296057c9eddc94d",
-      "size": 5116,
-      "body_sha256": "6db22af3030a3acdf8d6e138d2c9dac78d1204c30270f11ff358774d5bf65efa",
+      "sha256": "825fec86b5ff82c2c74a4acb703c4fc573e8a413d121fad49a307a4099136a27",
+      "size": 12344,
+      "body_sha256": "a07060a101f93da785a74c97bbb5999a87a8a01027d3dd04a784ca9589a91fbe",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -415,37 +519,80 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [
+            {
+              "element": "page",
+              "attributes": {
+                "number": "2",
+                "label": "1",
+                "origin": "ocr",
+                "completeness": "partial"
+              },
+              "start": 5356,
+              "content_start": 5444,
+              "end": 12038
+            }
+          ],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "content",
+            "extraction",
+            "requests",
+            "ascend",
+            "overlapping",
+            "ranges",
+            "merge",
+            "sorted",
+            "count",
+            "wholly"
+          ]
         }
       }
     },
     "formats.md": {
-      "document_id": null,
+      "id": "01M8A8KCH859QZ4H83EXA9HRA7",
       "title": "Formats and limits",
-      "type": "doc",
-      "content-type": "Guide",
+      "type": "documentation",
+      "content_type": "Guide",
       "tags": [
         "formats",
         "limits",
         "identifies",
         "implies",
         "lists",
-        "glassbox",
-        "signals",
-        "object",
-        "validation",
-        "pixel"
+        "classifies",
+        "overrides",
+        "doc",
+        "inconclusive",
+        "longest"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "formats",
+          "limits",
+          "identifies",
+          "implies",
+          "lists",
+          "classifies",
+          "overrides",
+          "doc",
+          "inconclusive",
+          "longest"
+        ]
       },
       "filename": "formats.md",
       "url": "./formats.md",
-      "sha256": "027927b8e264863442f6f752364ae8d77e1b1249acab223ca1f70a0ef89557a4",
-      "size": 6573,
-      "body_sha256": "68b171d9b08d8d2a4f2fc57bbcbbe1436777608abe42c52122d7aea593def865",
+      "sha256": "5dc6775593acc19accb4be62dcd3c27182053c47ca63a8fd63456e22b79fa2bb",
+      "size": 8262,
+      "body_sha256": "b67de5e0eb85410d1de475656a278b3a34b550291b09ea3edfcfe13b77dffcc2",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -522,37 +669,67 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "formats",
+            "limits",
+            "identifies",
+            "implies",
+            "lists",
+            "classifies",
+            "overrides",
+            "doc",
+            "inconclusive",
+            "longest"
+          ]
         }
       }
     },
     "inspect.md": {
-      "document_id": null,
+      "id": "01M8A8KCH87VDMX2AY8PF3JAYG",
       "title": "Metadata inspection",
-      "type": "doc",
-      "content-type": "Runbook",
+      "type": "documentation",
+      "content_type": "Runbook",
       "tags": [
         "metadata",
         "inspection",
-        "row",
-        "carries",
-        "basis",
-        "disagreement",
-        "bucket",
-        "bytes",
-        "mismatch",
-        "slides"
+        "exposing",
+        "subject",
+        "keywords",
+        "serializes",
+        "properties",
+        "advice",
+        "hop",
+        "routing"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "metadata",
+          "inspection",
+          "exposing",
+          "subject",
+          "keywords",
+          "serializes",
+          "properties",
+          "advice",
+          "hop",
+          "routing"
+        ]
       },
       "filename": "inspect.md",
       "url": "./inspect.md",
-      "sha256": "54fea5af1138fa57270b17d7bd9f25d772747a73828cd886cd91a76b6fdff232",
-      "size": 3904,
-      "body_sha256": "0725e8131cadd6007ab45b1967b746ad96a5edc05c3701b3a8923b98dca06a79",
+      "sha256": "1f7c59a67044c1581333205a4fa7e566f579c5d6b359222944c68fdca1276c68",
+      "size": 10112,
+      "body_sha256": "2c802f7dafcf83e8d8ef8903d642eb6bb5b1f99e5f43ce4c3b4afb330ae5eb35",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -629,37 +806,66 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "metadata",
+            "inspection",
+            "exposing",
+            "subject",
+            "keywords",
+            "serializes",
+            "properties",
+            "advice",
+            "hop",
+            "routing"
+          ]
         }
       }
     },
     "installation.md": {
-      "document_id": null,
+      "id": "01M8A8KCH8ZRM84SE24T1C5X0E",
       "title": "Installation",
-      "type": "doc",
-      "content-type": "Other",
+      "type": "documentation",
+      "content_type": "Other",
       "tags": [
         "installation",
-        "checkout",
         "ships",
+        "rust",
         "stable",
+        "toolchain",
         "linker",
         "leptonica",
         "languages",
         "inherited",
-        "contributing",
-        "toolchain"
+        "contributing"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "installation",
+          "ships",
+          "rust",
+          "stable",
+          "toolchain",
+          "linker",
+          "leptonica",
+          "languages",
+          "inherited",
+          "contributing"
+        ]
       },
       "filename": "installation.md",
       "url": "./installation.md",
-      "sha256": "7289e8c853e4554dd581d2128b1e25629e7e4a5fd1bc8be4022ec83706538bb4",
-      "size": 3663,
-      "body_sha256": "7289e8c853e4554dd581d2128b1e25629e7e4a5fd1bc8be4022ec83706538bb4",
+      "sha256": "200a128c2f001ec31d1e441cc0e5eda49a3ce9f44b5b288f3575d9377071d279",
+      "size": 5022,
+      "body_sha256": "aab7b6e340aef22fb7459cd0080262671dbd325888c8693118c4952d71b5f04c",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -729,15 +935,29 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "installation",
+            "ships",
+            "rust",
+            "stable",
+            "toolchain",
+            "linker",
+            "leptonica",
+            "languages",
+            "inherited",
+            "contributing"
+          ]
         }
       }
     },
     "ocr-and-troubleshooting.md": {
-      "document_id": null,
+      "id": "01M8A8KCH8M69K2NE0T5R7MFDH",
       "title": "OCR and troubleshooting",
-      "type": "doc",
-      "content-type": "Runbook",
+      "type": "documentation",
+      "content_type": "Runbook",
       "tags": [
         "ocr",
         "troubleshooting",
@@ -753,13 +973,29 @@
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "ocr",
+          "troubleshooting",
+          "configuration",
+          "downstream",
+          "http",
+          "servers",
+          "retains",
+          "readable",
+          "rendered",
+          "pixel"
+        ]
       },
       "filename": "ocr-and-troubleshooting.md",
       "url": "./ocr-and-troubleshooting.md",
-      "sha256": "b27adfbceeb31f0c08678a73bbcd7954509f77430442d6faa2241c4d4ab85898",
-      "size": 6451,
-      "body_sha256": "424db00890968a2cbd462398b436c118819166e349672506a2b0d082edb28472",
+      "sha256": "4aaa7bde9c1f47885081b8c5f98f2bf1e5107f64814fd6ebdc68319e949eeb30",
+      "size": 7132,
+      "body_sha256": "05472ef33707f2148c42bc0b49654c383b7d1916c8751502081b8c01baca63f4",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -829,37 +1065,67 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "ocr",
+            "troubleshooting",
+            "configuration",
+            "downstream",
+            "http",
+            "servers",
+            "retains",
+            "readable",
+            "rendered",
+            "pixel"
+          ]
         }
       }
     },
     "reports.md": {
-      "document_id": null,
+      "id": "01M8A8KCH9J3719VX2989Q1VKD",
       "title": "Reports and programmatic use",
-      "type": "doc",
-      "content-type": "API Reference",
+      "type": "documentation",
+      "content_type": "API Reference",
       "tags": [
         "reports",
         "programmatic",
-        "schema",
         "separates",
-        "upstream",
-        "formats",
-        "excerpts",
         "downstream",
-        "omit",
-        "placeholders"
+        "liteparse",
+        "upstream",
+        "examples",
+        "placeholders",
+        "row",
+        "values"
       ],
       "domains": [],
       "systems": [],
       "classification": {
-        "status": "not_run"
+        "status": "not_run",
+        "tags_source": "atlas",
+        "generated_tags": [
+          "reports",
+          "programmatic",
+          "separates",
+          "downstream",
+          "liteparse",
+          "upstream",
+          "examples",
+          "placeholders",
+          "row",
+          "values"
+        ]
       },
       "filename": "reports.md",
       "url": "./reports.md",
-      "sha256": "9af55f2cbccb2296008c54afe48f31fb6fd6f041501d46f220cbb8319d221b22",
-      "size": 6528,
-      "body_sha256": "01ae6eaea0ad03d4d97a857bd38e2892fe86686a8a059c014fdc41f0d98554e3",
+      "sha256": "bfd5a99c71194a78fa3a579f25cbef8de88754bebd3d45fd49681981f2c21c3d",
+      "size": 9165,
+      "body_sha256": "b8af8d85261fa2fb2a1cd01d670af4ae069dc034778171c8a295dec59c3fb147",
+      "schema": "chai.metadata/v2",
+      "metadata_profile": "docs",
+      "container_id": "01M8A8KCH8CGBADTAZR9N6G7K9",
       "extensions": {
         "docs": {
           "schema": "chai.docs-atlas/v1",
@@ -922,7 +1188,21 @@
             }
           ],
           "path_base": "collection-root",
-          "collection_root": ".."
+          "collection_root": "..",
+          "bodymatter": [],
+          "keyword_policy": "document-only/v1",
+          "keywords": [
+            "reports",
+            "programmatic",
+            "separates",
+            "downstream",
+            "liteparse",
+            "upstream",
+            "examples",
+            "placeholders",
+            "row",
+            "values"
+          ]
         }
       }
     }

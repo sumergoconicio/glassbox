@@ -8,9 +8,9 @@ pub use crate::detect::{
 use crate::reports::{
     Artifact, Completeness, Diagnostic, DiagnosticSeverity, DiagnosticStage, DocumentMetadata,
     EmbeddedMetadataField, EncryptionStatus, ExtractReport, ExtractedContent, ExtractionProvenance,
-    MetadataProvenance, MetadataReport, NativeUnit, OcrRecommendation, OperationStatus,
-    RasterDimensions, SampledFingerprint, SchemaKind, SelectionReport, SupportStatus,
-    TextLayerStatus,
+    MediaReceipt, MetadataProvenance, MetadataReport, NativeUnit, OcrRecommendation,
+    OperationStatus, RasterDimensions, SampledFingerprint, SchemaKind, SelectionReport,
+    SupportStatus, TextLayerStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -245,6 +245,10 @@ pub struct ExtractReportV3 {
     pub artifacts: Vec<ArtifactRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Vec<ExtractionProvenance>>,
+    /// Optional media-extraction receipts (`contact_sheet`, `asr`, `audio_extract`);
+    /// omitted for non-media document extractions so existing v3 JSON stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaReceipt>,
 }
 
 impl MetadataReport {
@@ -282,8 +286,9 @@ pub fn inspect_to_v3(report: &MetadataReport, verbose: bool) -> InspectReportV3 
 /// Accepts an extraction report and `verbose` flag (`true` includes reader and
 /// extraction provenance). Returns [`ExtractReportV3`] embedding the independent
 /// standalone v3 metadata projection alongside `selection`, `content`, top-level
-/// extraction `status`, combined top-level `diagnostics`, `artifacts`, and
-/// optional `provenance`. Performs no I/O and cannot fail.
+/// extraction `status`, combined top-level `diagnostics`, `artifacts`, optional
+/// `provenance`, and optional `media` receipts (omitted when `None`). Performs
+/// no I/O and cannot fail.
 pub fn extract_to_v3(report: &ExtractReport, verbose: bool) -> ExtractReportV3 {
     let metadata = inspect_to_v3(
         &MetadataReport {
@@ -307,6 +312,7 @@ pub fn extract_to_v3(report: &ExtractReport, verbose: bool) -> ExtractReportV3 {
         diagnostics,
         artifacts,
         provenance: verbose.then(|| report.provenance.clone()),
+        media: report.media.clone(),
     }
 }
 
@@ -509,6 +515,7 @@ fn native_unit_count_key(unit: &NativeUnit) -> Option<&'static str> {
         NativeUnit::XmlElement => Some("elements"),
         NativeUnit::MobiTextRecord => Some("records"),
         NativeUnit::PageBreak => Some("page_breaks"),
+        NativeUnit::TimeInterval => Some("time_intervals"),
         NativeUnit::Byte | NativeUnit::PdfObject(_) | NativeUnit::Unknown => None,
     }
 }

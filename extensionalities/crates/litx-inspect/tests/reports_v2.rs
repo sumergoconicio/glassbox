@@ -123,6 +123,8 @@ fn extract_fixture() -> ExtractReport {
                 source_part: Some("page-1".to_owned()),
                 label: None,
                 marker_index: None,
+                start_ms: None,
+                end_ms: None,
                 text: Some("SENTINEL_BODY SENTINEL_OCR".to_owned()),
                 rows: vec![ContentRow {
                     row_index: 1,
@@ -149,6 +151,7 @@ fn extract_fixture() -> ExtractReport {
             omitted: OmissionStatus::None,
             completeness: Completeness::Exact,
         },
+        media: None,
     }
 }
 

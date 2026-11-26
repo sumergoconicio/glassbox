@@ -1,8 +1,11 @@
 ---
 title: "Content extraction"
-type: doc
-content-type: Runbook
-parent: docs/README.md
+type: "documentation"
+content_type: "Runbook"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH86QGN3TZXSRA2YETW"
+tags: ["content", "extraction", "requests", "ascend", "overlapping", "ranges", "merge", "sorted", "count", "wholly"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # Content extraction
@@ -108,6 +111,41 @@ Process extracted Markdown in three steps:
 Pass `--no-markers` to omit every `bodymatter:v1` line from stdout Markdown and saved `--output-dir` `.md` files.
 Source `<` escaping, minimal block escaping, and clean GFM tables remain active.
 
+## Shared metadata consumers
+
+ChAI's Python metadata tools consume the six Glassbox structure elements defined above.
+Their shared reference lives at `~/chai/skills/meta/atlas-indexer/references/document-metadata.md`.
+The versioned field registry lives beside that reference in `metadata-fields.json`.
+
+Python-managed notes, PRDs, projects, documentation, transcripts, and extracts use flat `chai.metadata/v2` frontmatter.
+Shared fields use snake_case: `schema`, `id`, `type`, `content_type`, `status`, `container_id`, and `source_url` where applicable.
+Each workflow retains its existing content-type values and routing rules.
+`source_url` accepts an original URL, filename, or path. The source header omits source_format.
+New document IDs are uppercase ULIDs. Existing document IDs remain stable through migration.
+Existing curated document and section tags retain their navigation roles. Atlas stores generated document keywords.
+No per-section keyword markers are generated.
+The full-file SHA-256 lives outside the source document, in Atlas or a migration manifest.
+Glassbox's existing extraction Markdown remains valid marker-bearing input without a frontmatter header.
+
+### Registered ChAI bodymatter extensions
+
+These consumer extensions share the `bodymatter:v1` comment envelope:
+
+| Element | Attributes | Scope |
+| --- | --- | --- |
+| `time` | Required `start` and `end`, formatted `HH:MM:SS.mmm` | Following transcript text until the next `time` marker or output end. |
+| `segment` | Required positive `number` only | Following legacy text segment until the next `segment` marker or output end. |
+
+Temporal starts are inclusive; ends are exclusive. Hours may exceed two digits.
+Explicit intervals preserve silent gaps. They do not expand to the next marker's start time.
+Historical `<page no="X">...</page>` wrappers become untimed segments unless timing is verified.
+Their numbers never establish elapsed minutes or physical PDF pages by themselves.
+
+Glassbox emits the six document structure elements above and emits `<time start="HH:MM:SS.mmm" end="HH:MM:SS.mmm"/>` markers for `--asr` transcripts.
+`--asr` Markdown also emits flat `schema: "glassbox:v1"` YAML frontmatter by default (`--no-frontmatter` omits it).
+Document extraction Markdown stays frontmatter-free.
+The reviewed historical import adapter emits `segment`; Glassbox does not emit `segment`.
+
 ## Safety caps
 
 Extraction applies fixed safety caps to every request:
@@ -133,6 +171,37 @@ Pass `--ocr-language LANG` to choose another language (for example `en`, `eng`, 
 OCR failure never discards native text; the report retains native text and records a diagnostic.
 See [OCR and troubleshooting](ocr-and-troubleshooting.md) for model lookup and errors.
 
+## Media extraction
+
+`glassbox extract` supports opt-in FFmpeg workflows for audio and video files.
+`glassbox inspect` remains metadata-only and rejects all media flags with exit 64.
+
+### Video contact sheets (`--imagegrid`)
+
+`glassbox extract VIDEO --imagegrid [default|adaptive|custom]` builds a JPEG or PNG contact sheet from motion video.
+
+- Glassbox composites frames in memory and creates zero temporary frame directories on disk.
+- Supply an explicit `-o PATH` (single-file only) or `--output-dir DIR` (`<stem>-contact-sheet.<ext>`). Existing files are never overwritten.
+- `default` builds a 5x5 grid. `adaptive` scales from 1 to 10 rows by duration. `custom` uses `--every-seconds` up to a 250-tile cap (higher counts exit 64).
+- `--quality` (default, 360x202 cells, 1,920 px wide) and `--performance` (240x134 cells, 1,280 px wide) choose sheet geometry. `--imagegrid-format` selects `jpg` or `png`.
+
+### Piped ASR (`--asr`) and audio export (`--extract-audio`)
+
+`glassbox extract FILE --asr [short|adaptive|full]` streams 16 kHz mono PCM from FFmpeg over a pipe with zero temporary audio files.
+
+- `short` (default) detects speech onset with local VAD and captures up to 60 seconds.
+- `adaptive` samples 30-second windows every 15 minutes starting at `0:00`.
+- `full` transcribes the entire track in 30-second windows with 4-second overlap stitching.
+- Healthy `short` and `adaptive` runs exit 0 with `completeness: "partial"` and `selection.omitted: "selection"`.
+- ASR supports OpenAI-compatible HTTP endpoints (`transcriptions` multipart WAV or `chat` base64 `input_audio`) and local offline Whisper ONNX models. Configure backends with CLI flags, `GLASSBOX_ASR_*` variables, or `glassbox models`. See [CLI reference and parsing](cli.md#model-configuration-models).
+- `--asr` Markdown emits flat `schema: "glassbox:v1"` YAML frontmatter (`--no-frontmatter` omits it) and `bodymatter:v1` `<time>` markers (`--no-markers` omits them). Document extraction Markdown remains frontmatter-free.
+- Optional `--extract-audio [wav|flac|m4a|opus]` streams the full audio track to `<stem>-extract.<ext>` inside `--output-dir` without overwriting. It runs standalone or with `--asr full` (sharing one decode pass for `wav`). Combining `--extract-audio` with `--asr short` or `--asr adaptive` exits 64.
+
+### Combined triage
+
+Combine `--imagegrid` and `--asr` (and `--extract-audio` with `--asr full`) in one command to produce a contact sheet, transcript Markdown, and one v3 JSON report.
+If one stage fails while another succeeds, Glassbox preserves the completed artifact, records a `media` diagnostic, and exits 2 (`status: "partial"`).
+
 ## Output forms and hashing
 
 - **JSON (default)**: schema v3 extract report (`schema_version: 3`, `kind: "extract"`) with embedded v3 `metadata`, `selection`, and `content.units`. Add `--pretty` for indented output and `--verbose` for reader and extraction provenance.
@@ -148,10 +217,11 @@ Pass `--full-hash` to stream full SHA-256 above 128 MiB.
 Each entry in `content.units` records:
 
 - `unit_index`: one-based source position.
-- `unit`: native unit kind (for example `physical_page`, `worksheet`, `slide`, `table`, `spine_item`, `page_break`, or `logical_line`).
+- `unit`: native unit kind (for example `physical_page`, `worksheet`, `slide`, `table`, `spine_item`, `page_break`, `logical_line`, or `time_interval`).
 - `source_part`: internal part or page identifier, when present.
 - `label`: printed PDF page label from `/PageLabels`, when present.
 - `marker_index`: optional one-based source ordinal for DOCX `page-break` and DOCX or ODT `table` markers, omitted when absent.
+- `start_ms`, `end_ms`: optional inclusive start and exclusive end milliseconds for `time_interval` ASR units, omitted for non-media units.
 - `text` or `rows`: extracted payload.
 - `provenance`: reader, stage, fact source, and `origin` (`native`, `ocr`, `mixed`, or `derived_preview`).
 - `completeness`: `exact` or `partial`.

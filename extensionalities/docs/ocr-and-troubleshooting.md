@@ -1,8 +1,11 @@
 ---
 title: "OCR and troubleshooting"
-type: doc
-content-type: Runbook
-parent: docs/README.md
+type: "documentation"
+content_type: "Runbook"
+schema: "chai.metadata/v2"
+id: "01M8A8KCH8M69K2NE0T5R7MFDH"
+tags: ["ocr", "troubleshooting", "configuration", "downstream", "http", "servers", "retains", "readable", "rendered", "pixel"]
+container_id: "01M8A8KCH8CGBADTAZR9N6G7K9"
 ---
 
 # OCR and troubleshooting
@@ -75,6 +78,12 @@ Both use upstream PDFium and OCR stages. Their selection, reports, output format
 | Encrypted file yields no content | Passwords and DRM are not bypassed. Use the password-removed original. |
 | `--format` rejected in batch mode | Batch output is JSONL. Drop `--format`, `--pretty`, and `--thumbnail`. |
 | Exit 1 with an input-stage diagnostic | The file could not be opened or read, for example by permissions. Fix read access, then retry. |
+| `media_helper_missing` diagnostic for `ffmpeg` or `ffprobe` | Install FFmpeg or point `GLASSBOX_FFMPEG` and `GLASSBOX_FFPROBE` at executable paths. See [Optional dependencies](../DEPENDENCIES.md). |
+| `asr_asset_missing` for Whisper ONNX model files | Put `encoder_model[_int8].onnx`, `decoder_model_merged[_int8].onnx`, `generation_config.json`, and `vocab.json` in `model_dir` (or `model_dir/onnx/`). |
+| `asr_asset_missing` for ONNX Runtime (`libonnxruntime`) | Set `ORT_DYLIB_PATH` to `libonnxruntime.so` or `libonnxruntime.dylib`, or install the cached runtime via `glassbox parse models pull ocria-nano`. |
+| `asr_config_failed` on `--asr-device cuda` | CUDA refuses silent CPU fallback. Rebuild `glassbox-cli` with `--features whisper-onnx-cuda`, or pass `--asr-device cpu`. |
+| Exit 64 on ambiguous ASR environment variables | Both `GLASSBOX_ASR_URL` and `GLASSBOX_ASR_MODEL_DIR` are set without a backend selector. Set `--asr-backend` or `GLASSBOX_ASR_BACKEND` (`openai` or `whisper-onnx`). |
+| Compile error enabling `--features magika` with default features | Default `whisper-onnx` and optional `magika` pin incompatible `ort` versions. Build `magika` with `--no-default-features --features magika`. |
 
 ## Diagnostics first
 

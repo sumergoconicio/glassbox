@@ -276,6 +276,8 @@ pub(crate) fn text_unit(
         source_part,
         label: None,
         marker_index: None,
+        start_ms: None,
+        end_ms: None,
         text: Some(text),
         rows: Vec::new(),
         provenance: vec![ExtractionProvenance {
@@ -377,6 +379,7 @@ fn diagnostic_stage(stage: &str) -> DiagnosticStage {
     match stage {
         "selection" => DiagnosticStage::Selection,
         "pdf_ocr" | "probe_ocr" | "ocr" => DiagnosticStage::Ocr,
+        "media" => DiagnosticStage::Media,
         "output" => DiagnosticStage::Artifact,
         "input" => DiagnosticStage::Input,
         "detection" => DiagnosticStage::Detection,
@@ -754,6 +757,7 @@ pub(crate) fn assemble(
             omitted,
             completeness,
         },
+        media: None,
     }
 }
 
@@ -796,11 +800,48 @@ pub fn render_markdown(report: &ExtractReport) -> String {
 ///
 /// Accepts an [`ExtractReport`] and `include_markers` (`true` to include
 /// `bodymatter:v1` structure comments, `false` to omit all marker lines while
-/// keeping identical content blocks and GFM pipe tables). Returns blank-line-
-/// delimited Markdown ending with a single trailing newline when non-empty, or
-/// an empty string when no markers or content blocks are produced. Performs no
-/// I/O and cannot fail.
+/// keeping identical content blocks and GFM pipe tables). Delegates to
+/// [`render_markdown_full`] with `include_frontmatter = true` (which applies
+/// `glassbox:v1` frontmatter only to ASR transcript reports while keeping
+/// non-transcript documents frontmatter-free). Returns blank-line-delimited
+/// Markdown ending with a single trailing newline when non-empty, or an empty
+/// string when no markers or content blocks are produced. Cannot fail.
 pub fn render_markdown_with_options(report: &ExtractReport, include_markers: bool) -> String {
+    render_markdown_full(report, include_markers, true)
+}
+
+/// Renders one extraction report as Markdown with independent marker and frontmatter controls.
+///
+/// Accepts an [`ExtractReport`], `include_markers` (`true` to emit
+/// `bodymatter:v1` structure comments, `false` to omit them), and
+/// `include_frontmatter` (`true` to emit `schema: "glassbox:v1"` YAML
+/// frontmatter on ASR transcript reports where `report.media.asr.is_some()`,
+/// `false` to omit frontmatter). Non-transcript document extractions always
+/// remain frontmatter-free regardless of `include_frontmatter` so existing
+/// document Markdown output stays byte-identical. Returns blank-line-delimited
+/// Markdown ending with a single trailing newline when non-empty, or an empty
+/// string when no output blocks are produced. Cannot fail.
+pub fn render_markdown_full(
+    report: &ExtractReport,
+    include_markers: bool,
+    include_frontmatter: bool,
+) -> String {
+    if report
+        .media
+        .as_ref()
+        .and_then(|media| media.asr.as_ref())
+        .is_some()
+    {
+        return crate::transcript_markdown::render_transcript_markdown(
+            report,
+            &crate::transcript_markdown::TranscriptRenderOptions {
+                include_markers,
+                include_frontmatter,
+                ..crate::transcript_markdown::TranscriptRenderOptions::default()
+            },
+        );
+    }
+
     let worksheet_names: Vec<&str> = report
         .metadata
         .schema_identifiers
@@ -891,6 +932,10 @@ pub fn render_markdown_with_options(report: &ExtractReport, include_markers: boo
                 });
                 Some(BodymatterMarker::PageBreak { number })
             }
+            NativeUnit::TimeInterval => unit
+                .start_ms
+                .zip(unit.end_ms)
+                .and_then(|(start_ms, end_ms)| BodymatterMarker::time(start_ms, end_ms)),
             _ => None,
         };
 
